@@ -1,23 +1,51 @@
 # Положи в репозиторий как .github/workflows/build.yml
 # Рядом в корне репозитория должны лежать: mgg_panel.cpp и папка mgg/ с файлом Overlay.java
 # Запуск: Actions -> Build MGG panel -> Run workflow. Результат в Artifacts: libmggpanel.so и mgg_overlay.dex
+# В логе шага "Build native lib" ищи строку VARIANT=with-dobby (хуки есть) или VARIANT=no-dobby (хуков нет).
 name: Build MGG panel
 on: [workflow_dispatch, push]
 env:
-  MGG_TOKEN: 1488     # ТОЛЬКО латиница и цифры, например mgg7391
+  MGG_TOKEN: поменяй_меня     # ТОЛЬКО латиница и цифры, например mgg7391
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build Dobby (optional, for hooks)
+        continue-on-error: true
+        run: |
+          NDK=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}
+          git clone --depth 1 https://github.com/jmpews/Dobby.git dobby_src
+          cmake -S dobby_src -B dobby_build \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-21 \
+            -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF -DDOBBY_DEBUG=OFF
+          cmake --build dobby_build --target dobby -j4
+          find dobby_build -name 'libdobby.a' -print
+
       - name: Build native lib (armeabi-v7a)
         run: |
           NDK=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}
           CXX=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang++
-          $CXX -std=c++17 -O2 -shared -fPIC -static-libstdc++ \
-            -DMGG_TOKEN="\"$MGG_TOKEN\"" \
-            -o libmggpanel.so mgg_panel.cpp -llog
+          rm -f libmggpanel.so
+          DOBBY_A=$(find dobby_build -name 'libdobby.a' 2>/dev/null | head -1 || true)
+          if [ -n "$DOBBY_A" ] && [ -f dobby_src/include/dobby.h ]; then
+            if $CXX -std=c++17 -O2 -shared -fPIC -static-libstdc++ \
+                 -DMGG_TOKEN="\"$MGG_TOKEN\"" -DMGG_HAS_DOBBY -I dobby_src/include \
+                 -o libmggpanel.so mgg_panel.cpp "$DOBBY_A" -llog; then
+              echo "VARIANT=with-dobby"
+            else
+              echo "Dobby не подошёл, собираю без хуков"
+              rm -f libmggpanel.so
+            fi
+          fi
+          if [ ! -f libmggpanel.so ]; then
+            $CXX -std=c++17 -O2 -shared -fPIC -static-libstdc++ \
+              -DMGG_TOKEN="\"$MGG_TOKEN\"" \
+              -o libmggpanel.so mgg_panel.cpp -llog
+            echo "VARIANT=no-dobby"
+          fi
           file libmggpanel.so || true
 
       - name: Build overlay dex
