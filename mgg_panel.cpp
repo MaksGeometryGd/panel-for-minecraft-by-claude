@@ -258,7 +258,34 @@ static Str findXref(const Img &im, uintptr_t lo, uintptr_t hi, size_t maxr) {
             }
         }
     }
-    return found ? out : "ссылок не найдено (ищутся только Thumb + literal pool)\n";
+    // второй проход: movw rN,#lo ; movt rN,#hi ; ... ; add rN, pc
+    for (const Seg &g : im.segs) {
+        if (!g.r || !g.x) continue;
+        for (uintptr_t a = g.s; a + 8 <= g.e; a += 2) {
+            uint16_t h1 = rd16(a), h2 = rd16(a + 2);
+            if ((h1 & 0xFBF0) != 0xF240 || (h2 & 0x8000)) continue;                 // movw
+            int rd = (h2 >> 8) & 15;
+            uint32_t lw = ((uint32_t)(h1 & 0xF) << 12) | ((uint32_t)((h1 >> 10) & 1) << 11) | ((uint32_t)((h2 >> 12) & 7) << 8) | (h2 & 0xFF);
+            uint16_t m1 = rd16(a + 4), m2 = rd16(a + 6);
+            if ((m1 & 0xFBF0) != 0xF2C0 || (m2 & 0x8000) || (int)((m2 >> 8) & 15) != rd) continue;   // movt того же регистра
+            uint32_t hw = ((uint32_t)(m1 & 0xF) << 12) | ((uint32_t)((m1 >> 10) & 1) << 11) | ((uint32_t)((m2 >> 12) & 7) << 8) | (m2 & 0xFF);
+            uint32_t L = (hw << 16) | lw;
+            uint16_t want = rd < 8 ? (uint16_t)(0x4478 | rd) : (uint16_t)(0x44F8 | (rd - 8));
+            for (int k = 0; k < 12; k++) {
+                uintptr_t b = a + 8 + 2 * (uintptr_t)k;
+                if (b + 2 > g.e) break;
+                if (rd16(b) != want) continue;
+                uintptr_t S = (uintptr_t)L + b + 4;
+                if (S >= lo && S < hi) {
+                    uintptr_t fs = fnStart(im, a);
+                    out += "ссылка (movw/movt) в " + hx(a - im.base) + "  -> функция ~" + (fs ? hx(fs - im.base) : Str("?")) + "\n";
+                    if (++found >= maxr) { out += "...лимит\n"; return out; }
+                }
+                break;
+            }
+        }
+    }
+    return found ? out : "ссылок не найдено (ищутся Thumb: literal pool и movw/movt + add pc)\n";
 }
 
 static Str hexdump(const Img &im, uintptr_t off, size_t n) {
@@ -850,8 +877,47 @@ static bool backupOnce(const Str &path, const Str &cur) {
     return writeFile(bak, cur);
 }
 
+static void grepDir(const Str &dir, const Str &needle, int depth, size_t maxr, size_t &found, size_t &scanned, Str &out) {
+    if (depth > 8 || found >= maxr || scanned > 30000) return;
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    std::vector<Str> names; struct dirent *e;
+    while ((e = readdir(d)) != nullptr) { Str n = e->d_name; if (n != "." && n != "..") names.push_back(n); }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    for (const Str &n : names) {
+        if (found >= maxr) return;
+        Str full = dir + "/" + n;
+        struct stat st;
+        if (lstat(full.c_str(), &st) != 0 || S_ISLNK(st.st_mode)) continue;
+        if (S_ISDIR(st.st_mode)) { grepDir(full, needle, depth + 1, maxr, found, scanned, out); continue; }
+        if (!S_ISREG(st.st_mode) || st.st_size > (16 << 20) || st.st_size < (off_t)needle.size()) continue;
+        scanned++;
+        Str data;
+        if (!readFile(full, data, 17u << 20)) continue;
+        size_t at = 0, per = 0;
+        while ((at = data.find(needle, at)) != Str::npos && per < 3 && found < maxr) {
+            size_t a0 = at > 40 ? at - 40 : 0, a1 = std::min(data.size(), at + needle.size() + 40);
+            Str ctx;
+            for (size_t i = a0; i < a1; i++) { unsigned char c = (unsigned char)data[i]; ctx += (c >= 32 && c < 127) ? (char)c : '.'; }
+            out += full + "  @" + std::to_string((unsigned long long)at) + "\n    " + ctx + "\n";
+            at += needle.size(); per++; found++;
+        }
+    }
+}
+
 static Str fileRoute(const Str &path, const Params &q) {
     Str real, err;
+    if (path == "grep") {                                       // поиск текста по файлам (без учёта регистра не умеет)
+        Str needle = P(q, "s");
+        if (needle.size() < 3) return "нужен текст s, минимум 3 символа\n";
+        std::vector<Str> dirs;
+        if (P(q, "p").empty()) { for (const Str &r : fileRoots()) { char rb[PATH_MAX]; if (realpath(r.c_str(), rb) && std::find(dirs.begin(), dirs.end(), Str(rb)) == dirs.end()) dirs.push_back(rb); } }
+        else { if (!allowedPath(P(q, "p"), real, err)) return err + "\n"; dirs.push_back(real); }
+        Str out; size_t found = 0, scanned = 0, maxr = decNum(q, "max", 30);
+        for (const Str &d : dirs) grepDir(d, needle, 0, maxr, found, scanned, out);
+        return out + "\nпросмотрено файлов: " + std::to_string(scanned) + (found >= maxr ? ", найдено (лимит " + std::to_string(maxr) + ")\n" : ", найдено: " + std::to_string(found) + "\n");
+    }
     if (path == "ls") {
         Str p = P(q, "p");
         if (p.empty()) {
@@ -982,6 +1048,8 @@ pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border
 <div id=tf style="display:none">
 <section><h3>Файлы игры</h3><input id=fp placeholder="путь (пусто = показать папки игры)">
 <button onclick="call('ls',{p:v('fp')})">Список</button><button onclick="call('cat',{p:v('fp')})">Показать файл</button>
+<input id=gs placeholder="искать текст в файлах (в папке выше; пусто = во всех папках игры)">
+<button onclick="call('grep',{p:v('fp'),s:v('gs'),max:30})">Найти текст в файлах</button>
 <input id=fk placeholder="ключ (например gfx_viewdistance)"><input id=fv placeholder="значение (например 20)">
 <button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})">Задать ключ:значение</button>
 <input id=fa placeholder="найти текст"><input id=fb placeholder="заменить на">
@@ -1000,7 +1068,7 @@ function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navig
 
 static Str route(const Str &path, const Params &q) {
     std::lock_guard<std::mutex> lk(g_mu);
-    if (path == "ls" || path == "cat" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
+    if (path == "ls" || path == "cat" || path == "grep" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
     Img im;
     if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
     uintptr_t a = 0;
