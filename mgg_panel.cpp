@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <utility>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -271,6 +272,376 @@ static Str hexdump(const Img &im, uintptr_t off, size_t n) {
     return out;
 }
 
+// ---------------------------------------------------------------- дизассемблер Thumb/Thumb-2 (подмножество, в стиле radare2)
+static const char *RN[16] = {"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "sb", "sl", "fp", "ip", "sp", "lr", "pc"};
+static const char *CCN[16] = {"eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
+
+static Str dn(uint32_t v) { char b[16]; if (v < 10) snprintf(b, sizeof b, "%u", v); else snprintf(b, sizeof b, "0x%x", v); return b; }
+static Str ds(int32_t v) { return v < 0 ? "-" + dn((uint32_t)(-v)) : dn((uint32_t)v); }
+static Str h0(uint32_t v) { char b[16]; snprintf(b, sizeof b, "0x%x", v); return b; }
+static Str h8(uint32_t v) { char b[16]; snprintf(b, sizeof b, "0x%08x", v); return b; }
+static int32_t sext(uint32_t v, int bits) { uint32_t m = 1u << (bits - 1); return (int32_t)((v ^ m) - m); }
+static uint32_t ror32(uint32_t v, int r) { r &= 31; return r ? (v >> r) | (v << (32 - r)) : v; }
+static Str rlist(uint32_t m) {
+    Str s = "{"; bool f = true;
+    for (int i = 0; i < 16; i++) if (m & (1u << i)) { if (!f) s += ", "; s += RN[i]; f = false; }
+    return s + "}";
+}
+static Str memop(int rn, int32_t imm) { return imm ? Str("[") + RN[rn] + ", " + ds(imm) + "]" : Str("[") + RN[rn] + "]"; }
+static Str sreg(int n) { return "s" + std::to_string(n); }
+static Str dreg(int n) { return "d" + std::to_string(n); }
+
+static uint32_t thumbExpand(uint32_t i12) {
+    uint32_t b = i12 & 0xFF;
+    if ((i12 >> 10) == 0) {
+        switch ((i12 >> 8) & 3) {
+            case 0: return b;
+            case 1: return (b << 16) | b;
+            case 2: return (b << 24) | (b << 8);
+            default: return (b << 24) | (b << 16) | (b << 8) | b;
+        }
+    }
+    return ror32(0x80 | (i12 & 0x7F), (i12 >> 7) & 0x1F);
+}
+
+static Str litNote(const Img &im, uint32_t voff) {
+    uintptr_t a = im.base + voff;
+    if (!segAt(im, a, 4)) return "";
+    return "      ; [" + h0(voff) + "]=" + h0(rd32(a));
+}
+
+struct Br { int kind; uint32_t target; int cond; };     // kind: 1 bl, 2 b.w, 3 blx, 4 b<cond>.w
+static bool decodeBr(uint16_t h1, uint16_t h2, uint32_t addr, Br &r) {
+    if ((h1 >> 11) != 0x1E || !(h2 & 0x8000)) return false;
+    uint32_t pc = addr + 4, S = (h1 >> 10) & 1, J1 = (h2 >> 13) & 1, J2 = (h2 >> 11) & 1;
+    if ((h2 & 0xD000) == 0x8000) {
+        uint32_t cond = (h1 >> 6) & 0xF;
+        if (cond >= 14) return false;
+        uint32_t imm = (S << 20) | (J2 << 19) | (J1 << 18) | ((uint32_t)(h1 & 0x3F) << 12) | ((uint32_t)(h2 & 0x7FF) << 1);
+        r.kind = 4; r.cond = (int)cond; r.target = pc + (uint32_t)sext(imm, 21);
+        return true;
+    }
+    uint32_t I1 = (~(J1 ^ S)) & 1, I2 = (~(J2 ^ S)) & 1, imm10 = h1 & 0x3FF;
+    if ((h2 & 0xD000) == 0x9000 || (h2 & 0xD000) == 0xD000) {
+        uint32_t imm = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | ((uint32_t)(h2 & 0x7FF) << 1);
+        r.kind = (h2 & 0x4000) ? 1 : 2; r.cond = 0; r.target = pc + (uint32_t)sext(imm, 25);
+        return true;
+    }
+    if ((h2 & 0xD001) == 0xC000) {
+        uint32_t imm = (S << 24) | (I1 << 23) | (I2 << 22) | (imm10 << 12) | ((uint32_t)((h2 >> 1) & 0x3FF) << 2);
+        r.kind = 3; r.cond = 0; r.target = (pc & ~3u) + (uint32_t)sext(imm, 25);
+        return true;
+    }
+    return false;
+}
+
+static Str dis16(const Img &im, uint32_t addr, uint16_t h) {
+    uint32_t pc = addr + 4;
+    int rd, rn, rm;
+    switch (h >> 11) {
+        case 0: case 1: case 2: {
+            rd = h & 7; rm = (h >> 3) & 7; uint32_t imm = (h >> 6) & 0x1F; int op = h >> 11;
+            if (op == 0 && imm == 0) return Str("movs ") + RN[rd] + ", " + RN[rm];
+            if (op != 0 && imm == 0) imm = 32;
+            return Str(op == 0 ? "lsls " : op == 1 ? "lsrs " : "asrs ") + RN[rd] + ", " + RN[rm] + ", " + dn(imm);
+        }
+        case 3: {
+            rd = h & 7; rn = (h >> 3) & 7; int x = (h >> 6) & 7; bool imm = (h >> 10) & 1, sub = (h >> 9) & 1;
+            return Str(sub ? "subs " : "adds ") + RN[rd] + ", " + RN[rn] + ", " + (imm ? dn(x) : Str(RN[x]));
+        }
+        case 4: return Str("movs ") + RN[(h >> 8) & 7] + ", " + dn(h & 0xFF);
+        case 5: return Str("cmp ") + RN[(h >> 8) & 7] + ", " + dn(h & 0xFF);
+        case 6: return Str("adds ") + RN[(h >> 8) & 7] + ", " + dn(h & 0xFF);
+        case 7: return Str("subs ") + RN[(h >> 8) & 7] + ", " + dn(h & 0xFF);
+        case 8: {
+            if ((h >> 10) == 0x10) {
+                static const char *alu[16] = {"ands", "eors", "lsls", "lsrs", "asrs", "adcs", "sbcs", "rors", "tst", "rsbs", "cmp", "cmn", "orrs", "muls", "bics", "mvns"};
+                rd = h & 7; rm = (h >> 3) & 7; int op = (h >> 6) & 0xF;
+                if (op == 9) return Str("rsbs ") + RN[rd] + ", " + RN[rm] + ", 0";
+                if (op == 13) return Str("muls ") + RN[rd] + ", " + RN[rm] + ", " + RN[rd];
+                return Str(alu[op]) + " " + RN[rd] + ", " + RN[rm];
+            }
+            int op = (h >> 8) & 3; rm = (h >> 3) & 0xF; rd = (h & 7) | ((h >> 4) & 8);
+            if (op == 0) return Str("add ") + RN[rd] + ", " + RN[rm];
+            if (op == 1) return Str("cmp ") + RN[rd] + ", " + RN[rm];
+            if (op == 2) return Str("mov ") + RN[rd] + ", " + RN[rm];
+            return Str((h & 0x80) ? "blx " : "bx ") + RN[rm];
+        }
+        case 9: {
+            rd = (h >> 8) & 7; uint32_t lit = (pc & ~3u) + (uint32_t)(h & 0xFF) * 4;
+            return Str("ldr ") + RN[rd] + ", [" + h8(lit) + "]" + litNote(im, lit);
+        }
+        case 10: case 11: {
+            static const char *m[8] = {"str", "strh", "strb", "ldrsb", "ldr", "ldrh", "ldrb", "ldrsh"};
+            rd = h & 7; rn = (h >> 3) & 7; rm = (h >> 6) & 7;
+            return Str(m[(h >> 9) & 7]) + " " + RN[rd] + ", [" + RN[rn] + ", " + RN[rm] + "]";
+        }
+        case 12: case 13: case 14: case 15: case 16: case 17: {
+            static const char *m[6] = {"str", "ldr", "strb", "ldrb", "strh", "ldrh"};
+            int k = (h >> 11) - 12; rd = h & 7; rn = (h >> 3) & 7; uint32_t imm = (h >> 6) & 0x1F;
+            imm *= (k < 2) ? 4 : (k < 4) ? 1 : 2;
+            return Str(m[k]) + " " + RN[rd] + ", " + memop(rn, (int32_t)imm);
+        }
+        case 18: case 19:
+            return Str((h >> 11) == 18 ? "str " : "ldr ") + RN[(h >> 8) & 7] + ", " + memop(13, (int32_t)(h & 0xFF) * 4);
+        case 20: { uint32_t lit = (pc & ~3u) + (uint32_t)(h & 0xFF) * 4; return Str("adr ") + RN[(h >> 8) & 7] + ", " + h0(lit); }
+        case 21: return Str("add ") + RN[(h >> 8) & 7] + ", sp, " + dn((uint32_t)(h & 0xFF) * 4);
+        case 22: case 23: {
+            if ((h & 0xFF00) == 0xB000) return Str((h & 0x80) ? "sub sp, " : "add sp, ") + dn((uint32_t)(h & 0x7F) * 4);
+            if ((h & 0xF500) == 0xB100) {
+                uint32_t i = (h >> 9) & 1, imm5 = (h >> 3) & 0x1F;
+                return Str((h & 0x0800) ? "cbnz " : "cbz ") + RN[h & 7] + ", " + h0(pc + ((i << 6) | (imm5 << 1)));
+            }
+            if ((h & 0xFF00) == 0xB200) { static const char *m[4] = {"sxth", "sxtb", "uxth", "uxtb"}; return Str(m[(h >> 6) & 3]) + " " + RN[h & 7] + ", " + RN[(h >> 3) & 7]; }
+            if ((h & 0xFE00) == 0xB400) return "push " + rlist((h & 0xFF) | ((h & 0x100) ? 0x4000 : 0));
+            if ((h & 0xFE00) == 0xBC00) return "pop " + rlist((h & 0xFF) | ((h & 0x100) ? 0x8000 : 0));
+            if ((h & 0xFF00) == 0xBA00) { int o = (h >> 6) & 3; if (o != 2) return Str(o == 0 ? "rev " : o == 1 ? "rev16 " : "revsh ") + RN[h & 7] + ", " + RN[(h >> 3) & 7]; }
+            if ((h & 0xFF00) == 0xBE00) return "bkpt " + dn(h & 0xFF);
+            if ((h & 0xFF00) == 0xBF00) {
+                int mask = h & 0xF, fc = (h >> 4) & 0xF;
+                if (mask == 0) { static const char *hn[5] = {"nop", "yield", "wfe", "wfi", "sev"}; return fc < 5 ? hn[fc] : "hint"; }
+                int tz = 0; while (!((mask >> tz) & 1)) tz++;
+                int n = 4 - tz; Str s = "it";
+                for (int i = 1; i < n; i++) s += (((mask >> (4 - i)) & 1) == (fc & 1)) ? "t" : "e";
+                return s + " " + CCN[fc];
+            }
+            break;
+        }
+        case 24: case 25: {
+            rn = (h >> 8) & 7; uint32_t regs = h & 0xFF; bool ld = (h >> 11) == 25;
+            bool wb = !(ld && (regs & (1u << rn)));
+            return Str(ld ? "ldm " : "stm ") + RN[rn] + (wb ? "!, " : ", ") + rlist(regs);
+        }
+        case 26: case 27: {
+            int c = (h >> 8) & 0xF;
+            if (c == 0xF) return "svc " + dn(h & 0xFF);
+            if (c == 0xE) return "udf " + dn(h & 0xFF);
+            return Str("b") + CCN[c] + " " + h0(pc + (uint32_t)(sext(h & 0xFF, 8) * 2));
+        }
+        case 28: return "b " + h0(pc + (uint32_t)(sext(h & 0x7FF, 11) * 2));
+    }
+    char b[24]; snprintf(b, sizeof b, ".hword 0x%04x", h); return b;
+}
+
+static Str shiftStr(int type, uint32_t imm5) {
+    if (imm5 == 0 && type == 0) return "";
+    if (imm5 == 0 && type == 3) return ", rrx";
+    if (imm5 == 0) imm5 = 32;
+    static const char *t[4] = {"lsl", "lsr", "asr", "ror"};
+    return Str(", ") + t[type] + " " + dn(imm5);
+}
+
+static Str dis32(const Img &im, uint32_t addr, uint16_t h1, uint16_t h2) {
+    uint32_t pc = addr + 4;
+    uint32_t hi = h1 >> 11;
+    Br br;
+    if (decodeBr(h1, h2, addr, br)) {
+        if (br.kind == 1) return "bl " + h0(br.target);
+        if (br.kind == 2) return "b.w " + h0(br.target);
+        if (br.kind == 3) return "blx " + h0(br.target);
+        return Str("b") + CCN[br.cond] + ".w " + h0(br.target);
+    }
+    // --- load/store single
+    if ((h1 & 0xFE00) == 0xF800) {
+        int size = (h1 >> 5) & 3, sign = (h1 >> 8) & 1, L = (h1 >> 4) & 1, rn = h1 & 0xF, rt = (h2 >> 12) & 0xF;
+        const char *nm = nullptr;
+        if (size != 3) {
+            if (L) nm = !sign ? (size == 0 ? "ldrb" : size == 1 ? "ldrh" : "ldr") : (size == 0 ? "ldrsb" : size == 1 ? "ldrsh" : nullptr);
+            else if (!sign) nm = size == 0 ? "strb" : size == 1 ? "strh" : "str";
+        }
+        if (nm) {
+            Str mn = Str(nm) + ".w ";
+            if (rn == 15 && L) {
+                uint32_t imm = h2 & 0xFFF, lit = ((h1 >> 7) & 1) ? (pc & ~3u) + imm : (pc & ~3u) - imm;
+                return mn + RN[rt] + ", [" + h8(lit) + "]" + litNote(im, lit);
+            }
+            if (h1 & 0x80) return mn + RN[rt] + ", " + memop(rn, (int32_t)(h2 & 0xFFF));
+            if ((h2 & 0x800) && (h2 & 0xF00) != 0xE00) {
+                int P = (h2 >> 10) & 1, U = (h2 >> 9) & 1, W = (h2 >> 8) & 1; int32_t imm = h2 & 0xFF; if (!U) imm = -imm;
+                if (P) return mn + RN[rt] + ", " + memop(rn, imm) + (W ? "!" : "");
+                return mn + RN[rt] + ", [" + RN[rn] + "], " + ds(imm);
+            }
+            if ((h2 >> 6) == 0) {
+                int rm = h2 & 0xF, sh = (h2 >> 4) & 3;
+                return mn + RN[rt] + ", [" + RN[rn] + ", " + RN[rm] + (sh ? ", lsl " + dn(sh) : Str("")) + "]";
+            }
+        }
+    }
+    // --- data processing (modified immediate) / plain binary immediate
+    if (hi == 0x1E && !(h2 & 0x8000)) {
+        int rn = h1 & 0xF, rd = (h2 >> 8) & 0xF;
+        uint32_t i = (h1 >> 10) & 1, imm3 = (h2 >> 12) & 7, imm8 = h2 & 0xFF, imm12 = (i << 11) | (imm3 << 8) | imm8;
+        if (!(h1 & 0x200)) {
+            int op = (h1 >> 5) & 0xF, S = (h1 >> 4) & 1; uint32_t v = thumbExpand(imm12);
+            static const char *nm[16] = {"and", "bic", "orr", "orn", "eor", "", "", "", "add", "", "adc", "sbc", "", "sub", "rsb", ""};
+            Str sfx = S ? "s.w " : ".w ";
+            if (rd == 15 && S && (op == 0 || op == 4 || op == 8 || op == 13)) {
+                const char *t = op == 0 ? "tst.w " : op == 4 ? "teq.w " : op == 8 ? "cmn.w " : "cmp.w ";
+                return Str(t) + RN[rn] + ", " + dn(v);
+            }
+            if (op == 2 && rn == 15) return Str(S ? "movs.w " : "mov.w ") + RN[rd] + ", " + dn(v);
+            if (op == 3 && rn == 15) return Str(S ? "mvns.w " : "mvn.w ") + RN[rd] + ", " + dn(v);
+            if (nm[op][0]) return Str(nm[op]) + sfx + RN[rd] + ", " + RN[rn] + ", " + dn(v);
+        } else {
+            int op = (h1 >> 4) & 0x1F;
+            if (op == 0x04 || op == 0x0C) {
+                uint32_t imm16 = ((uint32_t)(h1 & 0xF) << 12) | imm12;
+                return Str(op == 0x04 ? "movw " : "movt ") + RN[rd] + ", " + dn(imm16);
+            }
+            if (op == 0x00) return rn == 15 ? Str("adr.w ") + RN[rd] + ", " + h0((pc & ~3u) + imm12) : Str("addw ") + RN[rd] + ", " + RN[rn] + ", " + dn(imm12);
+            if (op == 0x0A) return rn == 15 ? Str("adr.w ") + RN[rd] + ", " + h0((pc & ~3u) - imm12) : Str("subw ") + RN[rd] + ", " + RN[rn] + ", " + dn(imm12);
+            if (op == 0x14 || op == 0x1C) {
+                uint32_t lsb = (imm3 << 2) | ((h2 >> 6) & 3), w = (h2 & 0x1F) + 1;
+                return Str(op == 0x14 ? "sbfx " : "ubfx ") + RN[rd] + ", " + RN[rn] + ", " + dn(lsb) + ", " + dn(w);
+            }
+            if (op == 0x16) {
+                uint32_t lsb = (imm3 << 2) | ((h2 >> 6) & 3), msb = h2 & 0x1F, w = msb >= lsb ? msb - lsb + 1 : 0;
+                if (rn == 15) return Str("bfc ") + RN[rd] + ", " + dn(lsb) + ", " + dn(w);
+                return Str("bfi ") + RN[rd] + ", " + RN[rn] + ", " + dn(lsb) + ", " + dn(w);
+            }
+        }
+    }
+    // --- data processing (shifted register)
+    if ((h1 & 0xFE00) == 0xEA00) {
+        int op = (h1 >> 5) & 0xF, S = (h1 >> 4) & 1, rn = h1 & 0xF, rd = (h2 >> 8) & 0xF, rm = h2 & 0xF, type = (h2 >> 4) & 3;
+        uint32_t imm5 = (((h2 >> 12) & 7) << 2) | ((h2 >> 6) & 3);
+        static const char *nm[16] = {"and", "bic", "orr", "orn", "eor", "", "pkh", "", "add", "", "adc", "sbc", "", "sub", "rsb", ""};
+        if (rd == 15 && S && (op == 0 || op == 4 || op == 8 || op == 13)) {
+            const char *t = op == 0 ? "tst.w " : op == 4 ? "teq.w " : op == 8 ? "cmn.w " : "cmp.w ";
+            return Str(t) + RN[rn] + ", " + RN[rm] + shiftStr(type, imm5);
+        }
+        if (op == 2 && rn == 15) {
+            if (type == 0 && imm5 == 0) return Str(S ? "movs.w " : "mov.w ") + RN[rd] + ", " + RN[rm];
+            if (type == 3 && imm5 == 0) return Str(S ? "rrxs " : "rrx ") + RN[rd] + ", " + RN[rm];
+            static const char *t[4] = {"lsl", "lsr", "asr", "ror"};
+            return Str(t[type]) + (S ? "s.w " : ".w ") + RN[rd] + ", " + RN[rm] + ", " + dn(imm5 ? imm5 : 32);
+        }
+        if (op == 3 && rn == 15) return Str(S ? "mvns.w " : "mvn.w ") + RN[rd] + ", " + RN[rm] + shiftStr(type, imm5);
+        if (nm[op][0]) return Str(nm[op]) + (S ? "s.w " : ".w ") + RN[rd] + ", " + RN[rn] + ", " + RN[rm] + shiftStr(type, imm5);
+    }
+    // --- register-controlled shifts
+    if ((h1 & 0xFF80) == 0xFA00 && (h2 & 0xF0F0) == 0xF000) {
+        static const char *t[4] = {"lsl", "lsr", "asr", "ror"};
+        return Str(t[(h1 >> 5) & 3]) + (((h1 >> 4) & 1) ? "s.w " : ".w ") + RN[(h2 >> 8) & 0xF] + ", " + RN[h1 & 0xF] + ", " + RN[h2 & 0xF];
+    }
+    // --- multiply / divide
+    if ((h1 & 0xFFF0) == 0xFB00) {
+        int rn = h1 & 0xF, rd = (h2 >> 8) & 0xF, rm = h2 & 0xF, ra = (h2 >> 12) & 0xF;
+        if (ra == 15 && (h2 & 0xF0) == 0) return Str("mul ") + RN[rd] + ", " + RN[rn] + ", " + RN[rm];
+        if ((h2 & 0xF0) == 0) return Str("mla ") + RN[rd] + ", " + RN[rn] + ", " + RN[rm] + ", " + RN[ra];
+        if ((h2 & 0xF0) == 0x10) return Str("mls ") + RN[rd] + ", " + RN[rn] + ", " + RN[rm] + ", " + RN[ra];
+    }
+    if (((h1 & 0xFFF0) == 0xFB90 || (h1 & 0xFFF0) == 0xFBB0) && (h2 & 0xF0F0) == 0xF0F0)
+        return Str((h1 & 0x20) ? "udiv " : "sdiv ") + RN[(h2 >> 8) & 0xF] + ", " + RN[h1 & 0xF] + ", " + RN[h2 & 0xF];
+    if (((h1 & 0xFFF0) == 0xFBA0 || (h1 & 0xFFF0) == 0xFB80) && (h2 & 0xF0) == 0)
+        return Str((h1 & 0x20) ? "umull " : "smull ") + RN[(h2 >> 12) & 0xF] + ", " + RN[(h2 >> 8) & 0xF] + ", " + RN[h1 & 0xF] + ", " + RN[h2 & 0xF];
+    // --- ldm/stm, push/pop
+    if ((h1 & 0xFE40) == 0xE800) {
+        int op = (h1 >> 7) & 3, W = (h1 >> 5) & 1, L = (h1 >> 4) & 1, rn = h1 & 0xF;
+        if (op == 2 && !L && W && rn == 13) return "push.w " + rlist(h2);
+        if (op == 1 && L && W && rn == 13) return "pop.w " + rlist(h2);
+        if (op == 1 || op == 2) return Str(L ? "ldm" : "stm") + (op == 1 ? "" : "db") + ".w " + RN[rn] + (W ? "!, " : ", ") + rlist(h2);
+    }
+    if ((h1 & 0xFFF0) == 0xE8D0 && (h2 & 0xFFE0) == 0xF000) {
+        bool tbh = h2 & 0x10;
+        return Str(tbh ? "tbh [" : "tbb [") + RN[h1 & 0xF] + ", " + RN[h2 & 0xF] + (tbh ? ", lsl 1]" : "]");
+    }
+    if ((h1 & 0xFE40) == 0xE840) {
+        int P = (h1 >> 8) & 1, U = (h1 >> 7) & 1, W = (h1 >> 5) & 1, L = (h1 >> 4) & 1, rn = h1 & 0xF;
+        if (P || W) {
+            int32_t imm = (int32_t)(h2 & 0xFF) * 4; if (!U) imm = -imm;
+            Str o = Str(L ? "ldrd " : "strd ") + RN[(h2 >> 12) & 0xF] + ", " + RN[(h2 >> 8) & 0xF] + ", ";
+            if (P) return o + memop(rn, imm) + (W ? "!" : "");
+            return o + "[" + RN[rn] + "], " + ds(imm);
+        }
+    }
+    // --- VFP (одинарная/двойная точность, основные команды)
+    if ((h1 >> 10) == 0x3B) {
+        int cp = (h2 >> 8) & 0xF, sz = cp & 1;
+        if ((cp & 0xE) == 0xA) {
+            int D = (h1 >> 6) & 1, vd = (h2 >> 12) & 0xF, N = (h2 >> 7) & 1, M = (h2 >> 5) & 1, vn = h1 & 0xF, vm = h2 & 0xF;
+            auto R = [&](int v, int x) { return sz ? dreg((x << 4) | v) : sreg((v << 1) | x); };
+            if ((h1 & 0xFF20) == 0xED00) {
+                int L = (h1 >> 4) & 1, U = (h1 >> 7) & 1, rn = h1 & 0xF; uint32_t imm = (uint32_t)(h2 & 0xFF) * 4;
+                Str nm = L ? "vldr " : "vstr ";
+                if (rn == 15) { uint32_t lit = U ? (pc & ~3u) + imm : (pc & ~3u) - imm; return nm + R(vd, D) + ", [" + h8(lit) + "]" + litNote(im, lit); }
+                return nm + R(vd, D) + ", " + memop(rn, U ? (int32_t)imm : -(int32_t)imm);
+            }
+            if ((h1 & 0xFFBF) == 0xEEB4 && (h2 & 0x0E50) == 0x0A40)
+                return Str((h2 & 0x80) ? "vcmpe" : "vcmp") + (sz ? ".f64 " : ".f32 ") + R(vd, D) + ", " + R(vm, M);
+            if ((h1 & 0xFFBF) == 0xEEB5 && (h2 & 0x0E7F) == 0x0A40)
+                return Str((h2 & 0x80) ? "vcmpe" : "vcmp") + (sz ? ".f64 " : ".f32 ") + R(vd, D) + ", 0";
+            if (h1 == 0xEEF1 && (h2 & 0x0FFF) == 0x0A10) { int rt = (h2 >> 12) & 0xF; return rt == 15 ? "vmrs apsr_nzcv, fpscr" : Str("vmrs ") + RN[rt] + ", fpscr"; }
+            if (h1 == 0xEEE1 && (h2 & 0x0FFF) == 0x0A10) return Str("vmsr fpscr, ") + RN[(h2 >> 12) & 0xF];
+            if ((h1 & 0xFFE0) == 0xEE00 && (h2 & 0x0F7F) == 0x0A10) {
+                int rt = (h2 >> 12) & 0xF; Str s = sreg((vn << 1) | N);
+                return ((h1 >> 4) & 1) ? Str("vmov ") + RN[rt] + ", " + s : "vmov " + s + ", " + RN[rt];
+            }
+            if ((h2 & 0x0E10) == 0x0A00) {
+                int op6 = (h2 >> 6) & 1; const char *t = nullptr;
+                if ((h1 & 0xFFB0) == 0xEE30) t = op6 ? "vsub" : "vadd";
+                else if ((h1 & 0xFFB0) == 0xEE20) t = op6 ? "vnmul" : "vmul";
+                else if ((h1 & 0xFFB0) == 0xEE80 && !op6) t = "vdiv";
+                if (t) return Str(t) + (sz ? ".f64 " : ".f32 ") + R(vd, D) + ", " + R(vn, N) + ", " + R(vm, M);
+                if ((h1 & 0xFFB0) == 0xEEB0 && op6 && vn <= 1) {
+                    const char *u = vn == 0 ? ((h2 & 0x80) ? "vabs" : "vmov") : ((h2 & 0x80) ? "vsqrt" : "vneg");
+                    return Str(u) + (sz ? ".f64 " : ".f32 ") + R(vd, D) + ", " + R(vm, M);
+                }
+            }
+        }
+    }
+    char b[40]; snprintf(b, sizeof b, ".inst.w 0x%04x%04x", h1, h2); return b;
+}
+
+static Str disOne(const Img &im, uintptr_t a, int &len) {
+    uint32_t v = (uint32_t)(a - im.base);
+    const Seg *g = segAt(im, a, 2);
+    if (!g) { len = 2; return "?"; }
+    uint16_t h = rd16(a);
+    if ((h >> 11) >= 0x1D) {
+        if (a + 4 > g->e) { len = 2; char b[24]; snprintf(b, sizeof b, ".hword 0x%04x", h); return b; }
+        len = 4;
+        return dis32(im, v, h, rd16(a + 2));
+    }
+    len = 2;
+    return dis16(im, v, h);
+}
+
+static Str disasm(const Img &im, uintptr_t off, size_t n) {
+    uintptr_t a = (im.base + off) & ~(uintptr_t)1;
+    Str out; char b[16];
+    for (size_t i = 0; i < n; i++) {
+        if (!segAt(im, a, 2)) break;
+        int len; Str t = disOne(im, a, len);
+        Str bytes;
+        for (int k = 0; k < len; k++) { snprintf(b, sizeof b, "%02x", *(const uint8_t *)(a + k)); bytes += b; }
+        char hd[32]; snprintf(hd, sizeof hd, "0x%08x  ", (unsigned)(a - im.base));
+        out += hd + bytes + (len == 2 ? "      " : "  ") + t + "\n";
+        a += len;
+    }
+    return out.empty() ? "адрес вне читаемых сегментов\n" : out;
+}
+
+// кто вызывает функцию: bl / blx / b.w на заданное смещение
+static Str findCallers(const Img &im, uint32_t target, size_t maxr) {
+    target &= ~1u;
+    Str out; size_t found = 0;
+    for (const Seg &g : im.segs) {
+        if (!g.r || !g.x) continue;
+        for (uintptr_t a = g.s; a + 4 <= g.e; a += 2) {
+            uint16_t h1 = rd16(a);
+            if ((h1 & 0xF800) != 0xF000) continue;
+            Br br;
+            if (!decodeBr(h1, rd16(a + 2), (uint32_t)(a - im.base), br) || br.kind == 4) continue;
+            if (br.target != target) continue;
+            uintptr_t fs = fnStart(im, a);
+            out += Str(br.kind == 1 ? "bl" : br.kind == 2 ? "b.w" : "blx") + " в " + hx(a - im.base) + "  -> функция ~" + (fs ? hx(fs - im.base) : Str("?")) + "\n";
+            if (++found >= maxr) { out += "...лимит\n"; return out; }
+        }
+    }
+    return found ? out : "вызовов не найдено (ищутся только bl/blx/b.w; вызов через указатель или vtable не виден)\n";
+}
+
 // ---------------------------------------------------------------- патчи
 static std::map<uintptr_t, std::vector<uint8_t>> g_patches;   // смещение -> оригинальные байты
 
@@ -295,6 +666,103 @@ static Str writeMem(const Img &im, uintptr_t off, const std::vector<uint8_t> &b,
     mprotect((void *)p, len, orig);
     __builtin___clear_cache((char *)a, (char *)(a + b.size()));
     return "ok: записано " + std::to_string(b.size()) + " байт по " + hx(off) + "\n";
+}
+
+// ---------------------------------------------------------------- сохранение патчей между запусками
+struct Saved { uintptr_t off; std::vector<uint8_t> orig, now; };
+static std::vector<Saved> g_saved;
+static std::mutex g_mu;
+
+static Str dataDir() {
+    const char *e = getenv("MGG_DATA");
+    if (e && *e) return e;
+    char b[256] = {0};
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (f) { size_t n = fread(b, 1, sizeof b - 1, f); b[n] = 0; fclose(f); }
+    Str p = b;
+    size_t c = p.find(':');
+    if (c != Str::npos) p = p.substr(0, c);
+    return "/data/data/" + p;
+}
+static Str patchFile() { return dataDir() + "/mgg_patches.txt"; }
+
+static Str hexs(const std::vector<uint8_t> &v) {
+    Str o; char b[4];
+    for (uint8_t x : v) { snprintf(b, sizeof b, "%02X", x); o += b; }
+    return o;
+}
+static bool unhex(const Str &s, std::vector<uint8_t> &o) {
+    if (s.empty() || s.size() % 2) return false;
+    for (size_t i = 0; i < s.size(); i += 2) {
+        if (!isxdigit((unsigned char)s[i]) || !isxdigit((unsigned char)s[i + 1])) return false;
+        o.push_back((uint8_t)strtol(s.substr(i, 2).c_str(), nullptr, 16));
+    }
+    return true;
+}
+static void saveFile() {
+    FILE *f = fopen(patchFile().c_str(), "w");
+    if (!f) { LOGI("не могу писать %s", patchFile().c_str()); return; }
+    for (const Saved &s : g_saved) fprintf(f, "%lX %s %s\n", (unsigned long)s.off, hexs(s.orig).c_str(), hexs(s.now).c_str());
+    fclose(f);
+}
+static void loadFile() {
+    g_saved.clear();
+    FILE *f = fopen(patchFile().c_str(), "r");
+    if (!f) return;
+    char line[2048];
+    while (fgets(line, sizeof line, f)) {
+        char a[32], o[1024], n[1024];
+        if (sscanf(line, "%31s %1023s %1023s", a, o, n) != 3) continue;
+        Saved s; s.off = (uintptr_t)strtoull(a, nullptr, 16);
+        if (unhex(o, s.orig) && unhex(n, s.now) && s.orig.size() == s.now.size()) g_saved.push_back(s);
+    }
+    fclose(f);
+}
+
+static Str doPatch(const Img &im, uintptr_t off, const std::vector<uint8_t> &b, bool keep) {
+    auto it = g_patches.find(off);
+    if (it != g_patches.end() && it->second.size() != b.size()) return "по этому смещению уже есть патч другой длины: сначала откати\n";
+    Str r = writeMem(im, off, b, true);
+    if (r.compare(0, 2, "ok") != 0) return r;
+    if (keep) {
+        Saved s; s.off = off; s.orig = g_patches[off]; s.now = b;
+        for (size_t i = 0; i < g_saved.size(); i++) if (g_saved[i].off == off) { g_saved.erase(g_saved.begin() + i); break; }
+        g_saved.push_back(s);
+        saveFile();
+        r += "сохранён: применится при следующих запусках\n";
+    }
+    return r;
+}
+
+// автоприменение сохранённых патчей через несколько секунд после старта игры
+static void autoApply() {
+    Img im;
+    for (int i = 0; i < 120; i++) { im = Img(); if (loadImg(im)) break; sleep(1); }
+    if (im.segs.empty()) return;
+    sleep(8);
+    std::lock_guard<std::mutex> lk(g_mu);
+    Str lock = dataDir() + "/mgg_apply.lock";
+    loadFile();
+    if (g_saved.empty()) return;
+    if (access(lock.c_str(), F_OK) == 0) {                       // прошлый запуск упал, пока патчи применялись
+        rename(patchFile().c_str(), (patchFile() + ".disabled").c_str());
+        remove(lock.c_str());
+        g_saved.clear();
+        LOGI("прошлый запуск упал после применения патчей: они отключены (файл .disabled)");
+        return;
+    }
+    FILE *lf = fopen(lock.c_str(), "w"); if (lf) fclose(lf);
+    im = Img(); loadImg(im);
+    for (const Saved &s : g_saved) {
+        uintptr_t a = im.base + s.off;
+        if (!segAt(im, a, s.now.size())) { LOGI("патч %lX вне сегмента", (unsigned long)s.off); continue; }
+        std::vector<uint8_t> cur((uint8_t *)a, (uint8_t *)a + s.now.size());
+        if (cur == s.now) continue;
+        if (cur != s.orig) { LOGI("патч %lX пропущен: байты не совпали (другая версия игры?)", (unsigned long)s.off); continue; }
+        Str r = writeMem(im, s.off, s.now, true);
+        LOGI("автопатч %lX: %s", (unsigned long)s.off, r.c_str());
+    }
+    std::thread([lock] { sleep(45); remove(lock.c_str()); }).detach();   // игра прожила 45 с: считаем запуск безопасным
 }
 
 // ---------------------------------------------------------------- хуки (нужен Dobby)
@@ -358,10 +826,21 @@ pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border
 <button onclick="call('fn',{a:v('fa')})">Найти начало</button></section>
 <section><h3>Hex</h3><input id=ha placeholder="смещение, hex"><input id=hn placeholder="байт (десятичное, до 4096)">
 <button onclick="call('hex',{a:v('ha'),n:v('hn')||128})">Показать</button></section>
+<section><h3>Дизассемблер (Thumb)</h3><input id=da placeholder="смещение, hex"><input id=dn placeholder="сколько команд (по умолч. 24, до 200)">
+<button onclick="call('dis',{a:v('da'),n:v('dn')||24})">Показать команды</button></section>
+<section><h3>Кто вызывает функцию</h3><input id=ca placeholder="начало функции, hex">
+<button onclick="call('callers',{a:v('ca'),max:60})">Найти вызовы</button></section>
 <section><h3>Патч байтов</h3><input id=pa placeholder="смещение, hex"><input id=pb placeholder="байты: 00 20 70 47">
-<button onclick="call('patch',{a:v('pa'),b:v('pb')})">Записать</button>
+<select id=pk><option value=0>только сейчас</option><option value=1>сохранять на следующие запуски</option></select>
+<button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})">Записать</button>
 <button onclick="call('undo',{a:v('pa')})">Откатить по смещению</button>
-<button onclick="call('patches',{})">Список патчей</button></section>
+<button onclick="call('patches',{})">Список патчей (сессия)</button>
+<button onclick="call('saved',{})">Сохранённые патчи</button>
+<button onclick="call('clearsaved',{})">Удалить все сохранённые</button></section>
+<section><h3>Быстрые правки (Thumb)</h3><input id=qa placeholder="начало функции, hex"><input id=qv placeholder="число для ret, hex (0-FF)">
+<button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})">Функция возвращает число</button>
+<input id=qn placeholder="сколько NOP (по умолч. 1)">
+<button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})">Забить NOP-ами</button></section>
 <section><h3>Хук (нужна сборка с Dobby)</h3><input id=ka placeholder="смещение функции, hex">
 <select id=km><option value=log>лог (считать вызовы)</option><option value=ret>вернуть значение (без вызова)</option><option value=set>вызвать и подменить результат</option></select>
 <input id=kv placeholder="значение, hex (для ret/set)">
@@ -379,6 +858,7 @@ function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navig
 </script></body></html>)MGG";
 
 static Str route(const Str &path, const Params &q) {
+    std::lock_guard<std::mutex> lk(g_mu);
     Img im;
     if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
     uintptr_t a = 0;
@@ -411,18 +891,31 @@ static Str route(const Str &path, const Params &q) {
     if (path == "patch") {
         std::vector<uint8_t> b;
         if (!hexNum(q, "a", a) || !parseBytes(P(q, "b"), b)) return "нужны a (hex) и b (байты, без масок)\n";
-        return writeMem(im, a, b, true);
+        return doPatch(im, a, b, P(q, "k") == "1");
+    }
+    if (path == "quick") {
+        if (!hexNum(q, "a", a)) return "нужен параметр a (hex)\n";
+        std::vector<uint8_t> b; Str m = P(q, "m");
+        if (m == "ret") {
+            uintptr_t v = 0; hexNum(q, "v", v);
+            if (v > 255) return "значение больше FF: шаблон не подходит (пришли байты функции)\n";
+            b = {(uint8_t)v, 0x20, 0x70, 0x47};                                  // movs r0,#v ; bx lr  (Thumb)
+        } else if (m == "nop") {
+            size_t n = decNum(q, "n", 1); if (n < 1) n = 1; if (n > 32) n = 32;
+            for (size_t i = 0; i < n; i++) { b.push_back(0x00); b.push_back(0xBF); }   // nop (Thumb)
+        } else return "неизвестный режим\n";
+        return doPatch(im, a, b, P(q, "k") == "1");
     }
     if (path == "undo") {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex)\n";
         auto it = g_patches.find(a);
-        if (it == g_patches.end()) return "патча по этому смещению нет\n";
-        Str r = writeMem(im, a, it->second, false);
-        g_patches.erase(it);
-        return "откат: " + r;
+        Str r = "патча по этому смещению нет в этой сессии\n";
+        if (it != g_patches.end()) { r = "откат: " + writeMem(im, a, it->second, false); g_patches.erase(it); }
+        for (size_t i = 0; i < g_saved.size(); i++) if (g_saved[i].off == a) { g_saved.erase(g_saved.begin() + i); saveFile(); r += "убран из сохранённых\n"; break; }
+        return r;
     }
     if (path == "patches") {
-        if (g_patches.empty()) return "патчей нет\n";
+        if (g_patches.empty()) return "патчей в этой сессии нет\n";
         Str o;
         for (auto &kv : g_patches) {
             o += hx(kv.first) + "  оригинал:";
@@ -431,6 +924,27 @@ static Str route(const Str &path, const Params &q) {
             o += "\n";
         }
         return o;
+    }
+    if (path == "saved") {
+        if (g_saved.empty()) loadFile();
+        if (g_saved.empty()) return "сохранённых патчей нет\n";
+        Str o = "файл: " + patchFile() + "\n";
+        for (const Saved &s : g_saved) o += hx(s.off) + "  " + hexs(s.orig) + " -> " + hexs(s.now) + "\n";
+        return o;
+    }
+    if (path == "clearsaved") {
+        g_saved.clear();
+        remove(patchFile().c_str());
+        return "сохранённые патчи удалены (уже применённые в памяти остаются до перезапуска игры)\n";
+    }
+    if (path == "dis") {
+        if (!hexNum(q, "a", a)) return "нужен параметр a (hex)\n";
+        size_t n = decNum(q, "n", 24); if (n > 200) n = 200;
+        return disasm(im, a, n);
+    }
+    if (path == "callers") {
+        if (!hexNum(q, "a", a)) return "нужен параметр a (hex, начало функции)\n";
+        return findCallers(im, (uint32_t)a, decNum(q, "max", 60));
     }
 #ifdef MGG_HAS_DOBBY
     if (path == "hooks") return hooksList();
@@ -521,5 +1035,8 @@ static void serve() {
 }
 
 #ifndef MGG_NO_AUTOSTART
-__attribute__((constructor)) static void mggInit() { std::thread(serve).detach(); }
+__attribute__((constructor)) static void mggInit() {
+    std::thread(serve).detach();
+    std::thread(autoApply).detach();
+}
 #endif
