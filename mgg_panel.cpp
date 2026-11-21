@@ -19,6 +19,10 @@
 #include <mutex>
 #include <utility>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <climits>
+#include <algorithm>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -800,6 +804,128 @@ static Str hooksList() {
 }
 #endif
 
+// ---------------------------------------------------------------- файлы игры (только внутри папок приложения)
+static Str baseName(const Str &p) { size_t i = p.rfind('/'); return i == Str::npos ? p : p.substr(i + 1); }
+
+static std::vector<Str> fileRoots() {
+    Str d = dataDir(), pkg = baseName(d);
+    return {d, "/storage/emulated/0/Android/data/" + pkg, "/sdcard/Android/data/" + pkg};
+}
+
+static bool allowedPath(const Str &p, Str &real, Str &err) {
+    if (p.empty()) { err = "нужен параметр p (путь)"; return false; }
+    char buf[PATH_MAX];
+    if (!realpath(p.c_str(), buf)) { err = "путь не найден: " + p; return false; }
+    real = buf;
+    for (const Str &r : fileRoots()) {
+        char rb[PATH_MAX];
+        if (!realpath(r.c_str(), rb)) continue;
+        Str rr = rb;
+        if (real == rr || (real.size() > rr.size() && real.compare(0, rr.size(), rr) == 0 && real[rr.size()] == '/')) return true;
+    }
+    err = "путь вне папок игры (разрешены данные приложения и Android/data/<пакет>)";
+    return false;
+}
+
+static bool readFile(const Str &path, Str &out, size_t maxn = 1 << 20) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char b[4096]; size_t n;
+    while ((n = fread(b, 1, sizeof b, f)) > 0 && out.size() < maxn) out.append(b, n);
+    fclose(f);
+    return true;
+}
+
+static bool writeFile(const Str &path, const Str &data) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    fclose(f);
+    return ok;
+}
+
+static bool backupOnce(const Str &path, const Str &cur) {
+    Str bak = path + ".mgg.bak";
+    if (access(bak.c_str(), F_OK) == 0) return true;
+    return writeFile(bak, cur);
+}
+
+static Str fileRoute(const Str &path, const Params &q) {
+    Str real, err;
+    if (path == "ls") {
+        Str p = P(q, "p");
+        if (p.empty()) {
+            Str o = "папки игры:\n";
+            for (const Str &r : fileRoots()) { char rb[PATH_MAX]; if (realpath(r.c_str(), rb)) o += "  " + Str(rb) + "\n"; }
+            Str opt = "/storage/emulated/0/Android/data/" + baseName(dataDir()) + "/files/games/com.mojang/minecraftpe/options.txt";
+            if (access(opt.c_str(), F_OK) == 0) o += "\noptions.txt:\n  " + opt + "\n";
+            return o;
+        }
+        if (!allowedPath(p, real, err)) return err + "\n";
+        DIR *d = opendir(real.c_str());
+        if (!d) return "это не папка или нет доступа\n";
+        std::vector<Str> names; struct dirent *e;
+        while ((e = readdir(d)) != nullptr) { Str n = e->d_name; if (n != "." && n != "..") names.push_back(n); }
+        closedir(d);
+        std::sort(names.begin(), names.end());
+        Str o = real + "\n";
+        for (size_t i = 0; i < names.size() && i < 300; i++) {
+            struct stat st;
+            Str full = real + "/" + names[i];
+            if (stat(full.c_str(), &st) == 0) o += (S_ISDIR(st.st_mode) ? "[d] " : "    ") + names[i] + (S_ISDIR(st.st_mode) ? "/" : "  " + std::to_string((long long)st.st_size) + " байт") + "\n";
+            else o += "    " + names[i] + "\n";
+        }
+        if (names.size() > 300) o += "...ещё " + std::to_string(names.size() - 300) + "\n";
+        return o;
+    }
+    if (!allowedPath(P(q, "p"), real, err)) return err + "\n";
+    struct stat st;
+    if (stat(real.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return "это не обычный файл\n";
+    if (path == "cat") {
+        Str d;
+        if (!readFile(real, d, 65536)) return "не могу прочитать файл\n";
+        return d.empty() ? "(пустой файл)\n" : d;
+    }
+    Str cur;
+    if (path == "setkey") {                                   // формат "ключ:значение" (options.txt)
+        Str k = P(q, "k"), v = P(q, "v");
+        if (k.empty() || k.find('\n') != Str::npos || v.find('\n') != Str::npos) return "нужны k и v без переводов строк\n";
+        if (!readFile(real, cur)) return "не могу прочитать файл\n";
+        if (!backupOnce(real, cur)) return "не могу сделать копию .mgg.bak, правка отменена\n";
+        Str out, line, prefix = k + ":"; bool done = false; size_t i = 0;
+        while (i <= cur.size()) {
+            size_t j = cur.find('\n', i);
+            bool last = j == Str::npos;
+            if (last) j = cur.size();
+            line = cur.substr(i, j - i);
+            bool cr = !line.empty() && line.back() == '\r';
+            if (!done && line.compare(0, prefix.size(), prefix) == 0) { out += prefix + v + (cr ? "\r" : ""); done = true; }
+            else out += line;
+            if (!last) out += "\n";
+            i = j + 1;
+            if (last) break;
+        }
+        if (!done) { if (!out.empty() && out.back() != '\n') out += "\n"; out += prefix + v + "\n"; }
+        return writeFile(real, out) ? Str("ok: ") + k + " = " + v + (done ? " (заменено)\n" : " (добавлено)\n") + "копия: " + real + ".mgg.bak\n" : "не удалось записать файл\n";
+    }
+    if (path == "freplace") {                                 // заменить первое вхождение текста a на b
+        Str a = P(q, "a"), b = P(q, "b");
+        if (a.empty()) return "нужен параметр a\n";
+        if (!readFile(real, cur)) return "не могу прочитать файл\n";
+        size_t at = cur.find(a);
+        if (at == Str::npos) return "текст не найден\n";
+        if (!backupOnce(real, cur)) return "не могу сделать копию .mgg.bak, правка отменена\n";
+        cur.replace(at, a.size(), b);
+        return writeFile(real, cur) ? "ok: заменено\nкопия: " + real + ".mgg.bak\n" : "не удалось записать файл\n";
+    }
+    if (path == "frestore") {
+        Str bak = real + ".mgg.bak", d;
+        if (!readFile(bak, d)) return "копии .mgg.bak нет\n";
+        return writeFile(real, d) ? "ok: файл восстановлен из .mgg.bak\n" : "не удалось записать файл\n";
+    }
+    return "неизвестный маршрут\n";
+}
+
 // ---------------------------------------------------------------- маршруты
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>MGG panel</title>
@@ -809,11 +935,14 @@ h1{font-size:18px;margin:0 0 6px}h3{font-size:14px;margin:0 0 4px;color:#9ab}
 section{background:#1b1b1f;border-radius:10px;padding:8px;margin:8px 0}
 input,select,button{font:inherit;padding:8px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;margin:2px 0;width:100%;box-sizing:border-box}
 button{background:#3b5bdb;border:0}
+.tabs{display:flex;gap:6px;margin:8px 0}.tabs button{flex:1;background:#333;margin:0}.tabs button.on{background:#3b5bdb}
 pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border-radius:8px;min-height:90px;max-height:40vh;overflow:auto}
 </style></head><body>
 <h1>MGG panel</h1>
 <pre id=out>Нажми «Инфо»</pre>
 <button onclick="cp()">Скопировать результат</button>
+<div class=tabs><button id=bl class=on onclick="tab('l')">Lib</button><button id=bf onclick="tab('f')">File</button></div>
+<div id=tl>
 <section><h3>Инфо</h3><button onclick="call('info',{})">База и сегменты</button></section>
 <section><h3>Сигнатура (hex, ?? — любой байт)</h3>
 <input id=sp placeholder="F0 B5 03 AF ?? ??"><select id=sa><option value=0>только код</option><option value=1>вся библиотека</option></select>
@@ -849,8 +978,20 @@ pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border
 <button onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})">Сменить режим</button>
 <button onclick="call('unhook',{id:v('ki')})">Снять</button>
 <button onclick="call('hooks',{})">Список хуков</button></section>
+</div>
+<div id=tf style="display:none">
+<section><h3>Файлы игры</h3><input id=fp placeholder="путь (пусто = показать папки игры)">
+<button onclick="call('ls',{p:v('fp')})">Список</button><button onclick="call('cat',{p:v('fp')})">Показать файл</button>
+<input id=fk placeholder="ключ (например gfx_viewdistance)"><input id=fv placeholder="значение (например 20)">
+<button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})">Задать ключ:значение</button>
+<input id=fa placeholder="найти текст"><input id=fb placeholder="заменить на">
+<button onclick="call('freplace',{p:v('fp'),a:v('fa'),b:v('fb')})">Заменить текст</button>
+<button onclick="call('frestore',{p:v('fp')})">Вернуть из .mgg.bak</button></section>
+</div>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
+function tab(x){document.getElementById('tl').style.display=x=='l'?'':'none';document.getElementById('tf').style.display=x=='f'?'':'none';
+document.getElementById('bl').className=x=='l'?'on':'';document.getElementById('bf').className=x=='f'?'on':'';if(x=='f'&&!window.fOnce){window.fOnce=1;call('ls',{p:''})}}
 function v(i){return document.getElementById(i).value.trim()}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
 try{const r=await fetch('/api/'+p+'?'+q);out.textContent=await r.text()}catch(e){out.textContent='ошибка: '+e}}
@@ -859,6 +1000,7 @@ function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navig
 
 static Str route(const Str &path, const Params &q) {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (path == "ls" || path == "cat" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
     Img im;
     if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
     uintptr_t a = 0;
