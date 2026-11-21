@@ -23,6 +23,7 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.ByteArrayInputStream;
@@ -33,25 +34,34 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 
 /**
- * MGG overlay: плавающая кнопка "MGG" поверх игры. По нажатию открывается окно с той же панелью,
- * что и в браузере. Запросы WebView не идут через сеть Android (там запрещён http): страница
- * грузится с вымышленного адреса https://mgg.local, а Java сама достаёт ответы у libmggpanel.so
+ * MGG overlay: плавающая кнопка "MGG" поверх игры. По нажатию открывается окно с панелью.
+ * Окно можно таскать за шапку, менять размер окна и текста, делать полупрозрачным.
+ *
+ * Запросы WebView не идут через сеть Android (там запрещён http): страница грузится с
+ * вымышленного адреса https://mgg.local, а Java сама достаёт ответы у libmggpanel.so
  * по обычному сокету на 127.0.0.1.
  *
- * Подключение: в smali MainActivity.onCreate добавить
- *     invoke-static {p0}, Lmgg/Overlay;->start(Landroid/app/Activity;)V
+ * Подключение: в smali конструктора MainActivity (после вызова super-конструктора)
+ *     invoke-static {v7}, Lmgg/Overlay;->start(Landroid/app/Activity;)V
  */
 public final class Overlay {
     private static final String TOKEN = "__MGG_TOKEN__";   // подставляется при сборке
     private static final int PORT = 8765;
     private static final String HOST = "mgg.local";
     private static final String TAG = "MGG";
+    private static final float[] ALPHAS = {1f, 0.8f, 0.6f, 0.4f};
 
     private static final Handler H = new Handler(Looper.getMainLooper());
     private static Activity cur;
     private static TextView button;
-    private static FrameLayout panel;
+    private static LinearLayout panel;
     private static WebView web;
+
+    // запомненные положения (px от левого верхнего угла) и настройки окна
+    private static int bx = -1, by = -1, pnx = -1, pny = -1;
+    private static float scale = 1f;
+    private static int zoom = 75;
+    private static int alphaIdx = 0;
 
     private Overlay() {}
 
@@ -98,10 +108,11 @@ public final class Overlay {
         if (button == null) button = makeButton(a);
         if (!button.isAttachedToWindow()) {
             remove(button);
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(a, 52), dp(a, 52));
+            int sz = dp(a, 46);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(sz, sz);
             lp.gravity = Gravity.TOP | Gravity.LEFT;
-            lp.leftMargin = dp(a, 16);
-            lp.topMargin = dp(a, 96);
+            lp.leftMargin = bx >= 0 ? bx : dp(a, 16);
+            lp.topMargin = by >= 0 ? by : dp(a, 96);
             a.addContentView(button, lp);
         }
         if (panel != null && !panel.isAttachedToWindow()) {
@@ -115,44 +126,79 @@ public final class Overlay {
         TextView t = new TextView(a);
         t.setText("MGG");
         t.setTextColor(Color.WHITE);
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         t.setGravity(Gravity.CENTER);
         GradientDrawable g = new GradientDrawable();
         g.setShape(GradientDrawable.OVAL);
         g.setColor(0xCC3B5BDB);
         t.setBackground(g);
-        t.setOnTouchListener(new Drag(a));
+        t.setOnTouchListener(new Mover(a, t, new Runnable() {
+            public void run() {
+                toggle();
+            }
+        }));
         return t;
     }
 
-    /** Перетаскивание кнопки; короткое касание без сдвига открывает/закрывает панель. */
-    private static final class Drag implements View.OnTouchListener {
+    /** Перемещение view через margin (а не translation) с ограничением по границам экрана. */
+    private static void place(View v, int l, int t) {
+        if (!(v.getParent() instanceof ViewGroup)) return;
+        ViewGroup parent = (ViewGroup) v.getParent();
+        int maxL = Math.max(0, parent.getWidth() - v.getWidth());
+        int maxT = Math.max(0, parent.getHeight() - v.getHeight());
+        l = Math.max(0, Math.min(l, maxL));
+        t = Math.max(0, Math.min(t, maxT));
+        if (!(v.getLayoutParams() instanceof FrameLayout.LayoutParams)) return;
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) v.getLayoutParams();
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        lp.leftMargin = l;
+        lp.topMargin = t;
+        v.setLayoutParams(lp);
+        if (v == button) {
+            bx = l;
+            by = t;
+        } else {
+            pnx = l;
+            pny = t;
+        }
+    }
+
+    /** Тянет target за любой view-ручку; короткое касание без сдвига вызывает tap (если задан). */
+    private static final class Mover implements View.OnTouchListener {
+        private final View target;
+        private final Runnable tap;
         private final int slop;
-        private float ox, oy, sx, sy;
+        private float sx, sy;
+        private int startL, startT;
         private boolean moved;
 
-        Drag(Activity a) {
-            slop = dp(a, 8);
+        Mover(Activity a, View target, Runnable tap) {
+            this.target = target;
+            this.tap = tap;
+            this.slop = dp(a, 8);
         }
 
         public boolean onTouch(View v, MotionEvent e) {
             switch (e.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    ox = v.getX() - e.getRawX();
-                    oy = v.getY() - e.getRawY();
+                case MotionEvent.ACTION_DOWN: {
                     sx = e.getRawX();
                     sy = e.getRawY();
                     moved = false;
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    if (!moved && (Math.abs(e.getRawX() - sx) > slop || Math.abs(e.getRawY() - sy) > slop)) moved = true;
-                    if (moved) {
-                        v.setX(e.getRawX() + ox);
-                        v.setY(e.getRawY() + oy);
+                    if (target.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+                        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) target.getLayoutParams();
+                        startL = lp.leftMargin;
+                        startT = lp.topMargin;
                     }
                     return true;
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = e.getRawX() - sx, dy = e.getRawY() - sy;
+                    if (!moved && (Math.abs(dx) > slop || Math.abs(dy) > slop)) moved = true;
+                    if (moved) place(target, startL + (int) dx, startT + (int) dy);
+                    return true;
+                }
                 case MotionEvent.ACTION_UP:
-                    if (!moved) toggle();
+                    if (!moved && tap != null) tap.run();
                     return true;
                 case MotionEvent.ACTION_CANCEL:
                     return true;
@@ -177,24 +223,46 @@ public final class Overlay {
     }
 
     private static void layoutPanel(Activity a) {
+        if (panel == null) return;
         DisplayMetrics m = a.getResources().getDisplayMetrics();
         boolean land = m.widthPixels > m.heightPixels;
-        int w = land ? (int) (m.widthPixels * 0.6f) : ViewGroup.LayoutParams.MATCH_PARENT;
-        int h = (int) (m.heightPixels * (land ? 0.92f : 0.6f));
+        int w = (int) (m.widthPixels * (land ? 0.5f : 0.95f) * scale);
+        int h = (int) (m.heightPixels * (land ? 0.75f : 0.5f) * scale);
+        w = Math.max(dp(a, 220), Math.min(w, m.widthPixels));
+        h = Math.max(dp(a, 160), Math.min(h, m.heightPixels));
+        int l = pnx >= 0 ? pnx : dp(a, 8);
+        int t = pny >= 0 ? pny : dp(a, 8);
+        l = Math.max(0, Math.min(l, m.widthPixels - w));
+        t = Math.max(0, Math.min(t, m.heightPixels - h));
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(w, h);
-        lp.gravity = Gravity.BOTTOM | Gravity.LEFT;
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        lp.leftMargin = l;
+        lp.topMargin = t;
         panel.setLayoutParams(lp);
     }
 
-    private static void buildPanel(Activity a) {
-        FrameLayout p = new FrameLayout(a);
+    private static TextView tb(Activity a, String s, View.OnClickListener l) {
+        TextView t = new TextView(a);
+        t.setText(s);
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setGravity(Gravity.CENTER);
+        t.setOnClickListener(l);
+        return t;
+    }
+
+    private static void buildPanel(final Activity a) {
+        final LinearLayout p = new LinearLayout(a);
+        p.setOrientation(LinearLayout.VERTICAL);
         p.setBackgroundColor(0xF2101014);
         p.setClickable(true);                       // касания не проваливаются в игру
-        WebView w = new WebView(a);
+
+        final WebView w = new WebView(a);
         WebSettings s = w.getSettings();
         s.setJavaScriptEnabled(true);
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(false);
+        s.setTextZoom(zoom);
         w.setBackgroundColor(Color.BLACK);
         w.addJavascriptInterface(new Bridge(a), "MGGJ");
         w.setWebViewClient(new WebViewClient() {
@@ -203,11 +271,65 @@ public final class Overlay {
                 return handle(r);
             }
         });
-        p.addView(w, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // шапка: за название тянем окно, кнопки меняют размер/прозрачность/закрывают
+        LinearLayout head = new LinearLayout(a);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setBackgroundColor(0xFF1E2A5A);
+        TextView title = new TextView(a);
+        title.setText("≡ MGG (тяни)");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        title.setPadding(dp(a, 10), 0, 0, 0);
+        title.setOnTouchListener(new Mover(a, p, null));
+        head.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        int bw = dp(a, 36);
+        int mp = ViewGroup.LayoutParams.MATCH_PARENT;
+        head.addView(tb(a, "A−", new View.OnClickListener() {
+            public void onClick(View v) {
+                zoom = Math.max(50, zoom - 10);
+                w.getSettings().setTextZoom(zoom);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+        head.addView(tb(a, "A+", new View.OnClickListener() {
+            public void onClick(View v) {
+                zoom = Math.min(160, zoom + 10);
+                w.getSettings().setTextZoom(zoom);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+        head.addView(tb(a, "−", new View.OnClickListener() {
+            public void onClick(View v) {
+                scale = Math.max(0.5f, scale - 0.15f);
+                layoutPanel(a);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+        head.addView(tb(a, "+", new View.OnClickListener() {
+            public void onClick(View v) {
+                scale = Math.min(1.4f, scale + 0.15f);
+                layoutPanel(a);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+        head.addView(tb(a, "◐", new View.OnClickListener() {
+            public void onClick(View v) {
+                alphaIdx = (alphaIdx + 1) % ALPHAS.length;
+                p.setAlpha(ALPHAS[alphaIdx]);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+        head.addView(tb(a, "✕", new View.OnClickListener() {
+            public void onClick(View v) {
+                p.setVisibility(View.GONE);
+            }
+        }), new LinearLayout.LayoutParams(bw, mp));
+
+        p.addView(head, new LinearLayout.LayoutParams(mp, dp(a, 38)));
+        p.addView(w, new LinearLayout.LayoutParams(mp, 0, 1f));
+        p.setAlpha(ALPHAS[alphaIdx]);
         p.setVisibility(View.GONE);
         panel = p;
         web = w;
-        a.addContentView(p, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        a.addContentView(p, new FrameLayout.LayoutParams(dp(a, 300), dp(a, 300)));
         w.loadUrl("https://" + HOST + "/?t=" + TOKEN);
         if (button != null) button.bringToFront();
     }
@@ -300,5 +422,5 @@ public final class Overlay {
             }
         }
     }
-  }
-  
+    }
+                                 
