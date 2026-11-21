@@ -375,7 +375,7 @@ const T=new URLSearchParams(location.search).get('t')||'';const out=document.get
 function v(i){return document.getElementById(i).value.trim()}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
 try{const r=await fetch('/api/'+p+'?'+q);out.textContent=await r.text()}catch(e){out.textContent='ошибка: '+e}}
-function cp(){navigator.clipboard.writeText(out.textContent)}
+function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navigator.clipboard){navigator.clipboard.writeText(t)}}
 </script></body></html>)MGG";
 
 static Str route(const Str &path, const Params &q) {
