@@ -277,7 +277,7 @@ public final class Overlay {
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setBackgroundColor(0xFF1E2A5A);
         TextView title = new TextView(a);
-        title.setText("≡ MGG (тяни)");
+        title.setText("≡ MGG");
         title.setTextColor(Color.WHITE);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         title.setGravity(Gravity.CENTER_VERTICAL);
@@ -423,4 +423,4 @@ public final class Overlay {
         }
     }
     }
-                                 
+    
