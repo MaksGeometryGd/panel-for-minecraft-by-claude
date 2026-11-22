@@ -837,7 +837,7 @@ static Str baseName(const Str &p) { size_t i = p.rfind('/'); return i == Str::np
 
 static std::vector<Str> fileRoots() {
     Str d = dataDir(), pkg = baseName(d);
-    return {d, "/storage/emulated/0/Android/data/" + pkg, "/sdcard/Android/data/" + pkg};
+    return {d, "/storage/emulated/0/Android/data/" + pkg, "/sdcard/Android/data/" + pkg, "/storage/emulated/0/games/com.mojang", "/sdcard/games/com.mojang"};
 }
 
 static bool allowedPath(const Str &p, Str &real, Str &err) {
@@ -997,6 +997,20 @@ static Str fileRoute(const Str &path, const Params &q) {
 static std::vector<uintptr_t> g_cand;
 static int g_csz = 4;
 
+#include <csetjmp>
+#include <csignal>
+#include <chrono>
+static thread_local sigjmp_buf g_jb; static thread_local volatile sig_atomic_t g_guard = 0;
+static void segvH(int) { if (g_guard) siglongjmp(g_jb, 1); signal(SIGSEGV, SIG_DFL); }
+static bool instSegv() { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = segvH; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER; sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGBUS, &sa, nullptr); return true; }
+// безопасное чтение/запись своей памяти напрямую (без /proc/self/mem, он закрыт SELinux)
+static bool guarded(void *dst, const void *src, size_t n) {
+    static bool inst = instSegv(); (void)inst;
+    if (sigsetjmp(g_jb, 1) == 0) { g_guard = 1; memcpy(dst, src, n); g_guard = 0; return true; }
+    g_guard = 0; return false;
+}
+static int memOpen() { return 1; }
+static void memClose(int) {}
 struct MapR { uintptr_t s, e; };
 static std::vector<MapR> memMaps(bool all) {
     std::vector<MapR> v;
@@ -1018,106 +1032,185 @@ static std::vector<MapR> memMaps(bool all) {
     return v;
 }
 
-static bool memRead(int fd, uintptr_t a, void *b, size_t n) { return pread64(fd, b, n, (off64_t)a) == (ssize_t)n; }
 
-static Str memScan(long long val, int sz, bool all, size_t maxc) {
-    g_cand.clear(); g_csz = sz;
-    int fd = open("/proc/self/mem", O_RDONLY);
-    if (fd < 0) return "не могу открыть /proc/self/mem\n";
-    uint8_t pat[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
+static std::vector<unsigned long long> g_prev;
+static bool g_cf = false;
+
+static unsigned long long maskSz(unsigned long long v, int sz) { return sz >= 8 ? v : v & ((1ULL << (8 * sz)) - 1); }
+static unsigned long long rawOf(const Str &t, int sz, bool isf) {
+    if (isf) { float f = strtof(t.c_str(), nullptr); uint32_t u; memcpy(&u, &f, 4); return u; }
+    return maskSz((unsigned long long)strtoll(t.c_str(), nullptr, 10), sz);
+}
+static double numOf(unsigned long long raw, int sz, bool isf) {
+    if (isf) { uint32_t u = (uint32_t)raw; float f; memcpy(&f, &u, 4); return f; }
+    if (sz == 1) return (int8_t)raw;
+    if (sz == 2) return (int16_t)raw;
+    return (int32_t)raw;
+}
+static Str numStr(unsigned long long raw, int sz, bool isf) {
+    char b[48];
+    if (isf) snprintf(b, sizeof b, "%g", numOf(raw, sz, true)); else snprintf(b, sizeof b, "%lld", (long long)numOf(raw, sz, false));
+    return b;
+}
+static unsigned long long memVal(uintptr_t a, int sz, bool &ok) {
+    uint8_t b[8] = {0};
+    ok = guarded(b, (const void *)a, sz);
+    unsigned long long v = 0;
+    for (int i = 0; i < sz; i++) v |= (unsigned long long)b[i] << (8 * i);
+    return v;
+}
+static bool memWrite(uintptr_t a, unsigned long long raw, int sz) {
+    uint8_t b[8]; for (int i = 0; i < 8; i++) b[i] = (uint8_t)(raw >> (8 * i));
+    return guarded((void *)a, b, sz);
+}
+
+static Str memScan(unsigned long long raw, int sz, bool isf, bool all, size_t maxc) {
+    g_cand.clear(); g_prev.clear(); g_csz = sz; g_cf = isf;
+    uint8_t pat[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)(raw >> (8 * i));
     std::vector<uint8_t> buf(1 << 20);
     size_t regions = 0; unsigned long long bytes = 0;
     for (const MapR &m : memMaps(all)) {
         regions++;
         for (uintptr_t a = m.s; a < m.e;) {
             size_t n = std::min<size_t>(buf.size(), m.e - a);
-            ssize_t r = pread64(fd, buf.data(), n, (off64_t)a);
-            if (r <= 0) { a += 4096; continue; }
-            bytes += (unsigned long long)r;
-            for (size_t i = 0; i + sz <= (size_t)r; i += sz) {
+            if (!guarded(buf.data(), (const void *)a, n)) { a += 4096; continue; }
+            bytes += n;
+            for (size_t i = 0; i + sz <= n; i += sz) {
                 if (memcmp(buf.data() + i, pat, sz) != 0) continue;
-                g_cand.push_back(a + i);
-                if (g_cand.size() > maxc) { close(fd); size_t c = g_cand.size(); g_cand.clear(); return "слишком много совпадений (>" + std::to_string(maxc) + "): возьми менее частое значение\n" + std::to_string(c) + "\n"; }
+                g_cand.push_back(a + i); g_prev.push_back(raw);
+                if (g_cand.size() > maxc) { size_t c = g_cand.size(); g_cand.clear(); g_prev.clear(); return "слишком много совпадений (>" + std::to_string(maxc) + "): возьми менее частое значение или сузь позже\n"; (void)c; }
             }
-            a += (uintptr_t)r;
+            a += n;
         }
     }
-    close(fd);
     return "областей: " + std::to_string(regions) + ", просмотрено МБ: " + std::to_string(bytes >> 20) + ", найдено: " + std::to_string(g_cand.size()) + "\n";
 }
 
-static Str memNext(long long val) {
-    int fd = open("/proc/self/mem", O_RDONLY);
-    if (fd < 0) return "не могу открыть /proc/self/mem\n";
-    uint8_t pat[8], cur[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
-    std::vector<uintptr_t> keep;
-    for (uintptr_t a : g_cand) if (memRead(fd, a, cur, g_csz) && memcmp(cur, pat, g_csz) == 0) keep.push_back(a);
-    close(fd);
-    g_cand.swap(keep);
+static Str memNext(const Str &mode, unsigned long long raw) {
+    std::vector<uintptr_t> ka; std::vector<unsigned long long> kp;
+    for (size_t i = 0; i < g_cand.size(); i++) {
+        bool ok; unsigned long long cur = memVal(g_cand[i], g_csz, ok);
+        if (!ok) continue;
+        unsigned long long pv = g_prev[i];
+        bool keep = false;
+        if (mode == "eq") keep = cur == raw;
+        else if (mode == "same") keep = cur == pv;
+        else if (mode == "chg") keep = cur != pv;
+        else if (mode == "inc") keep = numOf(cur, g_csz, g_cf) > numOf(pv, g_csz, g_cf);
+        else if (mode == "dec") keep = numOf(cur, g_csz, g_cf) < numOf(pv, g_csz, g_cf);
+        if (keep) { ka.push_back(g_cand[i]); kp.push_back(cur); }
+    }
+    g_cand.swap(ka); g_prev.swap(kp);
     return "осталось: " + std::to_string(g_cand.size()) + "\n";
 }
 
-static unsigned long long memVal(int fd, uintptr_t a, int sz, bool &ok) {
-    uint8_t b[8] = {0};
-    ok = memRead(fd, a, b, sz);
-    unsigned long long v = 0;
-    for (int i = 0; i < sz; i++) v |= (unsigned long long)b[i] << (8 * i);
-    return v;
+// заморозка значений
+struct Frz { uintptr_t a; unsigned long long v; int sz; };
+static std::vector<Frz> g_frz; static std::mutex g_fm; static bool g_frzTh = false;
+static void frzThread() { for (;;) { usleep(30000); std::lock_guard<std::mutex> lk(g_fm); for (const Frz &f : g_frz) memWrite(f.a, f.v, f.sz); } }
+static void addFrz(uintptr_t a, unsigned long long v, int sz) {
+    std::lock_guard<std::mutex> lk(g_fm);
+    for (Frz &f : g_frz) if (f.a == a) { f.v = v; f.sz = sz; return; }
+    g_frz.push_back({a, v, sz});
+    if (!g_frzTh) { g_frzTh = true; std::thread(frzThread).detach(); }
 }
 
-static bool memWrite(uintptr_t a, long long val, int sz) {
-    uint8_t pat[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
-    int fd = open("/proc/self/mem", O_RDWR);
-    bool ok = false;
-    if (fd >= 0) { ok = pwrite64(fd, pat, sz, (off64_t)a) == (ssize_t)sz; close(fd); }
-    return ok;
+// монитор адреса
+struct WState { bool run = false; uintptr_t a = 0; int sz = 4; bool f = false; std::vector<Str> log; unsigned long long last = 0; long long t0 = 0; int gen = 0; };
+static WState g_w; static std::mutex g_wm;
+static long long nowMs() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static Str watchStart(uintptr_t a, int sz, bool f) {
+    bool ok; unsigned long long v = memVal(a, sz, ok);
+    if (!ok) return "адрес не читается\n";
+    int gen;
+    { std::lock_guard<std::mutex> lk(g_wm); g_w.gen++; gen = g_w.gen; g_w.run = true; g_w.a = a; g_w.sz = sz; g_w.f = f; g_w.last = v; g_w.t0 = nowMs(); g_w.log.clear(); }
+    std::thread([gen] {
+        for (;;) {
+            usleep(15000);
+            std::lock_guard<std::mutex> lk(g_wm);
+            if (!g_w.run || g_w.gen != gen) return;
+            bool ok2; unsigned long long x = memVal(g_w.a, g_w.sz, ok2);
+            if (ok2 && x != g_w.last) {
+                g_w.log.push_back(std::to_string(nowMs() - g_w.t0) + " мс: " + numStr(g_w.last, g_w.sz, g_w.f) + " -> " + numStr(x, g_w.sz, g_w.f));
+                if (g_w.log.size() > 200) g_w.log.erase(g_w.log.begin());
+                g_w.last = x;
+            }
+        }
+    }).detach();
+    return "слежу за " + hx(a) + " (текущее " + numStr(v, sz, f) + ")\n";
 }
 
 static Str memRoute(const Str &path, const Params &q) {
     int sz = (int)decNum(q, "sz", 4); if (sz != 1 && sz != 2 && sz != 4) sz = 4;
-    auto sval = [&](const char *k, long long &v) { Str t = P(q, k); if (t.empty()) return false; v = strtoll(t.c_str(), nullptr, 10); return true; };
-    long long v = 0;
+    bool isf = P(q, "f") == "1"; if (isf) sz = 4;
+    Str vs = P(q, "v");
     if (path == "mscan") {
-        if (!sval("v", v)) return "нужно число v\n";
-        return memScan(v, sz, P(q, "all") == "1", 2000000);
+        if (vs.empty()) return "нужно число v\n";
+        return memScan(rawOf(vs, sz, isf), sz, isf, P(q, "all") == "1", 2000000);
     }
     if (path == "mnext") {
-        if (!sval("v", v)) return "нужно число v\n";
         if (g_cand.empty()) return "список пуст: сначала «Первый поиск»\n";
-        return memNext(v);
+        Str m = P(q, "m", "eq");
+        if (m == "eq" && vs.empty()) return "нужно число v\n";
+        return memNext(m, vs.empty() ? 0 : rawOf(vs, g_csz, g_cf));
     }
     if (path == "mlist") {
         size_t n = decNum(q, "n", 40);
-        int fd = open("/proc/self/mem", O_RDONLY);
-        if (fd < 0) return "не могу открыть /proc/self/mem\n";
-        Str o = "кандидатов: " + std::to_string(g_cand.size()) + " (размер " + std::to_string(g_csz) + ")\n";
-        for (size_t i = 0; i < g_cand.size() && i < n; i++) { bool ok; unsigned long long x = memVal(fd, g_cand[i], g_csz, ok); o += hx(g_cand[i]) + "  = " + (ok ? std::to_string((long long)x) : Str("?")) + "\n"; }
-        close(fd);
+        Str o = "кандидатов: " + std::to_string(g_cand.size()) + " (размер " + std::to_string(g_csz) + (g_cf ? ", float" : "") + ")\n";
+        for (size_t i = 0; i < g_cand.size() && i < n; i++) { bool ok; unsigned long long x = memVal(g_cand[i], g_csz, ok); o += hx(g_cand[i]) + "  = " + (ok ? numStr(x, g_csz, g_cf) : Str("?")) + "\n"; }
         return o;
     }
-    if (path == "mreset") { g_cand.clear(); return "список сброшен\n"; }
-    if (path == "mset") {
-        if (!sval("v", v)) return "нужно число v\n";
+    if (path == "mreset") { g_cand.clear(); g_prev.clear(); return "список сброшен\n"; }
+    if (path == "mset" || path == "mfreeze") {
+        if (vs.empty()) return "нужно число v\n";
+        bool frz = path == "mfreeze";
         if (P(q, "all") == "1") {
             if (g_cand.empty()) return "список пуст\n";
             if (g_cand.size() > 50) return "кандидатов больше 50: сузь поиск, иначе это опасно\n";
-            size_t ok = 0; for (uintptr_t a : g_cand) if (memWrite(a, v, g_csz)) ok++;
-            return "записано " + std::to_string(ok) + " из " + std::to_string(g_cand.size()) + "\n";
+            unsigned long long raw = rawOf(vs, g_csz, g_cf); size_t ok = 0;
+            for (uintptr_t a : g_cand) { if (memWrite(a, raw, g_csz)) ok++; if (frz) addFrz(a, raw, g_csz); }
+            return (frz ? "заморожено " : "записано ") + std::to_string(ok) + " из " + std::to_string(g_cand.size()) + "\n";
         }
         uintptr_t a = 0;
         if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
-        return memWrite(a, v, sz) ? "ok: записано по " + hx(a) + "\n" : "запись не удалась\n";
+        unsigned long long raw = rawOf(vs, sz, isf);
+        bool ok = memWrite(a, raw, sz);
+        if (frz) addFrz(a, raw, sz);
+        return ok ? Str(frz ? "заморожено: " : "ok: записано по ") + hx(a) + "\n" : "запись не удалась\n";
     }
+    if (path == "mfrlist") {
+        std::lock_guard<std::mutex> lk(g_fm);
+        if (g_frz.empty()) return "заморозок нет\n";
+        Str o; for (const Frz &f : g_frz) o += hx(f.a) + " = " + std::to_string((long long)numOf(f.v, f.sz, false)) + " (" + std::to_string(f.sz) + " б)\n";
+        return o;
+    }
+    if (path == "munfreeze") {
+        std::lock_guard<std::mutex> lk(g_fm);
+        uintptr_t a = 0;
+        if (P(q, "all") == "1" || !hexNum(q, "a", a)) { size_t n = g_frz.size(); g_frz.clear(); return "снято заморозок: " + std::to_string(n) + "\n"; }
+        for (size_t i = 0; i < g_frz.size(); i++) if (g_frz[i].a == a) { g_frz.erase(g_frz.begin() + i); return "снято\n"; }
+        return "такой заморозки нет\n";
+    }
+    if (path == "mwatch") {
+        uintptr_t a = 0;
+        if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
+        return watchStart(a, sz, isf);
+    }
+    if (path == "mwlog") {
+        std::lock_guard<std::mutex> lk(g_wm);
+        if (!g_w.gen) return "монитор не запускался\n";
+        Str o = Str(g_w.run ? "слежу за " : "остановлен: ") + hx(g_w.a) + ", изменений: " + std::to_string(g_w.log.size()) + "\n";
+        size_t st = g_w.log.size() > 60 ? g_w.log.size() - 60 : 0;
+        for (size_t i = st; i < g_w.log.size(); i++) o += g_w.log[i] + "\n";
+        return o;
+    }
+    if (path == "mwstop") { std::lock_guard<std::mutex> lk(g_wm); g_w.run = false; return "монитор остановлен\n"; }
     if (path == "mdump") {
         uintptr_t a = 0;
         if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
         size_t n = decNum(q, "n", 128); if (n > 1024) n = 1024;
-        int fd = open("/proc/self/mem", O_RDONLY);
-        if (fd < 0) return "не могу открыть /proc/self/mem\n";
         std::vector<uint8_t> b(n);
-        bool ok = memRead(fd, a, b.data(), n);
-        close(fd);
-        if (!ok) return "не читается\n";
+        if (!guarded(b.data(), (const void *)a, n)) return "не читается\n";
         Str o; char t[8];
         for (size_t i = 0; i < n; i += 16) { o += hx(a + i) + ": "; for (size_t k = 0; k < 16 && i + k < n; k++) { snprintf(t, sizeof t, "%02X ", b[i + k]); o += t; } o += "\n"; }
         return o;
@@ -1126,17 +1219,18 @@ static Str memRoute(const Str &path, const Params &q) {
 }
 
 // ---------------------------------------------------------------- функции (готовые наборы патчей из файла mgg_functions.txt)
-// формат строки: Название|смещение_hex|оригинальные_байты|новые_байты   (одинаковые названия = одна функция)
+// строка: Название|смещение_hex|оригинальные_байты|новые_байты   (одинаковые названия = одна функция)
+// профиль: @Название|функция1,функция2
 struct FnPart { uintptr_t off; std::vector<uint8_t> orig, now; };
+struct FnSet { std::vector<std::pair<Str, std::vector<FnPart>>> fns; std::vector<std::pair<Str, std::vector<Str>>> profs; };
 static Str fnFile() { return dataDir() + "/mgg_functions.txt"; }
 static Str trimS(Str t) { size_t a = t.find_first_not_of(" \t\r\n"), b = t.find_last_not_of(" \t\r\n"); return a == Str::npos ? Str() : t.substr(a, b - a + 1); }
 
-static std::vector<std::pair<Str, std::vector<FnPart>>> fnLoad() {
-    std::vector<std::pair<Str, std::vector<FnPart>>> r;
-    Str txt;
+static FnSet fnLoad() {
+    FnSet r; Str txt;
     if (!readFile(fnFile(), txt)) {
         FILE *f = fopen(fnFile().c_str(), "w");
-        if (f) { fputs("# Название|смещение_hex|оригинальные_байты|новые_байты\n# одинаковые названия = одна функция (несколько патчей)\n# пример: Тест|815D236|C9F43BDD|00BF00BF\n", f); fclose(f); }
+        if (f) { fputs("# Название|смещение_hex|оригинальные_байты|новые_байты\n# одинаковые названия = одна функция (несколько патчей)\n# профиль (набор функций): @Название|функция1,функция2\n", f); fclose(f); }
         return r;
     }
     size_t i = 0;
@@ -1144,6 +1238,13 @@ static std::vector<std::pair<Str, std::vector<FnPart>>> fnLoad() {
         size_t e = txt.find('\n', i); if (e == Str::npos) e = txt.size();
         Str ln = trimS(txt.substr(i, e - i)); i = e + 1;
         if (ln.empty() || ln[0] == '#') continue;
+        if (ln[0] == '@') {
+            size_t p = ln.find('|'); if (p == Str::npos) continue;
+            std::vector<Str> mem; Str rest = ln.substr(p + 1); size_t j = 0;
+            while (j <= rest.size()) { size_t c = rest.find(',', j); if (c == Str::npos) c = rest.size(); Str m = trimS(rest.substr(j, c - j)); if (!m.empty()) mem.push_back(m); j = c + 1; }
+            r.profs.push_back({trimS(ln.substr(1, p - 1)), mem});
+            continue;
+        }
         size_t p1 = ln.find('|'), p2 = p1 == Str::npos ? p1 : ln.find('|', p1 + 1), p3 = p2 == Str::npos ? p2 : ln.find('|', p2 + 1);
         if (p3 == Str::npos) continue;
         Str nm = trimS(ln.substr(0, p1)); FnPart pt;
@@ -1151,8 +1252,8 @@ static std::vector<std::pair<Str, std::vector<FnPart>>> fnLoad() {
         auto cl = [](Str h) { Str o; for (char c : h) if (isxdigit((unsigned char)c)) o += c; return o; };
         if (!unhex(cl(ln.substr(p2 + 1, p3 - p2 - 1)), pt.orig) || !unhex(cl(ln.substr(p3 + 1)), pt.now) || pt.orig.size() != pt.now.size()) continue;
         bool f = false;
-        for (auto &kv : r) if (kv.first == nm) { kv.second.push_back(pt); f = true; break; }
-        if (!f) r.push_back({nm, {pt}});
+        for (auto &kv : r.fns) if (kv.first == nm) { kv.second.push_back(pt); f = true; break; }
+        if (!f) r.fns.push_back({nm, {pt}});
     }
     return r;
 }
@@ -1169,11 +1270,32 @@ static int fnState(const Img &im, const std::vector<FnPart> &ps) {
     return on == (int)ps.size() ? 1 : off == (int)ps.size() ? 0 : 2;
 }
 
+static Str fnApply(const Img &im, const std::vector<FnPart> &ps, const Str &nm, bool on, bool keep) {
+    if (fnState(im, ps) == 3) return nm + ": байты не совпали (другая версия игры?), не трогаю\n";
+    Str o;
+    for (const FnPart &p : ps) {
+        if (on) o += doPatch(im, p.off, p.now, keep);
+        else {
+            o += writeMem(im, p.off, p.orig, false);
+            g_patches.erase(p.off);
+            for (size_t i = 0; i < g_saved.size(); i++) if (g_saved[i].off == p.off) { g_saved.erase(g_saved.begin() + i); break; }
+        }
+    }
+    if (!on) saveFile();
+    return (on ? "включено: " : "выключено: ") + nm + "\n" + o;
+}
+
 static Str fnRoute(const Img &im, const Str &path, const Params &q) {
-    auto fns = fnLoad();
+    FnSet fs = fnLoad();
+    auto stOf = [&](const Str &nm) { for (auto &kv : fs.fns) if (kv.first == nm) return fnState(im, kv.second); return 3; };
     if (path == "fnlist") {
         Str o;
-        for (auto &kv : fns) o += kv.first + "\t" + std::to_string(fnState(im, kv.second)) + "\t" + std::to_string(kv.second.size()) + "\n";
+        for (auto &kv : fs.fns) o += kv.first + "\t" + std::to_string(fnState(im, kv.second)) + "\t" + std::to_string(kv.second.size()) + "\n";
+        for (auto &pr : fs.profs) {
+            int all1 = 1, bad = 0, any1 = 0;
+            for (const Str &m : pr.second) { int st = stOf(m); if (st != 1) all1 = 0; if (st == 3) bad = 1; if (st == 1) any1 = 1; }
+            o += pr.first + "\tP" + (bad ? "3" : all1 ? "1" : any1 ? "2" : "0") + "\t" + std::to_string(pr.second.size()) + "\n";
+        }
         return o.empty() ? "пусто\n" : o;
     }
     if (path == "fnsave") {                                        // превратить патчи этой сессии в функцию
@@ -1191,141 +1313,285 @@ static Str fnRoute(const Img &im, const Str &path, const Params &q) {
         fclose(f);
         return "функция «" + nm + "» сохранена (" + std::to_string(g_patches.size()) + " патч.)\n";
     }
-    const Str nm = P(q, "n");
-    for (auto &kv : fns) {
-        if (kv.first != nm) continue;
-        int st = fnState(im, kv.second);
-        if (st == 3) return "байты не совпали с описанием функции (другая версия игры?): не трогаю\n";
+    if (path == "fnprof") {
+        Str nm = P(q, "n"), l = P(q, "l");
+        if (nm.empty() || l.empty() || nm.find('|') != Str::npos) return "нужны название n и список функций l\n";
+        FILE *f = fopen(fnFile().c_str(), "a");
+        if (!f) return "не могу писать файл функций\n";
+        fprintf(f, "@%s|%s\n", nm.c_str(), l.c_str());
+        fclose(f);
+        return "профиль «" + nm + "» создан\n";
+    }
+    const Str nm = P(q, "n"); bool on = path == "fnon", keep = P(q, "k") == "1";
+    if (path != "fnon" && path != "fnoff") return "неизвестный маршрут\n";
+    for (auto &kv : fs.fns) if (kv.first == nm) return fnApply(im, kv.second, nm, on, keep);
+    for (auto &pr : fs.profs) if (pr.first == nm) {
         Str o;
-        if (path == "fnon") {
-            for (const FnPart &p : kv.second) o += doPatch(im, p.off, p.now, P(q, "k") == "1");
-            return "включено: " + nm + "\n" + o;
-        }
-        if (path == "fnoff") {
-            for (const FnPart &p : kv.second) {
-                o += writeMem(im, p.off, p.orig, false);
-                g_patches.erase(p.off);
-                for (size_t i = 0; i < g_saved.size(); i++) if (g_saved[i].off == p.off) { g_saved.erase(g_saved.begin() + i); break; }
-            }
-            saveFile();
-            return "выключено: " + nm + "\n" + o;
-        }
+        for (const Str &m : pr.second) { bool f = false; for (auto &kv : fs.fns) if (kv.first == m) { o += fnApply(im, kv.second, m, on, keep); f = true; } if (!f) o += m + ": функция не найдена\n"; }
+        return o;
     }
     return "функция не найдена\n";
 }
 
+// ---------------------------------------------------------------- поиск констант в коде, статус/откат, поиск options.txt
+static Str constFind(const Img &im, uint32_t v, bool has2, uint32_t v2, uintptr_t win, size_t maxr) {
+    auto collect = [&](uint32_t val, std::vector<uintptr_t> &hits) {
+        for (const Seg &g : im.segs) {
+            if (!g.r || !g.x) continue;
+            for (uintptr_t a = g.s; a + 4 <= g.e && hits.size() < 40000; a += 2) {
+                uint16_t h1 = rd16(a);
+                if (val <= 255 && ((h1 & 0xF800) == 0x2000 || (h1 & 0xF800) == 0x2800) && (h1 & 0xFF) == val) { hits.push_back(a - im.base); continue; }
+                if ((h1 & 0xF800) != 0xF000 && (h1 & 0xF800) != 0xF800 && (h1 & 0xF800) != 0xE800) continue;
+                uint16_t h2 = rd16(a + 2);
+                if ((h1 & 0xFBF0) == 0xF240 && (h2 & 0x8000) == 0) {                           // movw
+                    uint32_t imm = ((h1 & 0xF) << 12) | (((h1 >> 10) & 1) << 11) | (((h2 >> 12) & 7) << 8) | (h2 & 0xFF);
+                    if (imm == val) hits.push_back(a - im.base);
+                } else if (((h1 & 0xFBF0) == 0xF1B0 && (h2 & 0x8F00) == 0x0F00) || ((h1 & 0xFBEF) == 0xF04F && (h2 & 0x8000) == 0)) {   // cmp.w / mov.w imm
+                    uint32_t i12 = (((h1 >> 10) & 1) << 11) | (((h2 >> 12) & 7) << 8) | (h2 & 0xFF);
+                    if (thumbExpand(i12) == val) hits.push_back(a - im.base);
+                }
+            }
+        }
+    };
+    std::vector<uintptr_t> h1v, h2v; collect(v, h1v);
+    Str o = "вхождений " + dn(v) + ": " + std::to_string(h1v.size()) + "\n";
+    if (!has2) {
+        size_t n = 0;
+        for (uintptr_t a : h1v) { uintptr_t f = fnStart(im, im.base + a); o += hx(a) + "  функция ~" + (f ? hx(f - im.base) : Str("?")) + "\n"; if (++n >= maxr) { o += "...лимит\n"; break; } }
+        return o;
+    }
+    collect(v2, h2v);
+    o += "вхождений " + dn(v2) + ": " + std::to_string(h2v.size()) + "\n";
+    size_t n = 0; uintptr_t lastF = 1;
+    for (uintptr_t a : h1v) for (uintptr_t b : h2v) {
+        uintptr_t d = a > b ? a - b : b - a;
+        if (d > win) continue;
+        uintptr_t f = fnStart(im, im.base + (a < b ? a : b));
+        uintptr_t fo = f ? f - im.base : 0;
+        if (fo == lastF) continue;
+        lastF = fo;
+        o += hx(a) + " & " + hx(b) + "  функция ~" + (f ? hx(fo) : Str("?")) + "\n";
+        if (++n >= maxr) return o + "...лимит\n";
+    }
+    return n ? o : o + "рядом не найдено (увеличь окно w)\n";
+}
+
+static void findFile(const Str &dir, const Str &name, int depth, Str &out, size_t &n) {
+    if (depth < 0 || n > 20) return;
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    while (dirent *e = readdir(d)) {
+        Str nm = e->d_name;
+        if (nm == "." || nm == "..") continue;
+        Str full = dir + "/" + nm;
+        if (nm == name) { out += full + "\n"; n++; }
+        if (e->d_type == DT_DIR) findFile(full, name, depth - 1, out, n);
+    }
+    closedir(d);
+}
+
+static Str miscRoute(const Str &path, const Params &q) {
+    Str lock = dataDir() + "/mgg_apply.lock", dis = patchFile() + ".disabled";
+    if (path == "findopt") {
+        Str o; size_t n = 0;
+        for (const Str &r : fileRoots()) findFile(r, "options.txt", 7, o, n);
+        return o.empty() ? "options.txt не найден в доступных папках\n" : o;
+    }
+    if (path == "status") {
+        size_t fz; { std::lock_guard<std::mutex> lk(g_fm); fz = g_frz.size(); }
+        return "патчей в сессии: " + std::to_string(g_patches.size()) + "\nсохранённых: " + std::to_string(g_saved.size()) +
+               "\nзаморозок: " + std::to_string(fz) + "\nблокировка краша: " + (access(lock.c_str(), F_OK) == 0 ? "есть" : "нет") +
+               "\nотключённые патчи (.disabled): " + (access(dis.c_str(), F_OK) == 0 ? "есть" : "нет") + "\nпапка данных: " + dataDir() + "\n";
+    }
+    if (path == "unlock") { remove(lock.c_str()); return "блокировка снята\n"; }
+    if (path == "reenable") {
+        if (access(dis.c_str(), F_OK) != 0) return "отключённых патчей нет\n";
+        rename(dis.c_str(), patchFile().c_str()); loadFile();
+        return "патчи возвращены, применятся при следующем запуске игры\n";
+    }
+    if (path == "rollall") {
+        Img im; Str o;
+        if (loadImg(im)) for (auto &kv : g_patches) writeMem(im, kv.first, kv.second, false);
+        size_t n = g_patches.size(); g_patches.clear(); g_saved.clear();
+        remove(patchFile().c_str()); remove(lock.c_str());
+        size_t fz; { std::lock_guard<std::mutex> lk(g_fm); fz = g_frz.size(); g_frz.clear(); }
+        { std::lock_guard<std::mutex> lk(g_wm); g_w.run = false; }
+        (void)q;
+        return "откатано патчей: " + std::to_string(n) + ", снято заморозок: " + std::to_string(fz) + ", сохранённые очищены\n";
+    }
+    return "неизвестный маршрут\n";
+}
+
 // ---------------------------------------------------------------- маршруты
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>MGG panel</title>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1"><title>MGG</title>
 <style>
-body{font:14px system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:10px}
-h1{font-size:18px;margin:0 0 6px}h3{font-size:14px;margin:0 0 4px;color:#9ab}
-section{background:#1b1b1f;border-radius:10px;padding:8px;margin:8px 0}
-input,select,button{font:inherit;padding:8px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;margin:2px 0;width:100%;box-sizing:border-box}
-button{background:#3b5bdb;border:0}
-.tabs{display:flex;gap:6px;margin:8px 0}.tabs button{flex:1;background:#333;margin:0}.tabs button.on{background:#3b5bdb}
-pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border-radius:8px;min-height:90px;max-height:40vh;overflow:auto}
+:root{--bg:#0b0d12;--card:#151922;--card2:#1c2230;--line:#262d3d;--tx:#e8ecf4;--dim:#8a94a8;--ac:#6c8cff;--ac2:#a06cff;--ok:#2fbf71;--bad:#e5484d;--warn:#f5a524}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font:14px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--tx);margin:0;padding:0 0 70px}
+#top{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,#0b0d12 85%,transparent);padding:8px 10px 4px}
+#out{white-space:pre-wrap;word-break:break-all;background:#05070b;border:1px solid var(--line);border-radius:12px;padding:8px 10px;margin:0;max-height:26vh;min-height:44px;overflow:auto;font:12px/1.35 ui-monospace,monospace;color:#b9f3cf}
+#out.big{max-height:60vh}
+.row{display:flex;gap:6px;margin-top:6px}.row>*{flex:1}
+.pg{padding:2px 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px;margin:8px 0}
+.card h3{margin:0 0 6px;font-size:13px;color:var(--dim);font-weight:600;letter-spacing:.3px;text-transform:uppercase}
+details.card{padding:0}details.card>summary{padding:10px;font-weight:600;list-style:none;cursor:pointer}
+details.card>summary::after{content:"＋";float:right;color:var(--dim)}details[open].card>summary::after{content:"－"}
+details.card>div{padding:0 10px 10px}
+input,select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:9px 10px;margin:3px 0;font:inherit;outline:none}
+input:focus,select:focus{border-color:var(--ac)}
+button{font:inherit;color:#fff;border:0;border-radius:10px;padding:9px 10px;margin:3px 0;background:linear-gradient(135deg,var(--ac),var(--ac2));width:100%}
+button:active{opacity:.7}button.s{background:var(--card2);border:1px solid var(--line);color:var(--tx)}
+button.d{background:linear-gradient(135deg,#e5484d,#b5338a)}button.g{background:linear-gradient(135deg,#2fbf71,#1f8f8f)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+.grid2 button,.grid3 button{margin:0}
+.fn{display:flex;align-items:center;gap:10px;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px;margin:6px 0}
+.fn .nm{flex:1;font-weight:600}.fn .sub{color:var(--dim);font-size:11px;font-weight:400}
+.sw{width:46px;height:26px;border-radius:13px;background:#3a4256;position:relative;flex:none;transition:.15s}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.15s}
+.sw.on{background:var(--ok)}.sw.on::after{left:23px}.sw.bad{background:#555;opacity:.5}.sw.mid{background:var(--warn)}
+.tag{font-size:10px;background:#2a2f55;color:#b8c3ff;border-radius:6px;padding:1px 6px;margin-left:6px}
+small{color:var(--dim);display:block;margin-top:4px}
+nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:#0e1118;border-top:1px solid var(--line);z-index:9}
+nav button{background:none;border-radius:0;margin:0;padding:8px 2px 6px;color:var(--dim);font-size:11px;display:flex;flex-direction:column;gap:2px;align-items:center}
+nav button i{font-style:normal;font-size:18px}nav button.on{color:#fff;background:linear-gradient(180deg,#1b2340,transparent)}
 </style></head><body>
-<h1>MGG panel</h1>
-<pre id=out>Нажми «Инфо»</pre>
-<button onclick="cp()">Скопировать результат</button>
-<div class=tabs><button id=bl class=on onclick="tab('l')">Lib</button><button id=bf onclick="tab('f')">File</button><button id=bm onclick="tab('m')">Mem</button><button id=bn onclick="tab('n')">Functions</button></div>
-<div id=tl>
-<section><h3>Инфо</h3><button onclick="call('info',{})">База и сегменты</button></section>
-<section><h3>Сигнатура (hex, ?? — любой байт)</h3>
-<input id=sp placeholder="F0 B5 03 AF ?? ??"><select id=sa><option value=0>только код</option><option value=1>вся библиотека</option></select>
-<button onclick="call('sig',{p:v('sp'),all:v('sa'),max:50})">Искать</button></section>
-<section><h3>Строка</h3><input id=ss placeholder="viewdistance"><select id=si><option value=1>без учёта регистра</option><option value=0>с учётом</option></select>
-<button onclick="call('str',{s:v('ss'),i:v('si'),max:60})">Искать</button></section>
-<section><h3>Кто использует строку (xref)</h3><input id=xa placeholder="смещение строки, hex"><input id=xn placeholder="длина диапазона (по умолч. 1)">
-<button onclick="call('xref',{a:v('xa'),n:v('xn'),max:40})">Найти ссылки</button></section>
-<section><h3>Старт функции</h3><input id=fa placeholder="смещение внутри функции, hex">
-<button onclick="call('fn',{a:v('fa')})">Найти начало</button></section>
-<section><h3>Hex</h3><input id=ha placeholder="смещение, hex"><input id=hn placeholder="байт (десятичное, до 4096)">
-<button onclick="call('hex',{a:v('ha'),n:v('hn')||128})">Показать</button></section>
-<section><h3>Дизассемблер (Thumb)</h3><input id=da placeholder="смещение, hex"><input id=dn placeholder="сколько команд (по умолч. 24, до 200)">
-<button onclick="call('dis',{a:v('da'),n:v('dn')||24})">Показать команды</button></section>
-<section><h3>Кто вызывает функцию</h3><input id=ca placeholder="начало функции, hex">
-<button onclick="call('callers',{a:v('ca'),max:60})">Найти вызовы</button></section>
-<section><h3>Патч байтов</h3><input id=pa placeholder="смещение, hex"><input id=pb placeholder="байты: 00 20 70 47">
-<select id=pk><option value=0>только сейчас</option><option value=1>сохранять на следующие запуски</option></select>
-<button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})">Записать</button>
-<button onclick="call('undo',{a:v('pa')})">Откатить по смещению</button>
-<button onclick="call('patches',{})">Список патчей (сессия)</button>
-<button onclick="call('saved',{})">Сохранённые патчи</button>
-<button onclick="call('clearsaved',{})">Удалить все сохранённые</button></section>
-<section><h3>Быстрые правки (Thumb)</h3><input id=qa placeholder="начало функции, hex"><input id=qv placeholder="число для ret, hex (0-FF)">
-<button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})">Функция возвращает число</button>
-<input id=qn placeholder="сколько NOP (по умолч. 1)">
-<button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})">Забить NOP-ами</button></section>
-<section><h3>Хук (нужна сборка с Dobby)</h3><input id=ka placeholder="смещение функции, hex">
-<select id=km><option value=log>лог (считать вызовы)</option><option value=ret>вернуть значение (без вызова)</option><option value=set>вызвать и подменить результат</option></select>
-<input id=kv placeholder="значение, hex (для ret/set)">
-<button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv')})">Поставить</button>
-<input id=ki placeholder="номер хука">
-<button onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})">Сменить режим</button>
-<button onclick="call('unhook',{id:v('ki')})">Снять</button>
-<button onclick="call('hooks',{})">Список хуков</button></section>
-</div>
-<div id=tf style="display:none">
-<section><h3>Файлы игры</h3><input id=fp placeholder="путь (пусто = показать папки игры)">
-<button onclick="call('ls',{p:v('fp')})">Список</button><button onclick="call('cat',{p:v('fp')})">Показать файл</button>
-<input id=gs placeholder="искать текст в файлах (в папке выше; пусто = во всех папках игры)">
-<button onclick="call('grep',{p:v('fp'),s:v('gs'),max:30})">Найти текст в файлах</button>
-<input id=fk placeholder="ключ (например gfx_viewdistance)"><input id=fv placeholder="значение (например 20)">
-<button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})">Задать ключ:значение</button>
-<input id=fa placeholder="найти текст"><input id=fb placeholder="заменить на">
-<button onclick="call('freplace',{p:v('fp'),a:v('fa'),b:v('fb')})">Заменить текст</button>
-<button onclick="call('frestore',{p:v('fp')})">Вернуть из .mgg.bak</button></section>
-</div>
-<div id=tm style="display:none">
-<section><h3>Поиск значения в памяти (как Cheat Engine)</h3>
-<input id=mv placeholder="число (например 13 — максимум слайдера)">
-<select id=msz><option value=4>4 байта (int)</option><option value=2>2 байта</option><option value=1>1 байт</option></select>
-<select id=mall><option value=0>только куча (безопаснее)</option><option value=1>вся rw-память</option></select>
-<button onclick="call('mscan',{v:v('mv'),sz:v('msz'),all:v('mall')})">Первый поиск</button>
-<button onclick="call('mnext',{v:v('mv')})">Сузить (по новому значению)</button>
-<button onclick="call('mlist',{n:60})">Список найденных</button>
-<button onclick="call('mreset',{})">Сбросить список</button></section>
-<section><h3>Запись</h3><input id=ma placeholder="адрес (hex), одиночная запись">
-<input id=mw placeholder="новое число"><button onclick="call('mset',{a:v('ma'),v:v('mw'),sz:v('msz')})">Записать по адресу</button>
-<button onclick="call('mset',{all:1,v:v('mw')})">Записать во все найденные (до 50)</button>
-<input id=mn placeholder="байт для hex (по умолч. 128)"><button onclick="call('mdump',{a:v('ma'),n:v('mn')||128})">Hex вокруг адреса</button></section>
-</div>
-<div id=tn style="display:none">
-<section><h3>Готовые функции</h3><div id=fl>…</div>
+<div id=top><pre id=out>MGG готов. Открой вкладку «Функции».</pre>
+<div class=row><button class=s onclick="cp()">📋 Копировать</button><button class=s onclick="document.getElementById('out').classList.toggle('big')">⇕ Размер</button></div></div>
+
+<div class=pg id=pn>
+<div class=card><h3>Готовые функции</h3><div id=fl>…</div>
 <select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
-<button onclick="fnl()">Обновить список</button></section>
-<section><h3>Сохранить патчи сессии как функцию</h3><input id=fnn placeholder="название (например Disable render limit)">
-<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)">Сохранить</button>
-<small>Правка/добавление вручную: вкладка File → mgg_functions.txt (формат Название|смещение|оригинал|новое)</small></section>
+<button class=s onclick="fnl()">Обновить список</button></div>
+<details class=card><summary>Создать функцию из патчей сессии</summary><div>
+<input id=fnn placeholder="название (например Disable render limit)">
+<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)">Сохранить патчи сессии</button>
+<input id=fpn placeholder="профиль: название"><input id=fpl placeholder="функции через запятую">
+<button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)">Создать профиль (набор функций)</button>
+<small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
 </div>
+
+<div class=pg id=pm style="display:none">
+<div class=card><h3>Поиск значения</h3>
+<input id=mv placeholder="значение (например 13)" inputmode=decimal>
+<div class=grid2><select id=mt><option value=4>int 4 байта</option><option value=f>float</option><option value=2>2 байта</option><option value=1>1 байт</option></select>
+<select id=mall><option value=0>куча (безопасно)</option><option value=1>вся rw-память</option></select></div>
+<button onclick="call('mscan',{v:v('mv'),...ty(),all:v('mall')})">🔍 Первый поиск</button>
+<div class=grid3 style="margin-top:6px"><button class=s onclick="call('mnext',{m:'eq',v:v('mv')})">= значение</button><button class=s onclick="call('mnext',{m:'inc'})">⬆ выросло</button><button class=s onclick="call('mnext',{m:'dec'})">⬇ уменьшилось</button>
+<button class=s onclick="call('mnext',{m:'same'})">не менялось</button><button class=s onclick="call('mnext',{m:'chg'})">менялось</button><button class=s onclick="call('mreset',{})">сброс</button></div>
+<button class=s style="margin-top:6px" onclick="call('mlist',{n:60})">📃 Список найденных</button></div>
+<div class=card><h3>Запись и заморозка</h3>
+<input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
+<div class=grid2><button onclick="call('mset',{a:v('ma'),v:v('mw'),...ty()})">Записать</button><button onclick="call('mset',{all:1,v:v('mw')})">Во все найденные</button>
+<button class=g onclick="call('mfreeze',{a:v('ma'),v:v('mw'),...ty()})">❄ Заморозить</button><button class=g onclick="call('mfreeze',{all:1,v:v('mw')})">❄ Все найденные</button>
+<button class=s onclick="call('mfrlist',{})">Список заморозок</button><button class=d onclick="call('munfreeze',{all:1})">Разморозить всё</button></div></div>
+<div class=card><h3>Монитор адреса</h3>
+<div class=grid3><button onclick="call('mwatch',{a:v('ma'),...ty()})">Старт</button><button class=s onclick="call('mwlog',{})">Журнал</button><button class=d onclick="call('mwstop',{})">Стоп</button></div>
+<small>Показывает, когда и как меняется значение по адресу из поля выше.</small>
+<div class=row><input id=mn placeholder="байт (128)"><button class=s onclick="call('mdump',{a:v('ma'),n:v('mn')||128})">Hex</button></div></div>
+</div>
+
+<div class=pg id=pl style="display:none">
+<details class=card open><summary>Константы в коде</summary><div>
+<input id=cv placeholder="число (например 13 или 0xD)"><input id=cv2 placeholder="второе число рядом (необязательно)">
+<input id=cw placeholder="окно, байт (по умолч. 768)">
+<button onclick="call('constfind',{v:v('cv'),v2:v('cv2'),w:v('cw')||768,max:60})">Найти в коде</button>
+<small>Ищет movs/cmp/movw с этим числом. Со вторым числом — только места, где оба рядом (одна функция).</small></div></details>
+<details class=card><summary>Инфо / строки / сигнатуры</summary><div>
+<button class=s onclick="call('info',{})">База и сегменты</button>
+<input id=ss placeholder="строка (viewdistance)"><select id=si><option value=1>без учёта регистра</option><option value=0>с учётом</option></select>
+<button onclick="call('str',{s:v('ss'),i:v('si'),max:60})">Искать строку</button>
+<input id=sp placeholder="F0 B5 03 AF ?? ??"><select id=sa><option value=0>только код</option><option value=1>вся библиотека</option></select>
+<button onclick="call('sig',{p:v('sp'),all:v('sa'),max:50})">Искать сигнатуру</button></div></details>
+<details class=card><summary>Ссылки и функции</summary><div>
+<input id=xa placeholder="смещение строки, hex"><input id=xn placeholder="длина диапазона (1)">
+<button onclick="call('xref',{a:v('xa'),n:v('xn'),max:40})">Кто использует (xref)</button>
+<input id=fa placeholder="смещение внутри функции, hex"><button class=s onclick="call('fn',{a:v('fa')})">Начало функции</button>
+<input id=ca placeholder="начало функции, hex"><button class=s onclick="call('callers',{a:v('ca'),max:60})">Кто вызывает</button></div></details>
+<details class=card><summary>Hex / дизассемблер</summary><div>
+<input id=ha placeholder="смещение, hex"><input id=hn placeholder="байт (128)"><button class=s onclick="call('hex',{a:v('ha'),n:v('hn')||128})">Hex</button>
+<input id=da placeholder="смещение, hex"><input id=dn placeholder="команд (24)"><button class=s onclick="call('dis',{a:v('da'),n:v('dn')||24})">Дизассемблер Thumb</button></div></details>
+<details class=card><summary>Патчи</summary><div>
+<input id=pa placeholder="смещение, hex"><input id=pb placeholder="байты: 00 20 70 47">
+<select id=pk><option value=0>только сейчас</option><option value=1>сохранять на запуски</option></select>
+<button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})">Записать</button>
+<div class=grid2><button class=s onclick="call('undo',{a:v('pa')})">Откатить</button><button class=s onclick="call('patches',{})">Список (сессия)</button><button class=s onclick="call('saved',{})">Сохранённые</button><button class=d onclick="call('clearsaved',{})">Удалить сохранённые</button></div>
+<input id=qa placeholder="начало функции, hex"><input id=qv placeholder="число для ret, hex (0-FF)"><input id=qn placeholder="сколько NOP (1)">
+<div class=grid2><button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})">Функция → число</button><button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})">Забить NOP</button></div></div></details>
+<details class=card><summary>Хуки (нужен Dobby)</summary><div>
+<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option></select>
+<input id=kv placeholder="значение, hex"><button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv')})">Поставить</button>
+<input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})">Режим</button><button class=s onclick="call('unhook',{id:v('ki')})">Снять</button><button class=s onclick="call('hooks',{})">Список</button></div></div></details>
+</div>
+
+<div class=pg id=pf style="display:none">
+<div class=card><h3>Быстрые настройки (options.txt)</h3>
+<button class=s onclick="findopt()">🔎 Найти options.txt</button>
+<input id=op placeholder="путь к options.txt (заполнится сам)">
+<div class=grid2><input id=ok1 placeholder="ключ" value="gfx_viewdistance"><input id=ov1 placeholder="значение" value="32"></div>
+<button onclick="call('setkey',{p:v('op'),k:v('ok1'),v:v('ov1')})">Задать</button>
+<div class=grid3><button class=s onclick="q('gfx_viewdistance',v('ov1'))">дальность</button><button class=s onclick="q('gfx_field_of_view',v('ov1'))">FOV</button><button class=s onclick="q('gfx_gamma',v('ov1'))">яркость</button></div>
+<small>Игра может перезаписать файл при выходе и ограничить значение.</small></div>
+<div class=card><h3>Файлы игры</h3><input id=fp placeholder="путь (пусто = папки игры)">
+<div class=grid2><button class=s onclick="call('ls',{p:v('fp')})">Список</button><button class=s onclick="call('cat',{p:v('fp')})">Показать</button></div>
+<input id=gs placeholder="искать текст в файлах"><button class=s onclick="call('grep',{p:v('fp'),s:v('gs'),max:30})">Найти текст</button>
+<input id=fk placeholder="ключ"><input id=fv placeholder="значение"><button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})">Задать ключ:значение</button>
+<input id=fa2 placeholder="найти текст"><input id=fb placeholder="заменить на"><button onclick="call('freplace',{p:v('fp'),a:v('fa2'),b:v('fb')})">Заменить текст</button>
+<button class=s onclick="call('frestore',{p:v('fp')})">Вернуть из .mgg.bak</button></div>
+</div>
+
+<div class=pg id=ps style="display:none">
+<div class=card><h3>Состояние</h3><button class=s onclick="call('status',{})">Показать статус</button></div>
+<div class=card><h3>Аварийные кнопки</h3>
+<button class=d onclick="call('rollall',{})">⏪ Откатить ВСЁ (патчи, заморозки, сохранённое)</button>
+<button class=s onclick="call('unlock',{})">Снять блокировку после краша</button>
+<button class=s onclick="call('reenable',{})">Вернуть отключённые патчи (.disabled)</button>
+<small>Если игра вылетает при запуске: открой панель сразу после старта и нажми «Откатить всё».</small></div>
+</div>
+
+<nav><button id=bn class=on onclick="tab('n')"><i>⚡</i>Функции</button><button id=bm onclick="tab('m')"><i>🔍</i>Mem</button><button id=bl onclick="tab('l')"><i>🧬</i>Lib</button><button id=bf onclick="tab('f')"><i>📁</i>File</button><button id=bs onclick="tab('s')"><i>🛡</i>Safe</button></nav>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){for(const k of ['l','f','m','n']){document.getElementById('t'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'on':''}
-if(x=='n')fnl();
-if(x=='f'&&!window.fOnce){window.fOnce=1;call('ls',{p:''})}}
-async function fnl(){const q=new URLSearchParams({t:T});const r=await(await fetch('/api/fnlist?'+q)).text();const d=document.getElementById('fl');d.textContent='';
-if(r.startsWith('пусто')||r.includes('библиотека')){d.textContent=r;return}
-for(const ln of r.trim().split('\n')){const [n,st,c]=ln.split('\t');const b=document.createElement('button');const on=st=='1';
-b.textContent=(on?'✅ ':st=='3'?'⛔ ':st=='2'?'◐ ':'⬜ ')+n+' ('+c+')';b.style.background=on?'#2b8a3e':st=='3'?'#666':'#3b5bdb';
-b.onclick=async()=>{if(st=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
-await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};d.appendChild(b)}}
+function tab(x){for(const k of ['n','m','l','f','s']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'on':''}
+if(x=='n')fnl();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
+function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
-try{const r=await fetch('/api/'+p+'?'+q);out.textContent=await r.text()}catch(e){out.textContent='ошибка: '+e}}
+try{const r=await fetch('/api/'+p+'?'+q);const t=await r.text();out.textContent=t;return t}catch(e){out.textContent='ошибка: '+e;return ''}}
 function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navigator.clipboard){navigator.clipboard.writeText(t)}}
+async function fnl(){const q=new URLSearchParams({t:T});let r='';try{r=await(await fetch('/api/fnlist?'+q)).text()}catch(e){r='ошибка'}
+const d=document.getElementById('fl');d.textContent='';
+if(r.startsWith('пусто')||r.indexOf('\t')<0){d.textContent=r.startsWith('пусто')?'Функций пока нет. Добавь их через File → mgg_functions.txt или сохрани патчи сессии.':r;return}
+for(const ln of r.trim().split('\n')){const [n,st,c]=ln.split('\t');const prof=st[0]=='P';const s=prof?st[1]:st;const on=s=='1';
+const row=document.createElement('div');row.className='fn';
+const nm=document.createElement('div');nm.className='nm';nm.textContent=n;const sub=document.createElement('div');sub.className='sub';
+sub.textContent=(prof?'набор функций: ':'патчей: ')+c+(s=='3'?' · другая версия игры':s=='2'?' · частично':'');nm.appendChild(sub);if(prof){const t=document.createElement('span');t.className='tag';t.textContent='профиль';nm.firstChild.after(t)}
+const sw=document.createElement('div');sw.className='sw '+(on?'on':s=='3'?'bad':s=='2'?'mid':'');
+row.onclick=async()=>{if(s=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
+await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}}
+async function findopt(){const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m)document.getElementById('op').value=m.trim()}
+function q(k,val){document.getElementById('ok1').value=k;call('setkey',{p:v('op'),k:k,v:val})}
+fnl();
 </script></body></html>)MGG";
 
 static Str route(const Str &path, const Params &q) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (path == "ls" || path == "cat" || path == "grep" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
-    if (path == "mscan" || path == "mnext" || path == "mlist" || path == "mreset" || path == "mset" || path == "mdump") return memRoute(path, q);
+    if (path == "mscan" || path == "mnext" || path == "mlist" || path == "mreset" || path == "mset" || path == "mdump" || path == "mfreeze" || path == "mfrlist" || path == "munfreeze" || path == "mwatch" || path == "mwlog" || path == "mwstop") return memRoute(path, q);
+    if (path == "findopt" || path == "status" || path == "unlock" || path == "reenable" || path == "rollall") return miscRoute(path, q);
+    if (path == "mscan" || path == "mnext") {}
     Img im;
     if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
     uintptr_t a = 0;
 
-    if (path == "fnlist" || path == "fnon" || path == "fnoff" || path == "fnsave") return fnRoute(im, path, q);
+    if (path == "fnlist" || path == "fnon" || path == "fnoff" || path == "fnsave" || path == "fnprof") return fnRoute(im, path, q);
+    if (path == "constfind") {
+        Str a1 = P(q, "v"), a2 = P(q, "v2");
+        if (a1.empty()) return "нужно число v\n";
+        auto pn = [](const Str &t) { return (uint32_t)strtoull(t.c_str(), nullptr, 0); };
+        return constFind(im, pn(a1), !a2.empty(), a2.empty() ? 0 : pn(a2), (uintptr_t)decNum(q, "w", 768), decNum(q, "max", 60));
+    }
     if (path == "info") {
         Str o = "база: " + hx(im.base) + "\nсегменты (смещения):\n";
         for (const Seg &g : im.segs) o += "  " + hx(g.s - im.base) + " - " + hx(g.e - im.base) + "  " + (g.r ? "r" : "-") + (g.w ? "w" : "-") + (g.x ? "x" : "-") + "\n";
