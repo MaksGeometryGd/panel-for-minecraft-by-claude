@@ -1426,134 +1426,199 @@ static Str miscRoute(const Str &path, const Params &q) {
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1"><title>MGG</title>
 <style>
-:root{--bg:#0b0d12;--card:#151922;--card2:#1c2230;--line:#262d3d;--tx:#e8ecf4;--dim:#8a94a8;--ac:#6c8cff;--ac2:#a06cff;--ok:#2fbf71;--bad:#e5484d;--warn:#f5a524}
+:root{--bg:#12141c;--card:#1a1d29;--card2:#232736;--line:#2b3043;--tx:#e9eaf0;--dim:#8d92a6;--ac:#85775a;--acTx:#fff;--hl:#f0b429;--ok:#4cc38a;--r:10px}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{font:14px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--tx);margin:0;padding:0 0 70px}
-#top{position:sticky;top:0;z-index:5;background:linear-gradient(180deg,#0b0d12 85%,transparent);padding:8px 10px 4px}
-#out{white-space:pre-wrap;word-break:break-all;background:#05070b;border:1px solid var(--line);border-radius:12px;padding:8px 10px;margin:0;max-height:26vh;min-height:44px;overflow:auto;font:12px/1.35 ui-monospace,monospace;color:#b9f3cf}
+body{font:13px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--tx);margin:0;padding:0 0 10px 64px}
+.ic{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px;flex:none}
+.ic.fi{fill:currentColor;stroke:none}
+aside{position:fixed;left:0;top:0;bottom:0;width:64px;background:var(--card);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:8px 0;z-index:9;overflow-y:auto}
+aside .lg{font-weight:700;text-align:center;font-size:12px;padding:2px 0 10px;border-bottom:1px solid var(--line);margin:0 8px 8px;letter-spacing:.5px}
+aside .lg span{display:block;font-weight:400;color:var(--dim);font-size:9px;letter-spacing:.3px}
+.nav{background:none;border:0;margin:2px 6px;padding:6px 0 5px;color:var(--dim);font-size:9px;display:flex;flex-direction:column;align-items:center;gap:4px;width:auto;border-radius:12px}
+.nav .bx{width:30px;height:30px;border-radius:9px;background:rgba(255,255,255,.05);display:flex;align-items:center;justify-content:center;color:var(--dim)}
+.nav .bx .ic{width:17px;height:17px}
+.nav.on{background:rgba(255,255,255,.03)}
+.nav.on .bx{background:var(--ac);color:var(--acTx)}
+.nav.on{color:var(--tx)}
+#top{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 8px 4px}
+#out{white-space:pre-wrap;word-break:break-all;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;margin:0;max-height:24vh;min-height:42px;overflow:auto;font:11px/1.35 ui-monospace,monospace;color:var(--tx)}
 #out.big{max-height:60vh}
-.row{display:flex;gap:6px;margin-top:6px}.row>*{flex:1}
-.pg{padding:2px 10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px;margin:8px 0}
-.card h3{margin:0 0 6px;font-size:13px;color:var(--dim);font-weight:600;letter-spacing:.3px;text-transform:uppercase}
-details.card{padding:0}details.card>summary{padding:10px;font-weight:600;list-style:none;cursor:pointer}
-details.card>summary::after{content:"＋";float:right;color:var(--dim)}details[open].card>summary::after{content:"－"}
-details.card>div{padding:0 10px 10px}
-input,select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:9px 10px;margin:3px 0;font:inherit;outline:none}
+.row{display:flex;gap:5px;margin-top:5px}.row>*{flex:1}
+.pg{padding:0 8px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:9px;margin:7px 0}
+.card h3{margin:0 0 6px;font-size:11px;color:var(--dim);font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;gap:6px}
+details.card{padding:0}details.card>summary{padding:9px;font-weight:600;list-style:none;cursor:pointer;display:flex;align-items:center;gap:7px}
+details.card>summary .ic{margin-left:auto;transition:transform .15s}
+details[open].card>summary .ic{transform:rotate(45deg)}
+details.card>div{padding:0 9px 9px}
+input,select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:8px 9px;margin:3px 0;font:inherit;outline:none}
 input:focus,select:focus{border-color:var(--ac)}
-button{font:inherit;color:#fff;border:0;border-radius:10px;padding:9px 10px;margin:3px 0;background:linear-gradient(135deg,var(--ac),var(--ac2));width:100%}
-button:active{opacity:.7}button.s{background:var(--card2);border:1px solid var(--line);color:var(--tx)}
-button.d{background:linear-gradient(135deg,#e5484d,#b5338a)}button.g{background:linear-gradient(135deg,#2fbf71,#1f8f8f)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+input[type=color]{padding:2px;height:34px}input[type=range]{padding:0;accent-color:var(--ac)}
+button{font:inherit;color:var(--acTx);border:0;border-radius:var(--r);padding:8px 9px;margin:3px 0;background:var(--ac);width:100%;display:flex;align-items:center;justify-content:center;gap:7px}
+button:active{filter:brightness(1.25)}button.s{background:var(--card2);border:1px solid var(--line);color:var(--tx)}
+button.d{background:#8a3a40}button.g{background:#3f7a63}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:5px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}
 .grid2 button,.grid3 button{margin:0}
-.fn{display:flex;align-items:center;gap:10px;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px;margin:6px 0}
-.fn .nm{flex:1;font-weight:600}.fn .sub{color:var(--dim);font-size:11px;font-weight:400}
-.sw{width:46px;height:26px;border-radius:13px;background:#3a4256;position:relative;flex:none;transition:.15s}
-.sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.15s}
-.sw.on{background:var(--ok)}.sw.on::after{left:23px}.sw.bad{background:#555;opacity:.5}.sw.mid{background:var(--warn)}
-.tag{font-size:10px;background:#2a2f55;color:#b8c3ff;border-radius:6px;padding:1px 6px;margin-left:6px}
+.fn{display:flex;align-items:center;gap:8px;background:var(--ac);color:var(--acTx);border-radius:var(--r);padding:9px 10px;margin:5px 0}
+.fn .nm{flex:1;font-weight:600}.fn .sub{opacity:.7;font-size:10px;font-weight:400}
+.sw{width:38px;height:21px;border-radius:999px;background:rgba(0,0,0,.35);flex:none;position:relative}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;transition:transform .15s}
+.sw.on{background:var(--hl)}.sw.on::after{transform:translateX(17px);background:#22240f}
+.sw.bad{background:#8a3a40}.sw.bad::after{background:#ffd9db}
+.sw.mid{background:#6b6450}.sw.mid::after{background:#fff3cf}
+.tag{font-size:9px;background:rgba(0,0,0,.3);border-radius:5px;padding:1px 5px;margin-left:6px}
 small{color:var(--dim);display:block;margin-top:4px}
-nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:#0e1118;border-top:1px solid var(--line);z-index:9}
-nav button{background:none;border-radius:0;margin:0;padding:8px 2px 6px;color:var(--dim);font-size:11px;display:flex;flex-direction:column;gap:2px;align-items:center}
-nav button i{font-style:normal;font-size:18px}nav button.on{color:#fff;background:linear-gradient(180deg,#1b2340,transparent)}
+.pre{display:flex;gap:5px;flex-wrap:wrap}.pre button{width:auto;flex:1;min-width:70px}
 </style></head><body>
+<svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
+<symbol id="i-bolt" viewBox="0 0 24 24"><path class=fi d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
+<symbol id="i-mem" viewBox="0 0 24 24"><circle cx=10 cy=10 r=6/><path d="M14.5 14.5 20 20M10 7v6M7 10h6"/></symbol>
+<symbol id="i-lib" viewBox="0 0 24 24"><rect x=6 y=6 width=12 height=12 rx=2/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6z"/></symbol>
+<symbol id="i-safe" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 8.5 8 11 4.5-2.5 8-6 8-11V5l-8-3z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 8 0 1 0 0 16c1.5 0 2-1 2-2s-.5-1.5-.5-2.5S14 13 15 13h2a4 4 0 0 0 4-4c0-3.5-4-6-9-6z"/><circle class=fi cx=8 cy=12 r=1.3/><circle class=fi cx=9.5 cy=8 r=1.3/><circle class=fi cx=14.5 cy=8 r=1.3/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x=8 y=8 width=12 height=12 rx=2/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+<symbol id="i-expand" viewBox="0 0 24 24"><path d="M9 3H3v6M15 21h6v-6M21 3h-6v6M3 21h6v-6"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx=11 cy=11 r=7/><path d="M21 21l-4.3-4.3"/></symbol>
+<symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
+<symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
+<symbol id="i-eq" viewBox="0 0 24 24"><path d="M5 9h14M5 15h14"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+<symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v5h5"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v6h8V4M8 14h8v6H8z"/></symbol>
+<symbol id="i-snow" viewBox="0 0 24 24"><path d="M12 2v20M4.5 6.5l15 11M19.5 6.5l-15 11"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x=6 y=6 width=12 height=12 rx=1.5/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1.5 1.5"/><path d="M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1.5-1.5"/></symbol>
+<symbol id="i-start" viewBox="0 0 24 24"><path d="M8 5l12 7-12 7z"/></symbol>
+<symbol id="i-hex" viewBox="0 0 24 24"><path d="M9 3 3 7v10l6 4 6-4V7zM15 3l6 4v10l-6 4"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><path d="M9 6 3 12l6 6M15 6l6 6-6 6"/></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><path d="M3 10h9a6 6 0 0 1 0 12h-3"/><path d="M8 5 3 10l5 5"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></symbol>
+<symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12l-1 5a5 5 0 0 1-10 0z"/><path d="M12 17v5"/></symbol>
+<symbol id="i-unlock" viewBox="0 0 24 24"><rect x=5 y=11 width=14 height=9 rx=2/><path d="M8 11V7a4 4 0 0 1 7-2.6"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx=12 cy=12 r=9/><path d="M12 11v5M12 8h.01"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 3v18M5 4h11l-2 4 2 4H5"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 5v2M12 17v2M5 12H3M21 12h-2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx=12 cy=12 r=4/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx=12 cy=12 r=3/></symbol>
+</defs></svg>
 <div id=top><pre id=out>MGG готов. Открой вкладку «Функции».</pre>
-<div class=row><button class=s onclick="cp()">📋 Копировать</button><button class=s onclick="document.getElementById('out').classList.toggle('big')">⇕ Размер</button></div></div>
+<div class=row><button class=s onclick="cp()"><svg class=ic><use href="#i-copy"/></svg>Копировать</button><button class=s onclick="document.getElementById('out').classList.toggle('big')"><svg class=ic><use href="#i-expand"/></svg>Размер</button></div></div>
 
 <div class=pg id=pn>
-<div class=card><h3>Готовые функции</h3><div id=fl>…</div>
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Готовые функции</h3><div id=fl>…</div>
 <select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
-<button class=s onclick="fnl()">Обновить список</button></div>
-<details class=card><summary>Создать функцию из патчей сессии</summary><div>
+<button class=s onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg>Обновить список</button></div>
+<details class=card><summary><svg class=ic><use href="#i-plus"/></svg>Создать функцию из патчей сессии<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=fnn placeholder="название (например Disable render limit)">
-<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)">Сохранить патчи сессии</button>
+<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)"><svg class=ic><use href="#i-save"/></svg>Сохранить патчи сессии</button>
 <input id=fpn placeholder="профиль: название"><input id=fpl placeholder="функции через запятую">
-<button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)">Создать профиль (набор функций)</button>
+<button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)"><svg class=ic><use href="#i-flag"/></svg>Создать профиль (набор функций)</button>
 <small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
 </div>
 
 <div class=pg id=pm style="display:none">
-<div class=card><h3>Поиск значения</h3>
+<div class=card><h3><svg class=ic><use href="#i-search"/></svg>Поиск значения</h3>
 <input id=mv placeholder="значение (например 13)" inputmode=decimal>
 <div class=grid2><select id=mt><option value=4>int 4 байта</option><option value=f>float</option><option value=2>2 байта</option><option value=1>1 байт</option></select>
 <select id=mall><option value=0>куча (безопасно)</option><option value=1>вся rw-память</option></select></div>
-<button onclick="call('mscan',{v:v('mv'),...ty(),all:v('mall')})">🔍 Первый поиск</button>
-<div class=grid3 style="margin-top:6px"><button class=s onclick="call('mnext',{m:'eq',v:v('mv')})">= значение</button><button class=s onclick="call('mnext',{m:'inc'})">⬆ выросло</button><button class=s onclick="call('mnext',{m:'dec'})">⬇ уменьшилось</button>
-<button class=s onclick="call('mnext',{m:'same'})">не менялось</button><button class=s onclick="call('mnext',{m:'chg'})">менялось</button><button class=s onclick="call('mreset',{})">сброс</button></div>
-<button class=s style="margin-top:6px" onclick="call('mlist',{n:60})">📃 Список найденных</button></div>
-<div class=card><h3>Запись и заморозка</h3>
+<button onclick="call('mscan',{v:v('mv'),...ty(),all:v('mall')})"><svg class=ic><use href="#i-search"/></svg>Первый поиск</button>
+<div class=grid3 style="margin-top:6px"><button class=s onclick="call('mnext',{m:'eq',v:v('mv')})"><svg class=ic><use href="#i-eq"/></svg>= значение</button><button class=s onclick="call('mnext',{m:'inc'})"><svg class=ic><use href="#i-up"/></svg>выросло</button><button class=s onclick="call('mnext',{m:'dec'})"><svg class=ic><use href="#i-down"/></svg>уменьшилось</button>
+<button class=s onclick="call('mnext',{m:'same'})"><svg class=ic><use href="#i-eq"/></svg>не менялось</button><button class=s onclick="call('mnext',{m:'chg'})"><svg class=ic><use href="#i-reset"/></svg>менялось</button><button class=s onclick="call('mreset',{})"><svg class=ic><use href="#i-trash"/></svg>сброс</button></div>
+<button class=s style="margin-top:6px" onclick="call('mlist',{n:60})"><svg class=ic><use href="#i-list"/></svg>Список найденных</button></div>
+<div class=card><h3><svg class=ic><use href="#i-snow"/></svg>Запись и заморозка</h3>
 <input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
-<div class=grid2><button onclick="call('mset',{a:v('ma'),v:v('mw'),...ty()})">Записать</button><button onclick="call('mset',{all:1,v:v('mw')})">Во все найденные</button>
-<button class=g onclick="call('mfreeze',{a:v('ma'),v:v('mw'),...ty()})">❄ Заморозить</button><button class=g onclick="call('mfreeze',{all:1,v:v('mw')})">❄ Все найденные</button>
-<button class=s onclick="call('mfrlist',{})">Список заморозок</button><button class=d onclick="call('munfreeze',{all:1})">Разморозить всё</button></div></div>
-<div class=card><h3>Монитор адреса</h3>
-<div class=grid3><button onclick="call('mwatch',{a:v('ma'),...ty()})">Старт</button><button class=s onclick="call('mwlog',{})">Журнал</button><button class=d onclick="call('mwstop',{})">Стоп</button></div>
+<div class=grid2><button onclick="call('mset',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-save"/></svg>Записать</button><button onclick="call('mset',{all:1,v:v('mw')})"><svg class=ic><use href="#i-save"/></svg>Во все найденные</button>
+<button class=g onclick="call('mfreeze',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-snow"/></svg>Заморозить</button><button class=g onclick="call('mfreeze',{all:1,v:v('mw')})"><svg class=ic><use href="#i-snow"/></svg>Все найденные</button>
+<button class=s onclick="call('mfrlist',{})"><svg class=ic><use href="#i-list"/></svg>Список заморозок</button><button class=d onclick="call('munfreeze',{all:1})"><svg class=ic><use href="#i-sun"/></svg>Разморозить всё</button></div></div>
+<div class=card><h3><svg class=ic><use href="#i-eye"/></svg>Монитор адреса</h3>
+<div class=grid3><button onclick="call('mwatch',{a:v('ma'),...ty()})"><svg class=ic><use href="#i-start"/></svg>Старт</button><button class=s onclick="call('mwlog',{})"><svg class=ic><use href="#i-list"/></svg>Журнал</button><button class=d onclick="call('mwstop',{})"><svg class=ic><use href="#i-stop"/></svg>Стоп</button></div>
 <small>Показывает, когда и как меняется значение по адресу из поля выше.</small>
-<div class=row><input id=mn placeholder="байт (128)"><button class=s onclick="call('mdump',{a:v('ma'),n:v('mn')||128})">Hex</button></div></div>
+<div class=row><input id=mn placeholder="байт (128)"><button class=s onclick="call('mdump',{a:v('ma'),n:v('mn')||128})"><svg class=ic><use href="#i-hex"/></svg>Hex</button></div></div>
 </div>
 
 <div class=pg id=pl style="display:none">
-<details class=card open><summary>Константы в коде</summary><div>
+<details class=card open><summary><svg class=ic><use href="#i-hex"/></svg>Константы в коде<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=cv placeholder="число (например 13 или 0xD)"><input id=cv2 placeholder="второе число рядом (необязательно)">
 <input id=cw placeholder="окно, байт (по умолч. 768)">
-<button onclick="call('constfind',{v:v('cv'),v2:v('cv2'),w:v('cw')||768,max:60})">Найти в коде</button>
+<button onclick="call('constfind',{v:v('cv'),v2:v('cv2'),w:v('cw')||768,max:60})"><svg class=ic><use href="#i-search"/></svg>Найти в коде</button>
 <small>Ищет movs/cmp/movw с этим числом. Со вторым числом — только места, где оба рядом (одна функция).</small></div></details>
-<details class=card><summary>Инфо / строки / сигнатуры</summary><div>
-<button class=s onclick="call('info',{})">База и сегменты</button>
+<details class=card><summary><svg class=ic><use href="#i-info"/></svg>Инфо / строки / сигнатуры<svg class=ic><use href="#i-plus"/></svg></summary><div>
+<button class=s onclick="call('info',{})"><svg class=ic><use href="#i-info"/></svg>База и сегменты</button>
 <input id=ss placeholder="строка (viewdistance)"><select id=si><option value=1>без учёта регистра</option><option value=0>с учётом</option></select>
-<button onclick="call('str',{s:v('ss'),i:v('si'),max:60})">Искать строку</button>
+<button onclick="call('str',{s:v('ss'),i:v('si'),max:60})"><svg class=ic><use href="#i-search"/></svg>Искать строку</button>
 <input id=sp placeholder="F0 B5 03 AF ?? ??"><select id=sa><option value=0>только код</option><option value=1>вся библиотека</option></select>
-<button onclick="call('sig',{p:v('sp'),all:v('sa'),max:50})">Искать сигнатуру</button></div></details>
-<details class=card><summary>Ссылки и функции</summary><div>
+<button onclick="call('sig',{p:v('sp'),all:v('sa'),max:50})"><svg class=ic><use href="#i-search"/></svg>Искать сигнатуру</button></div></details>
+<details class=card><summary><svg class=ic><use href="#i-link"/></svg>Ссылки и функции<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=xa placeholder="смещение строки, hex"><input id=xn placeholder="длина диапазона (1)">
-<button onclick="call('xref',{a:v('xa'),n:v('xn'),max:40})">Кто использует (xref)</button>
-<input id=fa placeholder="смещение внутри функции, hex"><button class=s onclick="call('fn',{a:v('fa')})">Начало функции</button>
-<input id=ca placeholder="начало функции, hex"><button class=s onclick="call('callers',{a:v('ca'),max:60})">Кто вызывает</button></div></details>
-<details class=card><summary>Hex / дизассемблер</summary><div>
-<input id=ha placeholder="смещение, hex"><input id=hn placeholder="байт (128)"><button class=s onclick="call('hex',{a:v('ha'),n:v('hn')||128})">Hex</button>
-<input id=da placeholder="смещение, hex"><input id=dn placeholder="команд (24)"><button class=s onclick="call('dis',{a:v('da'),n:v('dn')||24})">Дизассемблер Thumb</button></div></details>
-<details class=card><summary>Патчи</summary><div>
+<button onclick="call('xref',{a:v('xa'),n:v('xn'),max:40})"><svg class=ic><use href="#i-link"/></svg>Кто использует (xref)</button>
+<input id=fa placeholder="смещение внутри функции, hex"><button class=s onclick="call('fn',{a:v('fa')})"><svg class=ic><use href="#i-start"/></svg>Начало функции</button>
+<input id=ca placeholder="начало функции, hex"><button class=s onclick="call('callers',{a:v('ca'),max:60})"><svg class=ic><use href="#i-link"/></svg>Кто вызывает</button></div></details>
+<details class=card><summary><svg class=ic><use href="#i-code"/></svg>Hex / дизассемблер<svg class=ic><use href="#i-plus"/></svg></summary><div>
+<input id=ha placeholder="смещение, hex"><input id=hn placeholder="байт (128)"><button class=s onclick="call('hex',{a:v('ha'),n:v('hn')||128})"><svg class=ic><use href="#i-hex"/></svg>Hex</button>
+<input id=da placeholder="смещение, hex"><input id=dn placeholder="команд (24)"><button class=s onclick="call('dis',{a:v('da'),n:v('dn')||24})"><svg class=ic><use href="#i-code"/></svg>Дизассемблер Thumb</button></div></details>
+<details class=card><summary><svg class=ic><use href="#i-save"/></svg>Патчи<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=pa placeholder="смещение, hex"><input id=pb placeholder="байты: 00 20 70 47">
 <select id=pk><option value=0>только сейчас</option><option value=1>сохранять на запуски</option></select>
-<button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})">Записать</button>
-<div class=grid2><button class=s onclick="call('undo',{a:v('pa')})">Откатить</button><button class=s onclick="call('patches',{})">Список (сессия)</button><button class=s onclick="call('saved',{})">Сохранённые</button><button class=d onclick="call('clearsaved',{})">Удалить сохранённые</button></div>
+<button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})"><svg class=ic><use href="#i-save"/></svg>Записать</button>
+<div class=grid2><button class=s onclick="call('undo',{a:v('pa')})"><svg class=ic><use href="#i-undo"/></svg>Откатить</button><button class=s onclick="call('patches',{})"><svg class=ic><use href="#i-list"/></svg>Список (сессия)</button><button class=s onclick="call('saved',{})"><svg class=ic><use href="#i-list"/></svg>Сохранённые</button><button class=d onclick="call('clearsaved',{})"><svg class=ic><use href="#i-trash"/></svg>Удалить сохранённые</button></div>
 <input id=qa placeholder="начало функции, hex"><input id=qv placeholder="число для ret, hex (0-FF)"><input id=qn placeholder="сколько NOP (1)">
-<div class=grid2><button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})">Функция → число</button><button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})">Забить NOP</button></div></div></details>
-<details class=card><summary>Хуки (нужен Dobby)</summary><div>
+<div class=grid2><button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})"><svg class=ic><use href="#i-save"/></svg>Функция → число</button><button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})"><svg class=ic><use href="#i-stop"/></svg>Забить NOP</button></div></div></details>
+<details class=card><summary><svg class=ic><use href="#i-plug"/></svg>Хуки (нужен Dobby)<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option></select>
-<input id=kv placeholder="значение, hex"><button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv')})">Поставить</button>
-<input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})">Режим</button><button class=s onclick="call('unhook',{id:v('ki')})">Снять</button><button class=s onclick="call('hooks',{})">Список</button></div></div></details>
+<input id=kv placeholder="значение, hex"><button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv')})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
+<input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})"><svg class=ic><use href="#i-reset"/></svg>Режим</button><button class=s onclick="call('unhook',{id:v('ki')})"><svg class=ic><use href="#i-stop"/></svg>Снять</button><button class=s onclick="call('hooks',{})"><svg class=ic><use href="#i-list"/></svg>Список</button></div></div></details>
 </div>
 
 <div class=pg id=pf style="display:none">
-<div class=card><h3>Быстрые настройки (options.txt)</h3>
-<button class=s onclick="findopt()">🔎 Найти options.txt</button>
+<div class=card><h3><svg class=ic><use href="#i-file"/></svg>Быстрые настройки (options.txt)</h3>
+<button class=s onclick="findopt()"><svg class=ic><use href="#i-search"/></svg>Найти options.txt</button>
 <input id=op placeholder="путь к options.txt (заполнится сам)">
 <div class=grid2><input id=ok1 placeholder="ключ" value="gfx_viewdistance"><input id=ov1 placeholder="значение" value="32"></div>
-<button onclick="call('setkey',{p:v('op'),k:v('ok1'),v:v('ov1')})">Задать</button>
+<button onclick="call('setkey',{p:v('op'),k:v('ok1'),v:v('ov1')})"><svg class=ic><use href="#i-save"/></svg>Задать</button>
 <div class=grid3><button class=s onclick="q('gfx_viewdistance',v('ov1'))">дальность</button><button class=s onclick="q('gfx_field_of_view',v('ov1'))">FOV</button><button class=s onclick="q('gfx_gamma',v('ov1'))">яркость</button></div>
 <small>Игра может перезаписать файл при выходе и ограничить значение.</small></div>
-<div class=card><h3>Файлы игры</h3><input id=fp placeholder="путь (пусто = папки игры)">
-<div class=grid2><button class=s onclick="call('ls',{p:v('fp')})">Список</button><button class=s onclick="call('cat',{p:v('fp')})">Показать</button></div>
-<input id=gs placeholder="искать текст в файлах"><button class=s onclick="call('grep',{p:v('fp'),s:v('gs'),max:30})">Найти текст</button>
-<input id=fk placeholder="ключ"><input id=fv placeholder="значение"><button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})">Задать ключ:значение</button>
-<input id=fa2 placeholder="найти текст"><input id=fb placeholder="заменить на"><button onclick="call('freplace',{p:v('fp'),a:v('fa2'),b:v('fb')})">Заменить текст</button>
-<button class=s onclick="call('frestore',{p:v('fp')})">Вернуть из .mgg.bak</button></div>
+<div class=card><h3><svg class=ic><use href="#i-file"/></svg>Файлы игры</h3><input id=fp placeholder="путь (пусто = папки игры)">
+<div class=grid2><button class=s onclick="call('ls',{p:v('fp')})"><svg class=ic><use href="#i-list"/></svg>Список</button><button class=s onclick="call('cat',{p:v('fp')})"><svg class=ic><use href="#i-eye"/></svg>Показать</button></div>
+<input id=gs placeholder="искать текст в файлах"><button class=s onclick="call('grep',{p:v('fp'),s:v('gs'),max:30})"><svg class=ic><use href="#i-search"/></svg>Найти текст</button>
+<input id=fk placeholder="ключ"><input id=fv placeholder="значение"><button onclick="call('setkey',{p:v('fp'),k:v('fk'),v:v('fv')})"><svg class=ic><use href="#i-save"/></svg>Задать ключ:значение</button>
+<input id=fa2 placeholder="найти текст"><input id=fb placeholder="заменить на"><button onclick="call('freplace',{p:v('fp'),a:v('fa2'),b:v('fb')})"><svg class=ic><use href="#i-reset"/></svg>Заменить текст</button>
+<button class=s onclick="call('frestore',{p:v('fp')})"><svg class=ic><use href="#i-undo"/></svg>Вернуть из .mgg.bak</button></div>
 </div>
 
 <div class=pg id=ps style="display:none">
-<div class=card><h3>Состояние</h3><button class=s onclick="call('status',{})">Показать статус</button></div>
-<div class=card><h3>Аварийные кнопки</h3>
-<button class=d onclick="call('rollall',{})">⏪ Откатить ВСЁ (патчи, заморозки, сохранённое)</button>
-<button class=s onclick="call('unlock',{})">Снять блокировку после краша</button>
-<button class=s onclick="call('reenable',{})">Вернуть отключённые патчи (.disabled)</button>
+<div class=card><h3><svg class=ic><use href="#i-safe"/></svg>Состояние</h3><button class=s onclick="call('status',{})"><svg class=ic><use href="#i-info"/></svg>Показать статус</button></div>
+<div class=card><h3><svg class=ic><use href="#i-safe"/></svg>Аварийные кнопки</h3>
+<button class=d onclick="call('rollall',{})"><svg class=ic><use href="#i-undo"/></svg>Откатить ВСЁ (патчи, заморозки, сохранённое)</button>
+<button class=s onclick="call('unlock',{})"><svg class=ic><use href="#i-unlock"/></svg>Снять блокировку после краша</button>
+<button class=s onclick="call('reenable',{})"><svg class=ic><use href="#i-reset"/></svg>Вернуть отключённые патчи (.disabled)</button>
 <small>Если игра вылетает при запуске: открой панель сразу после старта и нажми «Откатить всё».</small></div>
 </div>
 
-<nav><button id=bn class=on onclick="tab('n')"><i>⚡</i>Функции</button><button id=bm onclick="tab('m')"><i>🔍</i>Mem</button><button id=bl onclick="tab('l')"><i>🧬</i>Lib</button><button id=bf onclick="tab('f')"><i>📁</i>File</button><button id=bs onclick="tab('s')"><i>🛡</i>Safe</button></nav>
+<div class=pg id=pt style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-palette"/></svg>Пресеты</h3><div class=pre>
+<button onclick="preset('#85775a','#12141c','#1a1d29','#f0b429')">Asteria</button>
+<button onclick="preset('#4f6bff','#0b0d12','#151922','#7dd3fc')">Neon</button>
+<button onclick="preset('#2f9e6e','#0e1512','#16211c','#b7f7cf')">Green</button>
+<button onclick="preset('#b5424d','#150d10','#22151a','#ffb3ba')">Red</button>
+<button onclick="preset('#6c5ce7','#101018','#1b1b2b','#d0c8ff')">Violet</button>
+<button onclick="preset('#3b82f6','#eef1f6','#ffffff','#1d4ed8')">Light</button></div></div>
+<div class=card><h3><svg class=ic><use href="#i-palette"/></svg>Свои цвета</h3>
+<div class=grid2><div>Кнопки<input type=color id=c_ac oninput="applyTheme()"></div><div>Галочки<input type=color id=c_hl oninput="applyTheme()"></div>
+<div>Фон<input type=color id=c_bg oninput="applyTheme()"></div><div>Карточки<input type=color id=c_card oninput="applyTheme()"></div></div>
+Скругление<input type=range id=c_r min=0 max=20 value=10 oninput="applyTheme()">
+<button class=s onclick="preset('#85775a','#12141c','#1a1d29','#f0b429')"><svg class=ic><use href="#i-reset"/></svg>Сбросить тему</button></div>
+</div>
+<aside><div class=lg>MGG<span>panel</span></div>
+<button id=bn class="nav on" onclick="tab('n')"><span class=bx><svg class=ic><use href="#i-bolt"/></svg></span>Функции</button>
+<button id=bm class=nav onclick="tab('m')"><span class=bx><svg class=ic><use href="#i-mem"/></svg></span>Mem</button>
+<button id=bl class=nav onclick="tab('l')"><span class=bx><svg class=ic><use href="#i-lib"/></svg></span>Lib</button>
+<button id=bf class=nav onclick="tab('f')"><span class=bx><svg class=ic><use href="#i-file"/></svg></span>File</button>
+<button id=bs class=nav onclick="tab('s')"><span class=bx><svg class=ic><use href="#i-safe"/></svg></span>Safe</button>
+<button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button></aside>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){for(const k of ['n','m','l','f','s']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'on':''}
+function tab(x){for(const k of ['n','m','l','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
 if(x=='n')fnl();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
 function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
@@ -1572,8 +1637,19 @@ row.onclick=async()=>{if(s=='3'){out.textContent='байты не совпали
 await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}}
 async function findopt(){const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m)document.getElementById('op').value=m.trim()}
 function q(k,val){document.getElementById('ok1').value=k;call('setkey',{p:v('op'),k:k,v:val})}
+
+function mix(h,p){const n=parseInt(h.slice(1),16);let r=n>>16,g=(n>>8)&255,b=n&255;const f=x=>Math.max(0,Math.min(255,Math.round(x+(p>0?(255-x):x)*p)));return '#'+[r,g,b].map(f).map(x=>x.toString(16).padStart(2,'0')).join('')}
+function lum(h){const n=parseInt(h.slice(1),16);return (0.299*(n>>16)+0.587*((n>>8)&255)+0.114*(n&255))/255}
+function applyTheme(save=true){const ac=v('c_ac'),hl=v('c_hl'),bg=v('c_bg'),cd=v('c_card'),r=v('c_r');const R=document.documentElement.style;
+const light=lum(bg)>.6;R.setProperty('--ac',ac);R.setProperty('--hl',hl);R.setProperty('--bg',bg);R.setProperty('--card',cd);R.setProperty('--card2',mix(cd,light?-0.06:0.08));R.setProperty('--line',mix(cd,light?-0.14:0.14));
+R.setProperty('--tx',light?'#161a24':'#e9eaf0');R.setProperty('--dim',light?'#5d6578':'#8d92a6');R.setProperty('--acTx',lum(ac)>.65?'#111':'#fff');R.setProperty('--r',r+'px');
+if(save)try{localStorage.setItem('mggTheme',JSON.stringify([ac,bg,cd,hl,r]))}catch(e){}}
+function preset(ac,bg,cd,hl){document.getElementById('c_ac').value=ac;document.getElementById('c_bg').value=bg;document.getElementById('c_card').value=cd;document.getElementById('c_hl').value=hl;applyTheme()}
+(function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme'))}catch(e){}t=t||['#85775a','#12141c','#1a1d29','#f0b429',10];
+document.getElementById('c_ac').value=t[0];document.getElementById('c_bg').value=t[1];document.getElementById('c_card').value=t[2];document.getElementById('c_hl').value=t[3];document.getElementById('c_r').value=t[4];applyTheme(false)})();
 fnl();
 </script></body></html>)MGG";
+
 
 static Str route(const Str &path, const Params &q) {
     std::lock_guard<std::mutex> lk(g_mu);
