@@ -20,6 +20,7 @@
 #include <utility>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <climits>
 #include <algorithm>
@@ -992,6 +993,227 @@ static Str fileRoute(const Str &path, const Params &q) {
     return "неизвестный маршрут\n";
 }
 
+// ---------------------------------------------------------------- память процесса (поиск значений, как в Cheat Engine)
+static std::vector<uintptr_t> g_cand;
+static int g_csz = 4;
+
+struct MapR { uintptr_t s, e; };
+static std::vector<MapR> memMaps(bool all) {
+    std::vector<MapR> v;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return v;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long s, e, off, ino; char perms[8] = {0}, dev[16] = {0}, path[512] = {0};
+        int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %511[^\n]", &s, &e, perms, &off, dev, &ino, path);
+        if (n < 6 || perms[0] != 'r' || perms[1] != 'w') continue;
+        Str p = n >= 7 ? Str(path) : Str();
+        size_t k = p.find_first_not_of(' ');
+        p = k == Str::npos ? Str() : p.substr(k);
+        if (p == "[vvar]" || p == "[vdso]" || p == "[vectors]" || p.find("/dev/") != Str::npos || p.find("/dri/") != Str::npos) continue;
+        if (!all && !p.empty() && p[0] == '/') continue;                // по умолчанию только куча/анонимная память
+        v.push_back({(uintptr_t)s, (uintptr_t)e});
+    }
+    fclose(f);
+    return v;
+}
+
+static bool memRead(int fd, uintptr_t a, void *b, size_t n) { return pread64(fd, b, n, (off64_t)a) == (ssize_t)n; }
+
+static Str memScan(long long val, int sz, bool all, size_t maxc) {
+    g_cand.clear(); g_csz = sz;
+    int fd = open("/proc/self/mem", O_RDONLY);
+    if (fd < 0) return "не могу открыть /proc/self/mem\n";
+    uint8_t pat[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
+    std::vector<uint8_t> buf(1 << 20);
+    size_t regions = 0; unsigned long long bytes = 0;
+    for (const MapR &m : memMaps(all)) {
+        regions++;
+        for (uintptr_t a = m.s; a < m.e;) {
+            size_t n = std::min<size_t>(buf.size(), m.e - a);
+            ssize_t r = pread64(fd, buf.data(), n, (off64_t)a);
+            if (r <= 0) { a += 4096; continue; }
+            bytes += (unsigned long long)r;
+            for (size_t i = 0; i + sz <= (size_t)r; i += sz) {
+                if (memcmp(buf.data() + i, pat, sz) != 0) continue;
+                g_cand.push_back(a + i);
+                if (g_cand.size() > maxc) { close(fd); size_t c = g_cand.size(); g_cand.clear(); return "слишком много совпадений (>" + std::to_string(maxc) + "): возьми менее частое значение\n" + std::to_string(c) + "\n"; }
+            }
+            a += (uintptr_t)r;
+        }
+    }
+    close(fd);
+    return "областей: " + std::to_string(regions) + ", просмотрено МБ: " + std::to_string(bytes >> 20) + ", найдено: " + std::to_string(g_cand.size()) + "\n";
+}
+
+static Str memNext(long long val) {
+    int fd = open("/proc/self/mem", O_RDONLY);
+    if (fd < 0) return "не могу открыть /proc/self/mem\n";
+    uint8_t pat[8], cur[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
+    std::vector<uintptr_t> keep;
+    for (uintptr_t a : g_cand) if (memRead(fd, a, cur, g_csz) && memcmp(cur, pat, g_csz) == 0) keep.push_back(a);
+    close(fd);
+    g_cand.swap(keep);
+    return "осталось: " + std::to_string(g_cand.size()) + "\n";
+}
+
+static unsigned long long memVal(int fd, uintptr_t a, int sz, bool &ok) {
+    uint8_t b[8] = {0};
+    ok = memRead(fd, a, b, sz);
+    unsigned long long v = 0;
+    for (int i = 0; i < sz; i++) v |= (unsigned long long)b[i] << (8 * i);
+    return v;
+}
+
+static bool memWrite(uintptr_t a, long long val, int sz) {
+    uint8_t pat[8]; for (int i = 0; i < 8; i++) pat[i] = (uint8_t)((unsigned long long)val >> (8 * i));
+    int fd = open("/proc/self/mem", O_RDWR);
+    bool ok = false;
+    if (fd >= 0) { ok = pwrite64(fd, pat, sz, (off64_t)a) == (ssize_t)sz; close(fd); }
+    return ok;
+}
+
+static Str memRoute(const Str &path, const Params &q) {
+    int sz = (int)decNum(q, "sz", 4); if (sz != 1 && sz != 2 && sz != 4) sz = 4;
+    auto sval = [&](const char *k, long long &v) { Str t = P(q, k); if (t.empty()) return false; v = strtoll(t.c_str(), nullptr, 10); return true; };
+    long long v = 0;
+    if (path == "mscan") {
+        if (!sval("v", v)) return "нужно число v\n";
+        return memScan(v, sz, P(q, "all") == "1", 2000000);
+    }
+    if (path == "mnext") {
+        if (!sval("v", v)) return "нужно число v\n";
+        if (g_cand.empty()) return "список пуст: сначала «Первый поиск»\n";
+        return memNext(v);
+    }
+    if (path == "mlist") {
+        size_t n = decNum(q, "n", 40);
+        int fd = open("/proc/self/mem", O_RDONLY);
+        if (fd < 0) return "не могу открыть /proc/self/mem\n";
+        Str o = "кандидатов: " + std::to_string(g_cand.size()) + " (размер " + std::to_string(g_csz) + ")\n";
+        for (size_t i = 0; i < g_cand.size() && i < n; i++) { bool ok; unsigned long long x = memVal(fd, g_cand[i], g_csz, ok); o += hx(g_cand[i]) + "  = " + (ok ? std::to_string((long long)x) : Str("?")) + "\n"; }
+        close(fd);
+        return o;
+    }
+    if (path == "mreset") { g_cand.clear(); return "список сброшен\n"; }
+    if (path == "mset") {
+        if (!sval("v", v)) return "нужно число v\n";
+        if (P(q, "all") == "1") {
+            if (g_cand.empty()) return "список пуст\n";
+            if (g_cand.size() > 50) return "кандидатов больше 50: сузь поиск, иначе это опасно\n";
+            size_t ok = 0; for (uintptr_t a : g_cand) if (memWrite(a, v, g_csz)) ok++;
+            return "записано " + std::to_string(ok) + " из " + std::to_string(g_cand.size()) + "\n";
+        }
+        uintptr_t a = 0;
+        if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
+        return memWrite(a, v, sz) ? "ok: записано по " + hx(a) + "\n" : "запись не удалась\n";
+    }
+    if (path == "mdump") {
+        uintptr_t a = 0;
+        if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
+        size_t n = decNum(q, "n", 128); if (n > 1024) n = 1024;
+        int fd = open("/proc/self/mem", O_RDONLY);
+        if (fd < 0) return "не могу открыть /proc/self/mem\n";
+        std::vector<uint8_t> b(n);
+        bool ok = memRead(fd, a, b.data(), n);
+        close(fd);
+        if (!ok) return "не читается\n";
+        Str o; char t[8];
+        for (size_t i = 0; i < n; i += 16) { o += hx(a + i) + ": "; for (size_t k = 0; k < 16 && i + k < n; k++) { snprintf(t, sizeof t, "%02X ", b[i + k]); o += t; } o += "\n"; }
+        return o;
+    }
+    return "неизвестный маршрут\n";
+}
+
+// ---------------------------------------------------------------- функции (готовые наборы патчей из файла mgg_functions.txt)
+// формат строки: Название|смещение_hex|оригинальные_байты|новые_байты   (одинаковые названия = одна функция)
+struct FnPart { uintptr_t off; std::vector<uint8_t> orig, now; };
+static Str fnFile() { return dataDir() + "/mgg_functions.txt"; }
+static Str trimS(Str t) { size_t a = t.find_first_not_of(" \t\r\n"), b = t.find_last_not_of(" \t\r\n"); return a == Str::npos ? Str() : t.substr(a, b - a + 1); }
+
+static std::vector<std::pair<Str, std::vector<FnPart>>> fnLoad() {
+    std::vector<std::pair<Str, std::vector<FnPart>>> r;
+    Str txt;
+    if (!readFile(fnFile(), txt)) {
+        FILE *f = fopen(fnFile().c_str(), "w");
+        if (f) { fputs("# Название|смещение_hex|оригинальные_байты|новые_байты\n# одинаковые названия = одна функция (несколько патчей)\n# пример: Тест|815D236|C9F43BDD|00BF00BF\n", f); fclose(f); }
+        return r;
+    }
+    size_t i = 0;
+    while (i <= txt.size()) {
+        size_t e = txt.find('\n', i); if (e == Str::npos) e = txt.size();
+        Str ln = trimS(txt.substr(i, e - i)); i = e + 1;
+        if (ln.empty() || ln[0] == '#') continue;
+        size_t p1 = ln.find('|'), p2 = p1 == Str::npos ? p1 : ln.find('|', p1 + 1), p3 = p2 == Str::npos ? p2 : ln.find('|', p2 + 1);
+        if (p3 == Str::npos) continue;
+        Str nm = trimS(ln.substr(0, p1)); FnPart pt;
+        pt.off = (uintptr_t)strtoull(trimS(ln.substr(p1 + 1, p2 - p1 - 1)).c_str(), nullptr, 16);
+        auto cl = [](Str h) { Str o; for (char c : h) if (isxdigit((unsigned char)c)) o += c; return o; };
+        if (!unhex(cl(ln.substr(p2 + 1, p3 - p2 - 1)), pt.orig) || !unhex(cl(ln.substr(p3 + 1)), pt.now) || pt.orig.size() != pt.now.size()) continue;
+        bool f = false;
+        for (auto &kv : r) if (kv.first == nm) { kv.second.push_back(pt); f = true; break; }
+        if (!f) r.push_back({nm, {pt}});
+    }
+    return r;
+}
+
+// 0 = выключена, 1 = включена, 2 = частично, 3 = байты не совпали (другая версия игры)
+static int fnState(const Img &im, const std::vector<FnPart> &ps) {
+    int on = 0, off = 0;
+    for (const FnPart &p : ps) {
+        uintptr_t a = im.base + p.off;
+        if (!segAt(im, a, p.now.size())) return 3;
+        std::vector<uint8_t> cur((uint8_t *)a, (uint8_t *)a + p.now.size());
+        if (cur == p.now) on++; else if (cur == p.orig) off++; else return 3;
+    }
+    return on == (int)ps.size() ? 1 : off == (int)ps.size() ? 0 : 2;
+}
+
+static Str fnRoute(const Img &im, const Str &path, const Params &q) {
+    auto fns = fnLoad();
+    if (path == "fnlist") {
+        Str o;
+        for (auto &kv : fns) o += kv.first + "\t" + std::to_string(fnState(im, kv.second)) + "\t" + std::to_string(kv.second.size()) + "\n";
+        return o.empty() ? "пусто\n" : o;
+    }
+    if (path == "fnsave") {                                        // превратить патчи этой сессии в функцию
+        Str nm = P(q, "n");
+        if (nm.empty()) return "нужно имя n\n";
+        if (nm.find('|') != Str::npos) return "в имени нельзя символ |\n";
+        if (g_patches.empty()) return "патчей в этой сессии нет\n";
+        FILE *f = fopen(fnFile().c_str(), "a");
+        if (!f) return "не могу писать файл функций\n";
+        for (auto &kv : g_patches) {
+            uintptr_t a = im.base + kv.first;
+            std::vector<uint8_t> now((uint8_t *)a, (uint8_t *)a + kv.second.size());
+            fprintf(f, "%s|%lX|%s|%s\n", nm.c_str(), (unsigned long)kv.first, hexs(kv.second).c_str(), hexs(now).c_str());
+        }
+        fclose(f);
+        return "функция «" + nm + "» сохранена (" + std::to_string(g_patches.size()) + " патч.)\n";
+    }
+    const Str nm = P(q, "n");
+    for (auto &kv : fns) {
+        if (kv.first != nm) continue;
+        int st = fnState(im, kv.second);
+        if (st == 3) return "байты не совпали с описанием функции (другая версия игры?): не трогаю\n";
+        Str o;
+        if (path == "fnon") {
+            for (const FnPart &p : kv.second) o += doPatch(im, p.off, p.now, P(q, "k") == "1");
+            return "включено: " + nm + "\n" + o;
+        }
+        if (path == "fnoff") {
+            for (const FnPart &p : kv.second) {
+                o += writeMem(im, p.off, p.orig, false);
+                g_patches.erase(p.off);
+                for (size_t i = 0; i < g_saved.size(); i++) if (g_saved[i].off == p.off) { g_saved.erase(g_saved.begin() + i); break; }
+            }
+            saveFile();
+            return "выключено: " + nm + "\n" + o;
+        }
+    }
+    return "функция не найдена\n";
+}
+
 // ---------------------------------------------------------------- маршруты
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>MGG panel</title>
@@ -1007,7 +1229,7 @@ pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border
 <h1>MGG panel</h1>
 <pre id=out>Нажми «Инфо»</pre>
 <button onclick="cp()">Скопировать результат</button>
-<div class=tabs><button id=bl class=on onclick="tab('l')">Lib</button><button id=bf onclick="tab('f')">File</button></div>
+<div class=tabs><button id=bl class=on onclick="tab('l')">Lib</button><button id=bf onclick="tab('f')">File</button><button id=bm onclick="tab('m')">Mem</button><button id=bn onclick="tab('n')">Functions</button></div>
 <div id=tl>
 <section><h3>Инфо</h3><button onclick="call('info',{})">База и сегменты</button></section>
 <section><h3>Сигнатура (hex, ?? — любой байт)</h3>
@@ -1056,10 +1278,39 @@ pre{white-space:pre-wrap;word-break:break-all;background:#000;padding:8px;border
 <button onclick="call('freplace',{p:v('fp'),a:v('fa'),b:v('fb')})">Заменить текст</button>
 <button onclick="call('frestore',{p:v('fp')})">Вернуть из .mgg.bak</button></section>
 </div>
+<div id=tm style="display:none">
+<section><h3>Поиск значения в памяти (как Cheat Engine)</h3>
+<input id=mv placeholder="число (например 13 — максимум слайдера)">
+<select id=msz><option value=4>4 байта (int)</option><option value=2>2 байта</option><option value=1>1 байт</option></select>
+<select id=mall><option value=0>только куча (безопаснее)</option><option value=1>вся rw-память</option></select>
+<button onclick="call('mscan',{v:v('mv'),sz:v('msz'),all:v('mall')})">Первый поиск</button>
+<button onclick="call('mnext',{v:v('mv')})">Сузить (по новому значению)</button>
+<button onclick="call('mlist',{n:60})">Список найденных</button>
+<button onclick="call('mreset',{})">Сбросить список</button></section>
+<section><h3>Запись</h3><input id=ma placeholder="адрес (hex), одиночная запись">
+<input id=mw placeholder="новое число"><button onclick="call('mset',{a:v('ma'),v:v('mw'),sz:v('msz')})">Записать по адресу</button>
+<button onclick="call('mset',{all:1,v:v('mw')})">Записать во все найденные (до 50)</button>
+<input id=mn placeholder="байт для hex (по умолч. 128)"><button onclick="call('mdump',{a:v('ma'),n:v('mn')||128})">Hex вокруг адреса</button></section>
+</div>
+<div id=tn style="display:none">
+<section><h3>Готовые функции</h3><div id=fl>…</div>
+<select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
+<button onclick="fnl()">Обновить список</button></section>
+<section><h3>Сохранить патчи сессии как функцию</h3><input id=fnn placeholder="название (например Disable render limit)">
+<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)">Сохранить</button>
+<small>Правка/добавление вручную: вкладка File → mgg_functions.txt (формат Название|смещение|оригинал|новое)</small></section>
+</div>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){document.getElementById('tl').style.display=x=='l'?'':'none';document.getElementById('tf').style.display=x=='f'?'':'none';
-document.getElementById('bl').className=x=='l'?'on':'';document.getElementById('bf').className=x=='f'?'on':'';if(x=='f'&&!window.fOnce){window.fOnce=1;call('ls',{p:''})}}
+function tab(x){for(const k of ['l','f','m','n']){document.getElementById('t'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'on':''}
+if(x=='n')fnl();
+if(x=='f'&&!window.fOnce){window.fOnce=1;call('ls',{p:''})}}
+async function fnl(){const q=new URLSearchParams({t:T});const r=await(await fetch('/api/fnlist?'+q)).text();const d=document.getElementById('fl');d.textContent='';
+if(r.startsWith('пусто')||r.includes('библиотека')){d.textContent=r;return}
+for(const ln of r.trim().split('\n')){const [n,st,c]=ln.split('\t');const b=document.createElement('button');const on=st=='1';
+b.textContent=(on?'✅ ':st=='3'?'⛔ ':st=='2'?'◐ ':'⬜ ')+n+' ('+c+')';b.style.background=on?'#2b8a3e':st=='3'?'#666':'#3b5bdb';
+b.onclick=async()=>{if(st=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
+await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};d.appendChild(b)}}
 function v(i){return document.getElementById(i).value.trim()}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
 try{const r=await fetch('/api/'+p+'?'+q);out.textContent=await r.text()}catch(e){out.textContent='ошибка: '+e}}
@@ -1069,10 +1320,12 @@ function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navig
 static Str route(const Str &path, const Params &q) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (path == "ls" || path == "cat" || path == "grep" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
+    if (path == "mscan" || path == "mnext" || path == "mlist" || path == "mreset" || path == "mset" || path == "mdump") return memRoute(path, q);
     Img im;
     if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
     uintptr_t a = 0;
 
+    if (path == "fnlist" || path == "fnon" || path == "fnoff" || path == "fnsave") return fnRoute(im, path, q);
     if (path == "info") {
         Str o = "база: " + hx(im.base) + "\nсегменты (смещения):\n";
         for (const Seg &g : im.segs) o += "  " + hx(g.s - im.base) + " - " + hx(g.e - im.base) + "  " + (g.r ? "r" : "-") + (g.w ? "w" : "-") + (g.x ? "x" : "-") + "\n";
