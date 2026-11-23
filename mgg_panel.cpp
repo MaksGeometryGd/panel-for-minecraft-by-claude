@@ -1440,7 +1440,7 @@ aside .lg span{display:block;font-weight:400;color:var(--dim);font-size:9px;lett
 .nav.on{background:rgba(255,255,255,.03)}
 .nav.on .bx{background:var(--ac);color:var(--acTx)}
 .nav.on{color:var(--tx)}
-#top{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 8px 4px}
+#top{background:var(--bg);padding:8px 8px 4px}
 #out{white-space:pre-wrap;word-break:break-all;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;margin:0;max-height:24vh;min-height:42px;overflow:auto;font:11px/1.35 ui-monospace,monospace;color:var(--tx)}
 #out.big{max-height:60vh}
 .row{display:flex;gap:5px;margin-top:5px}.row>*{flex:1}
