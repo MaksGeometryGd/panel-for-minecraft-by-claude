@@ -5,6 +5,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.graphics.Color;
+import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Handler;
@@ -16,6 +17,7 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -61,6 +63,7 @@ public final class Overlay {
     private static int bx = -1, by = -1, pnx = -1, pny = -1;
     private static float scale = 1f;
     private static int zoom = 75;
+    private static final int PANEL_RADIUS_DP = 16;   // скругление всего окна панели (шапка + webview разом)
     private static int alphaIdx = 0;
 
     private Overlay() {}
@@ -239,6 +242,11 @@ public final class Overlay {
         lp.leftMargin = l;
         lp.topMargin = t;
         panel.setLayoutParams(lp);
+        panel.post(new Runnable() {         // ждём, пока новый размер реально применится, иначе скругление возьмёт старые w/h
+            public void run() {
+                panel.invalidateOutline();
+            }
+        });
     }
 
     private static TextView tb(Activity a, String s, View.OnClickListener l) {
@@ -275,13 +283,13 @@ public final class Overlay {
         // шапка: за название тянем окно, кнопки меняют размер/прозрачность/закрывают
         LinearLayout head = new LinearLayout(a);
         head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setBackgroundColor(0xFF1E2A5A);
+        head.setBackgroundColor(0xFF1A1D29);           // тот же тон, что и фон страницы (--card): шапка не выделяется отдельной плашкой
         TextView title = new TextView(a);
-        title.setText("≡ MGG");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        title.setText("≡");                            // только значок "потяни", название уже есть в самой панели
+        title.setTextColor(0xFF8D92A6);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
         title.setGravity(Gravity.CENTER_VERTICAL);
-        title.setPadding(dp(a, 10), 0, 0, 0);
+        title.setPadding(dp(a, 12), 0, 0, 0);
         title.setOnTouchListener(new Mover(a, p, null));
         head.addView(title, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
 
@@ -325,6 +333,14 @@ public final class Overlay {
 
         p.addView(head, new LinearLayout.LayoutParams(mp, dp(a, 38)));
         p.addView(w, new LinearLayout.LayoutParams(mp, 0, 1f));
+        final float rad = dp(a, PANEL_RADIUS_DP);
+        p.setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), rad);
+            }
+        });
+        p.setClipToOutline(true);
         p.setAlpha(ALPHAS[alphaIdx]);
         p.setVisibility(View.GONE);
         panel = p;
@@ -423,4 +439,4 @@ public final class Overlay {
         }
     }
     }
-    
+            
