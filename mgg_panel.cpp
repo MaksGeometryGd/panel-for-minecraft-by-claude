@@ -60,15 +60,31 @@ typedef std::map<Str, Str> Params;
 struct Seg { uintptr_t s, e; bool r, w, x; };
 struct Img { uintptr_t base = 0; std::vector<Seg> segs; };
 
-static bool loadImg(Img &im) {
+static Str g_lib = MGG_TARGET_LIB;     // выбранная для патчинга библиотека (вкладка Lib)
+
+// строка /proc/self/maps -> диапазон, права, путь
+static bool mapLine(const char *line, unsigned long &s, unsigned long &e, char *perms, Str &path) {
+    int n = 0;
+    if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %n", &s, &e, perms, &n) < 3 || n <= 0) {
+        if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3) return false;
+        path.clear(); return true;
+    }
+    path = line + n;
+    while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) path.pop_back();
+    return true;
+}
+static Str mapBase(const Str &p) { size_t k = p.rfind('/'); return k == Str::npos ? p : p.substr(k + 1); }
+
+static bool loadImg(Img &im, const char *lib = nullptr) {
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return false;
     char line[1024];
     uintptr_t lo = ~(uintptr_t)0;
+    Str want = lib ? Str(lib) : g_lib;
     while (fgets(line, sizeof line, f)) {
-        if (!strstr(line, MGG_TARGET_LIB)) continue;
-        unsigned long s, e; char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &s, &e, perms) != 3) continue;
+        unsigned long s, e; char perms[8] = {0}; Str path;
+        if (!mapLine(line, s, e, perms, path)) continue;
+        if (mapBase(path) != want) continue;
         Seg g{(uintptr_t)s, (uintptr_t)e, perms[0] == 'r', perms[1] == 'w', perms[2] == 'x'};
         im.segs.push_back(g);
         if (g.s < lo) lo = g.s;
@@ -752,6 +768,7 @@ static void loadFile() {
 }
 
 static Str doPatch(const Img &im, uintptr_t off, const std::vector<uint8_t> &b, bool keep) {
+    if (keep && g_lib != MGG_TARGET_LIB) return Str("«сохранять на запуски» только для ") + MGG_TARGET_LIB + ": выбери «только сейчас» или основную библиотеку\n";
     auto it = g_patches.find(off);
     if (it != g_patches.end() && it->second.size() != b.size()) return "по этому смещению уже есть патч другой длины: сначала откати\n";
     Str r = writeMem(im, off, b, true);
@@ -769,7 +786,7 @@ static Str doPatch(const Img &im, uintptr_t off, const std::vector<uint8_t> &b, 
 // автоприменение сохранённых патчей через несколько секунд после старта игры
 static void autoApply() {
     Img im;
-    for (int i = 0; i < 120; i++) { im = Img(); if (loadImg(im)) break; sleep(1); }
+    for (int i = 0; i < 120; i++) { im = Img(); if (loadImg(im, MGG_TARGET_LIB)) break; sleep(1); }
     if (im.segs.empty()) return;
     sleep(8);
     std::lock_guard<std::mutex> lk(g_mu);
@@ -784,7 +801,7 @@ static void autoApply() {
         return;
     }
     FILE *lf = fopen(lock.c_str(), "w"); if (lf) fclose(lf);
-    im = Img(); loadImg(im);
+    im = Img(); loadImg(im, MGG_TARGET_LIB);
     for (const Saved &s : g_saved) {
         uintptr_t a = im.base + s.off;
         if (!segAt(im, a, s.now.size())) { LOGI("патч %lX вне сегмента", (unsigned long)s.off); continue; }
@@ -1561,7 +1578,7 @@ static Str miscRoute(const Str &path, const Params &q) {
     }
     if (path == "status") {
         size_t fz; { std::lock_guard<std::mutex> lk(g_fm); fz = g_frz.size(); }
-        return "патчей в сессии: " + std::to_string(g_patches.size()) + "\nсохранённых: " + std::to_string(g_saved.size()) +
+        return "библиотека: " + g_lib + "\nпатчей в сессии: " + std::to_string(g_patches.size()) + "\nсохранённых: " + std::to_string(g_saved.size()) +
                "\nзаморозок: " + std::to_string(fz) + "\nблокировка краша: " + (access(lock.c_str(), F_OK) == 0 ? "есть" : "нет") +
                "\nотключённые патчи (.disabled): " + (access(dis.c_str(), F_OK) == 0 ? "есть" : "нет") + "\nпапка данных: " + dataDir() + "\n";
     }
@@ -1582,6 +1599,128 @@ static Str miscRoute(const Str &path, const Params &q) {
         return "откатано патчей: " + std::to_string(n) + ", снято заморозок: " + std::to_string(fz) + ", сохранённые очищены\n";
     }
     return "неизвестный маршрут\n";
+}
+
+
+// ---------------------------------------------------------------- выбор библиотеки (вкладка Lib)
+static const char *libInfo(const Str &n, const Str &path) {
+    struct D { const char *k; const char *d; };
+    static const D t[] = {
+        {"libminecraftpe.so", "ЯДРО игры Minecraft Bedrock: логика, мир, рендер, UI. Основная для патчей"},
+        {"libmggpanel.so", "эта панель MGG"},
+        {"libc.so", "стандартная C: память, файлы, потоки"},
+        {"libm.so", "математика (sin, sqrt и т.д.)"},
+        {"libdl.so", "загрузка библиотек (dlopen/dlsym)"},
+        {"liblog.so", "логи Android (logcat)"},
+        {"libandroid.so", "NDK Android: окно, ввод, ассеты, сенсоры"},
+        {"libEGL.so", "создаёт окно и контекст для графики OpenGL ES"},
+        {"libGLESv1_CM.so", "OpenGL ES 1.x (старая графика)"},
+        {"libGLESv2.so", "OpenGL ES 2/3: рисование картинки игры"},
+        {"libGLESv3.so", "OpenGL ES 3: рисование картинки игры"},
+        {"libvulkan.so", "Vulkan: современный API графики"},
+        {"libOpenSLES.so", "звук OpenSL ES"},
+        {"libaaudio.so", "звук AAudio (низкая задержка)"},
+        {"libfmod.so", "звуковой движок FMOD"},
+        {"libfmodstudio.so", "звуковой движок FMOD Studio"},
+        {"libz.so", "сжатие zlib (zip/gzip)"},
+        {"libstdc++.so", "рантайм C++ системный"},
+        {"libc++.so", "рантайм C++ (STL)"},
+        {"libc++_shared.so", "рантайм C++ (STL), общий"},
+        {"libjnigraphics.so", "работа с картинками (Bitmap) из C++"},
+        {"libnativewindow.so", "окна и буферы для графики"},
+        {"libmediandk.so", "кодеки и медиа"},
+        {"libnativehelper.so", "мост JNI между Java и C++"},
+        {"libart.so", "виртуальная машина Android (Java/Kotlin)"},
+        {"libandroid_runtime.so", "ядро Android runtime"},
+        {"libhwui.so", "аппаратное рисование интерфейса Android"},
+        {"libbinder.so", "связь между процессами Android"},
+        {"libbinder_ndk.so", "связь между процессами Android (NDK)"},
+        {"libcutils.so", "системные утилиты Android"},
+        {"libutils.so", "системные утилиты Android"},
+        {"libssl.so", "TLS/SSL шифрование"},
+        {"libcrypto.so", "криптография"},
+        {"libnetd_client.so", "сеть Android"},
+        {"libsync.so", "синхронизация графики"},
+        {"libvndksupport.so", "поддержка vendor-библиотек"},
+        {"libicuuc.so", "ICU: юникод, языки, текст"},
+        {"libicui18n.so", "ICU: локали, даты, числа"},
+        {"libHttpClient.Android.so", "Xbox/сетевой клиент HTTP"},
+        {"libMaesdk.Android.so", "телеметрия Microsoft"},
+        {"linker", "загрузчик библиотек (32-bit)"},
+        {"linker64", "загрузчик библиотек (64-bit)"},
+    };
+    for (const D &d : t) if (n == d.k) return d.d;
+    if (n.compare(0, 8, "libVkLay") == 0) return "слой отладки Vulkan";
+    if (n.find("adreno") != Str::npos || n.find("GLES_mali") != Str::npos || n.find("vulkan.") != Str::npos || n.compare(0, 6, "libEGL") == 0 || n.compare(0, 7, "libGLES") == 0 || n.find("glnext") != Str::npos) return "драйвер видеокарты (GPU)";
+    if (n.compare(0, 8, "libcore_") == 0 || n.compare(0, 6, "libopenjdk") == 0 || n.compare(0, 8, "libjavacore") == 0) return "Java-часть Android";
+    if (path.compare(0, 8, "/system/") == 0 || path.compare(0, 6, "/apex/") == 0 || path.compare(0, 8, "/vendor/") == 0 || path.compare(0, 9, "/product/") == 0) return "системная библиотека Android";
+    if (path.compare(0, 10, "/data/app/") == 0 || path.compare(0, 11, "/data/data/") == 0) return "библиотека приложения/игры";
+    return "нет описания";
+}
+
+static int elfBits(const Str &path) {            // 32 / 64 / 0 (не прочитать)
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    unsigned char h[5] = {0};
+    size_t n = fread(h, 1, 5, f); fclose(f);
+    if (n < 5 || h[0] != 0x7f || h[1] != 'E' || h[2] != 'L' || h[3] != 'F') return 0;
+    return h[4] == 2 ? 64 : h[4] == 1 ? 32 : 0;
+}
+
+struct LibEnt { Str name, path; unsigned long lo, hi; int bits; };
+
+static std::vector<LibEnt> listLibs() {
+    std::vector<LibEnt> v;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return v;
+    char line[1024];
+    int procBits = (int)sizeof(void *) * 8;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long s, e; char perms[8] = {0}; Str path;
+        if (!mapLine(line, s, e, perms, path)) continue;
+        if (path.empty() || path[0] != '/') continue;
+        Str bn = mapBase(path);
+        if (bn.find(".so") == Str::npos && bn != "linker" && bn != "linker64") continue;
+        LibEnt *x = nullptr;
+        for (LibEnt &c : v) if (c.name == bn) { x = &c; break; }
+        if (!x) { v.push_back({bn, path, s, e, 0}); x = &v.back(); }
+        if (s < x->lo) x->lo = s;
+        if (e > x->hi) x->hi = e;
+    }
+    fclose(f);
+    for (LibEnt &c : v) { c.bits = elfBits(c.path); if (!c.bits) c.bits = procBits; }   // не прочиталась: процесс может грузить только свою разрядность
+    std::sort(v.begin(), v.end(), [](const LibEnt &a, const LibEnt &b) {
+        bool am = a.name == MGG_TARGET_LIB, bm = b.name == MGG_TARGET_LIB;
+        if (am != bm) return am;
+        return a.name < b.name;
+    });
+    return v;
+}
+
+// libs: строки "имя \t бит \t размер \t описание \t выбрана"; первая строка "#\t<бит процесса>\t<выбранная>\t<бит выбранной>"
+static Str libRoute(const Str &path, const Params &q) {
+    std::vector<LibEnt> v = listLibs();
+    int procBits = (int)sizeof(void *) * 8;
+    if (path == "libsel") {
+        Str n = P(q, "n");
+        if (n.empty()) return "нужно имя библиотеки\n";
+        const LibEnt *hit = nullptr;
+        for (const LibEnt &c : v) if (c.name == n) { hit = &c; break; }
+        if (!hit) return "библиотека " + n + " не найдена в процессе игры\n";
+        if (n != g_lib && !g_patches.empty()) return "сначала откати патчи сессии (Lib → Патчи → Список, или Safe → Откатить ВСЁ): они записаны в «" + g_lib + "»\n";
+        g_lib = n;
+        Str o = "выбрана: " + n + " (" + std::to_string(hit->bits) + " бит)\nбаза " + hx(hit->lo) + ", размер " + hx(hit->hi - hit->lo) + "\n" + libInfo(n, hit->path) + "\n";
+        if (n != MGG_TARGET_LIB) o += "внимание: сохранение патчей на запуски и автоприменение работают только для " MGG_TARGET_LIB "\n";
+        if (hit->bits == 64) o += "внимание: дизассемблер, xref, «кто вызывает», константы и «Функция → число / NOP» рассчитаны на 32-bit Thumb; для 64-bit работают Hex, сигнатуры, строки и патчи байтами\n";
+        return o;
+    }
+    Str o = "#\t" + std::to_string(procBits) + "\t" + g_lib + "\t";
+    int sb = procBits;
+    for (const LibEnt &c : v) if (c.name == g_lib) sb = c.bits;
+    o += std::to_string(sb) + "\n";
+    for (const LibEnt &c : v)
+        o += c.name + "\t" + std::to_string(c.bits) + "\t" + hx(c.hi - c.lo) + "\t" + libInfo(c.name, c.path) + "\t" + (c.name == g_lib ? "1" : "0") + "\n";
+    return o;
 }
 
 // ---------------------------------------------------------------- маршруты
@@ -1636,6 +1775,9 @@ button.d{background:#8a3a40}button.g{background:#3f7a63}
 .tag{font-size:9px;background:rgba(0,0,0,.3);border-radius:5px;padding:1px 5px;margin-left:6px}
 small{color:var(--dim);display:block;margin-top:4px}
 .pre{display:flex;gap:5px;flex-wrap:wrap}.pre button{width:auto;flex:1 1 30%;min-width:0}
+.pre.sm button{flex:1 1 20%;padding:6px 3px;font-size:11px;margin:0}
+.lb{font-weight:600;font-size:10px;color:var(--dim);margin:7px 0 3px;display:block}
+#ll .fn{cursor:pointer}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
 <symbol id="i-bolt" viewBox="0 0 24 24"><path class="fi" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
@@ -1695,6 +1837,13 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button class=s style="margin-top:6px" onclick="call('mlist',{n:60})"><svg class=ic><use href="#i-list"/></svg>Список найденных</button></div>
 <div class=card><h3><svg class=ic><use href="#i-snow"/></svg>Запись и заморозка</h3>
 <input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
+<span class=lb>Заготовки значений</span>
+<select id=mpm><option value=0>по нажатию: только вставить в поле</option><option value=w>по нажатию: сразу записать</option><option value=f>по нажатию: сразу заморозить</option></select>
+<div class="pre sm"><button class=s onclick="pv('0','4','OFF')">OFF 0</button><button class=s onclick="pv('1','4','ON')">ON 1</button><button class=s onclick="pv('-1','4','-1')">-1</button><button class=s onclick="pv('100','4','100')">100</button><button class=s onclick="pv('999','4','999')">999</button><button class=s onclick="pv('9999','4','9999')">9999</button><button class=s onclick="pv('2147483647','4','МАКС')">МАКС</button></div>
+<span class=lb>float</span>
+<div class="pre sm"><button class=s onclick="pv('0','f','0.0')">0.0</button><button class=s onclick="pv('0.5','f','0.5')">0.5</button><button class=s onclick="pv('1','f','1.0')">1.0</button><button class=s onclick="pv('2','f','2.0')">2.0</button><button class=s onclick="pv('10','f','10.0')">10.0</button><button class=s onclick="pv('100','f','100.0')">100.0</button></div>
+<span class=lb>1 байт (флаги, вкл/выкл)</span>
+<div class="pre sm"><button class=s onclick="pv('0','1','byte OFF 0')">OFF 0</button><button class=s onclick="pv('1','1','byte ON 1')">ON 1</button><button class=s onclick="pv('255','1','byte 255')">255</button></div>
 <div class=grid2><button onclick="call('mset',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-save"/></svg>Записать</button><button onclick="call('mset',{all:1,v:v('mw')})"><svg class=ic><use href="#i-save"/></svg>Во все найденные</button>
 <button class=g onclick="call('mfreeze',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-snow"/></svg>Заморозить</button><button class=g onclick="call('mfreeze',{all:1,v:v('mw')})"><svg class=ic><use href="#i-snow"/></svg>Все найденные</button>
 <button class=s onclick="call('mfrlist',{})"><svg class=ic><use href="#i-list"/></svg>Список заморозок</button><button class=d onclick="call('munfreeze',{all:1})"><svg class=ic><use href="#i-sun"/></svg>Разморозить всё</button></div></div>
@@ -1705,6 +1854,12 @@ small{color:var(--dim);display:block;margin-top:4px}
 </div>
 
 <div class=pg id=pl style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-lib"/></svg>Библиотека для патчинга</h3>
+<div class=fn onclick="libOpen()"><div class=nm><span id=lnm>…</span><div class=sub id=lsub></div></div><svg class=ic><use href="#i-list"/></svg></div>
+<div id=lpick style="display:none">
+<div class=grid2><button id=lb32 class=s onclick="libBits(32)">32 bit</button><button id=lb64 class=s onclick="libBits(64)">64 bit</button></div>
+<small id=lnote></small><div id=ll></div></div>
+<small>По умолчанию libminecraftpe.so, разрядность берётся из игры. Все вкладки Lib (хекс, патчи, сигнатуры, строки) работают с выбранной библиотекой.</small></div>
 <details class=card open><summary><svg class=ic><use href="#i-hex"/></svg>Константы в коде<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=cv placeholder="число (например 13 или 0xD)"><input id=cv2 placeholder="второе число рядом (необязательно)">
 <input id=cw placeholder="окно, байт (по умолч. 768)">
@@ -1726,6 +1881,9 @@ small{color:var(--dim);display:block;margin-top:4px}
 <input id=da placeholder="смещение, hex"><input id=dn placeholder="команд (24)"><button class=s onclick="call('dis',{a:v('da'),n:v('dn')||24})"><svg class=ic><use href="#i-code"/></svg>Дизассемблер Thumb</button></div></details>
 <details class=card><summary><svg class=ic><use href="#i-save"/></svg>Патчи<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=pa placeholder="смещение, hex"><input id=pb placeholder="байты: 00 20 70 47">
+<span class=lb>Заготовки (в начало функции: она сразу вернёт значение)</span>
+<div class="pre sm" id=pbs32><button class=s onclick="pbv('00 20 70 47','OFF: вернуть 0')">OFF (0)</button><button class=s onclick="pbv('01 20 70 47','ON: вернуть 1')">ON (1)</button><button class=s onclick="pbv('64 20 70 47','вернуть 100')">100</button><button class=s onclick="pbv('70 47','return: выйти сразу')">RET</button><button class=s onclick="pbv('00 BF','NOP (2 байта)')">NOP</button></div>
+<div class="pre sm" id=pbs64 style="display:none"><button class=s onclick="pbv('00 00 80 D2 C0 03 5F D6','OFF: вернуть 0')">OFF (0)</button><button class=s onclick="pbv('20 00 80 D2 C0 03 5F D6','ON: вернуть 1')">ON (1)</button><button class=s onclick="pbv('80 0C 80 D2 C0 03 5F D6','вернуть 100')">100</button><button class=s onclick="pbv('C0 03 5F D6','ret: выйти сразу')">RET</button><button class=s onclick="pbv('1F 20 03 D5','NOP (4 байта)')">NOP</button></div>
 <select id=pk><option value=0>только сейчас</option><option value=1>сохранять на запуски</option></select>
 <button onclick="call('patch',{a:v('pa'),b:v('pb'),k:v('pk')})"><svg class=ic><use href="#i-save"/></svg>Записать</button>
 <div class=grid2><button class=s onclick="call('undo',{a:v('pa')})"><svg class=ic><use href="#i-undo"/></svg>Откатить</button><button class=s onclick="call('patches',{})"><svg class=ic><use href="#i-list"/></svg>Список (сессия)</button><button class=s onclick="call('saved',{})"><svg class=ic><use href="#i-list"/></svg>Сохранённые</button><button class=d onclick="call('clearsaved',{})"><svg class=ic><use href="#i-trash"/></svg>Удалить сохранённые</button></div>
@@ -1786,7 +1944,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
 function tab(x){for(const k of ['n','m','l','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
-if(x=='n')fnl();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
+if(x=='n')fnl();if(x=='l')libLoad();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
 function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
@@ -1803,6 +1961,28 @@ const sw=document.createElement('div');sw.className='sw '+(on?'on':s=='3'?'bad':
 row.onclick=async()=>{if(s=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
 await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}}
 async function findopt(){const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m)document.getElementById('op').value=m.trim()}
+const LB={proc:32,sel:'',selBits:32,pick:0,list:[]};
+async function libLoad(){let r='';try{r=await(await fetch('/api/libs?'+new URLSearchParams({t:T}))).text()}catch(e){document.getElementById('lnm').textContent='ошибка';return}
+const ls=r.trim().split('\n');const h=ls.shift().split('\t');if(h[0]!='#'){document.getElementById('lnm').textContent=r;return}
+LB.proc=+h[1];LB.sel=h[2];LB.selBits=+h[3];if(!LB.pick)LB.pick=LB.proc;
+LB.list=ls.map(l=>{const a=l.split('\t');return{n:a[0],b:+a[1],sz:a[2],d:a[3],on:a[4]=='1'}});libRender()}
+function libRender(){const cur=LB.list.find(x=>x.on);document.getElementById('lnm').textContent=LB.sel||'не найдена';
+document.getElementById('lsub').textContent=cur?(cur.b+' bit · '+cur.d):'нет в процессе игры';
+document.getElementById('lb32').className=LB.pick==32?'':'s';document.getElementById('lb64').className=LB.pick==64?'':'s';
+const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.b==LB.pick);
+document.getElementById('lnote').textContent=L.length?('Библиотек '+LB.pick+' bit: '+L.length+' (игра запущена в '+LB.proc+' bit)'):('Игра запущена в '+LB.proc+' bit: библиотек '+LB.pick+' bit в процессе нет');
+for(const x of L){const row=document.createElement('div');row.className='fn';const nm=document.createElement('div');nm.className='nm';nm.textContent=x.n;
+const sub=document.createElement('div');sub.className='sub';sub.textContent=x.d+' · '+x.sz;nm.appendChild(sub);
+const sw=document.createElement('div');sw.className='sw'+(x.on?' on':'');row.onclick=()=>libSel(x.n);row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}
+document.getElementById('pbs32').style.display=LB.selBits==64?'none':'';document.getElementById('pbs64').style.display=LB.selBits==64?'':'none'}
+function libOpen(){const p=document.getElementById('lpick');p.style.display=p.style.display=='none'?'':'none';if(p.style.display=='')libLoad()}
+function libBits(b){LB.pick=b;libRender()}
+async function libSel(n){await call('libsel',{n:n});await libLoad();document.getElementById('lpick').style.display='none'}
+function pbv(b,t){document.getElementById('pb').value=b;out.textContent=t+'\nбайты вставлены. Впиши смещение функции и нажми «Записать».'}
+async function pv(val,t,name){document.getElementById('mw').value=val;document.getElementById('mt').value=t;const m=v('mpm');
+if(m=='0'){out.textContent='значение '+name+' ('+val+') вставлено в поле'+(t=='f'?' · тип float':t=='1'?' · тип 1 байт':'')+'\nнажми «Записать» или «Заморозить»';return}
+if(!v('ma')){out.textContent='сначала впиши адрес';return}
+call(m=='w'?'mset':'mfreeze',{a:v('ma'),v:val,...ty()})}
 function q(k,val){document.getElementById('ok1').value=k;call('setkey',{p:v('op'),k:k,v:val})}
 
 function mix(h,p){const n=parseInt(h.slice(1),16);let r=n>>16,g=(n>>8)&255,b=n&255;const f=x=>Math.max(0,Math.min(255,Math.round(x+(p>0?(255-x):x)*p)));return '#'+[r,g,b].map(f).map(x=>x.toString(16).padStart(2,'0')).join('')}
@@ -1814,7 +1994,7 @@ if(save)try{localStorage.setItem('mggTheme',JSON.stringify([ac,bg,cd,hl,r]))}cat
 function preset(ac,bg,cd,hl){document.getElementById('c_ac').value=ac;document.getElementById('c_bg').value=bg;document.getElementById('c_card').value=cd;document.getElementById('c_hl').value=hl;applyTheme()}
 (function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme'))}catch(e){}t=t||['#85775a','#12141c','#1a1d29','#f0b429',10];
 document.getElementById('c_ac').value=t[0];document.getElementById('c_bg').value=t[1];document.getElementById('c_card').value=t[2];document.getElementById('c_hl').value=t[3];document.getElementById('c_r').value=t[4];applyTheme(false)})();
-fnl();
+fnl();libLoad();
 </script></body></html>)MGG";
 
 
@@ -1823,9 +2003,9 @@ static Str route(const Str &path, const Params &q) {
     if (path == "ls" || path == "cat" || path == "grep" || path == "setkey" || path == "freplace" || path == "frestore") return fileRoute(path, q);
     if (path == "mscan" || path == "mnext" || path == "mlist" || path == "mreset" || path == "mset" || path == "mdump" || path == "mfreeze" || path == "mfrlist" || path == "munfreeze" || path == "mwatch" || path == "mwlog" || path == "mwstop") return memRoute(path, q);
     if (path == "findopt" || path == "status" || path == "unlock" || path == "reenable" || path == "rollall") return miscRoute(path, q);
-    if (path == "mscan" || path == "mnext") {}
+    if (path == "libs" || path == "libsel") return libRoute(path, q);
     Img im;
-    if (!loadImg(im)) return Str("библиотека ") + MGG_TARGET_LIB + " не найдена в /proc/self/maps\n";
+    if (!loadImg(im)) return "библиотека " + g_lib + " не найдена в /proc/self/maps (выбери другую во вкладке Lib)\n";
     uintptr_t a = 0;
 
     if (path == "fnlist" || path == "fnon" || path == "fnoff" || path == "fnsave" || path == "fnprof") return fnRoute(im, path, q);
