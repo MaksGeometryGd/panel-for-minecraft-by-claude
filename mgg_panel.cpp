@@ -1235,18 +1235,36 @@ static Str memRoute(const Str &path, const Params &q) {
     return "неизвестный маршрут\n";
 }
 
-// ---------------------------------------------------------------- Chunk limit disabler: ползунок дальности прорисовки
+// ---------------------------------------------------------------- Привязанные значения в куче: дальность прорисовки (чанки), FOV, данные игрока
 // Значение лежит в куче, и адрес меняется при каждом запуске игры. Поэтому при «Привязать» запоминаем окружение адреса
 // (по 16 слов вокруг): слово-указатель в libminecraftpe.so хранится как смещение от базы (стабильно), указатель в любую другую
 // память игнорируется (нестабилен), остальное хранится как есть. При «Применить» окружение ищется в куче заново.
 // Пока значение заморожено, поток каждые 60 мс перепроверяет окружение: если оно изменилось (вышел из мира, память освобождена),
 // заморозка снимается и ничего не пишется в чужую память.
+// Привязок несколько: chunk (int), fov (float) — их можно писать; p_* (данные игрока) — только читаются во вкладке World.
 struct CsWord { uint8_t k; uint32_t v; };                 // k: 0 пропуск, 1 точное значение, 2 указатель в lib (v = смещение от базы)
 struct CsSig { std::vector<CsWord> w; int tgt = 0; };
 static const int CS_BEFORE = 16, CS_AFTER = 16;
-static CsSig g_cs; static uintptr_t g_ca = 0, g_cbase = 0; static int g_cval = 0; static bool g_cfreeze = false, g_cth = false; static Str g_cmsg;
+
+struct CsSlot {
+    const char *name; bool isf; double lo, hi; bool canSet;
+    CsSig sg; bool tried; uintptr_t a, base; uint32_t val; bool freeze; Str msg;
+    CsSlot(const char *n, bool f, double l, double h, bool c) : name(n), isf(f), lo(l), hi(h), canSet(c), tried(false), a(0), base(0), val(0), freeze(false) {}
+};
+static CsSlot g_cslot[] = {
+    CsSlot("chunk", false, 1, 96, true),
+    CsSlot("fov", true, 30, 170, true),
+    CsSlot("p_hp", true, 0, 0, false),
+    CsSlot("p_armor", true, 0, 0, false),
+    CsSlot("p_food", true, 0, 0, false),
+    CsSlot("p_pos", true, 0, 0, false),       // X, дальше по +4 Y и +8 Z
+    CsSlot("p_rot", true, 0, 0, false),       // два float подряд (поворот)
+};
+static bool g_cth = false;
 static std::mutex g_cm;
-static Str csFile() { return dataDir() + "/mgg_chunk.txt"; }
+
+static CsSlot *csSlot(const Str &n) { for (CsSlot &s : g_cslot) if (n == s.name) return &s; return nullptr; }
+static Str csFile(const CsSlot &s) { Str n = s.name; return dataDir() + (n == "chunk" ? Str("/mgg_chunk.txt") : "/mgg_" + n + ".txt"); }
 
 static std::vector<MapR> allMaps() {
     std::vector<MapR> v; FILE *f = fopen("/proc/self/maps", "r"); if (!f) return v;
@@ -1255,6 +1273,20 @@ static std::vector<MapR> allMaps() {
     fclose(f); return v;
 }
 static bool csIsAnchor(const CsWord &c) { return c.k == 2 || (c.k == 1 && c.v >= 0x100); }
+
+// подходит ли слово как значение этой привязки
+static bool csValOk(const CsSlot &s, uint32_t raw) {
+    if (!s.isf) return raw <= 4096;
+    float f; memcpy(&f, &raw, 4);
+    if (!(f == f)) return false;
+    if (s.canSet) return f >= 1.f && f <= 400.f;           // FOV
+    return f > -1e7f && f < 1e7f;
+}
+static Str csFmt(const CsSlot &s, uint32_t raw) {
+    char b[32];
+    if (s.isf) { float f; memcpy(&f, &raw, 4); snprintf(b, sizeof b, "%g", f); } else snprintf(b, sizeof b, "%d", (int)raw);
+    return b;
+}
 
 static bool csBuild(const Img &im, uintptr_t a, CsSig &sg, Str &err) {
     if (a & 3) { err = "адрес должен быть кратен 4"; return false; }
@@ -1292,14 +1324,14 @@ static bool csScore(const CsSig &sg, uintptr_t base, uintptr_t a, double &all, d
     }
     all = t1 ? (double)o1 / t1 : 0; anc = t2 ? (double)o2 / t2 : 0; return true;
 }
-static bool csOk(const CsSig &sg, uintptr_t base, uintptr_t a, double lo) {
+static bool csOk(const CsSlot &s, const CsSig &sg, uintptr_t base, uintptr_t a, double lo) {
     double x, y; if (!csScore(sg, base, a, x, y)) return false;
     bool ok; unsigned long long v = memVal(a, 4, ok);
-    return ok && x >= lo && y >= lo - 0.1 && v <= 4096;
+    return ok && x >= lo && y >= lo - 0.1 && csValOk(s, (uint32_t)v);
 }
 
 // поиск окружения в куче: берём до 3 якорных слов, ищем каждое (шаг 4 байта), проверяем кандидатов
-static Str csFind(const CsSig &sg, uintptr_t base, uintptr_t &found) {
+static Str csFind(const CsSlot &s, const CsSig &sg, uintptr_t base, uintptr_t &found) {
     found = 0; int n = (int)sg.w.size(); std::vector<int> an;
     for (int i = 0; i < n; i++) if (sg.w[i].k == 2) an.push_back(i);
     for (int i = 0; i < n; i++) if (sg.w[i].k == 1 && sg.w[i].v >= 0x100) an.push_back(i);
@@ -1322,7 +1354,7 @@ static Str csFind(const CsSig &sg, uintptr_t base, uintptr_t &found) {
         for (uintptr_t h : hits) {
             uintptr_t t = h + (uintptr_t)(sg.tgt - ix) * 4; double x, y; if (!csScore(sg, base, t, x, y)) continue;
             bool ok; unsigned long long v = memVal(t, 4, ok);
-            if (!ok || v > 4096 || x < 0.8 || y < 0.7) continue;
+            if (!ok || !csValOk(s, (uint32_t)v) || x < 0.8 || y < 0.7) continue;
             if (x > best + 1e-9) { best = x; bestA = t; ties = 1; } else if (x > best - 1e-9 && t != bestA) ties++;
         }
         if (bestA && ties == 1) { found = bestA; return ""; }
@@ -1331,70 +1363,311 @@ static Str csFind(const CsSig &sg, uintptr_t base, uintptr_t &found) {
     return "окружение не найдено в куче\n";
 }
 
-static bool csSave(const CsSig &sg) {
-    FILE *f = fopen(csFile().c_str(), "w"); if (!f) return false;
+static bool csSave(const CsSlot &s, const CsSig &sg) {
+    FILE *f = fopen(csFile(s).c_str(), "w"); if (!f) return false;
     fprintf(f, "MGGCHUNK1 %d %d\n", sg.tgt, (int)sg.w.size());
     for (const CsWord &c : sg.w) fprintf(f, "%d %X\n", (int)c.k, (unsigned)c.v);
     fclose(f); return true;
 }
-static bool csLoad(CsSig &sg) {
-    FILE *f = fopen(csFile().c_str(), "r"); if (!f) return false;
+static bool csLoad(const CsSlot &s, CsSig &sg) {
+    FILE *f = fopen(csFile(s).c_str(), "r"); if (!f) return false;
     int tgt = 0, n = 0; bool ok = fscanf(f, "MGGCHUNK1 %d %d", &tgt, &n) == 2 && n > 0 && n < 200 && tgt >= 0 && tgt < n;
-    CsSig s; s.tgt = tgt;
-    for (int i = 0; ok && i < n; i++) { int k = 0; unsigned v = 0; if (fscanf(f, "%d %x", &k, &v) != 2 || k < 0 || k > 2) ok = false; else s.w.push_back(CsWord{(uint8_t)k, (uint32_t)v}); }
-    fclose(f); if (ok) sg = s; return ok;
+    CsSig t; t.tgt = tgt;
+    for (int i = 0; ok && i < n; i++) { int k = 0; unsigned v = 0; if (fscanf(f, "%d %x", &k, &v) != 2 || k < 0 || k > 2) ok = false; else t.w.push_back(CsWord{(uint8_t)k, (uint32_t)v}); }
+    fclose(f); if (ok) sg = t; return ok;
+}
+// есть ли привязка (в памяти или в файле); вызывать под g_cm
+static bool csHas(CsSlot &s) {
+    if (s.sg.w.empty() && !s.tried) { s.tried = true; csLoad(s, s.sg); }
+    return !s.sg.w.empty();
+}
+// 0 = нет привязки, 1 = адрес рабочий, 2 = адрес устарел (нужен поиск заново); вызывать под g_cm
+static int csState(CsSlot &s, const Img &im, uintptr_t &a) {
+    if (!csHas(s)) return 0;
+    if (!s.a || !csOk(s, s.sg, im.base, s.a, 0.6)) return 2;
+    a = s.a; return 1;
 }
 
 static void csThread() {
     for (;;) {
         usleep(60000);
         std::lock_guard<std::mutex> lk(g_cm);
-        if (!g_cfreeze || !g_ca) continue;
-        if (!csOk(g_cs, g_cbase, g_ca, 0.6)) { g_cfreeze = false; g_cmsg = "заморозка снята: данные по адресу изменились (выход из мира или перезапуск игры)"; continue; }
-        bool ok; unsigned long long cur = memVal(g_ca, 4, ok);
-        if (ok && (int)cur != g_cval) memWrite(g_ca, (unsigned long long)(uint32_t)g_cval, 4);
+        for (CsSlot &s : g_cslot) {
+            if (!s.freeze || !s.a) continue;
+            if (!csOk(s, s.sg, s.base, s.a, 0.6)) { s.freeze = false; s.msg = "заморозка снята: данные по адресу изменились (выход из мира или перезапуск игры)"; continue; }
+            bool ok; unsigned long long cur = memVal(s.a, 4, ok);
+            if (ok && (uint32_t)cur != s.val) memWrite(s.a, (unsigned long long)s.val, 4);
+        }
     }
 }
 
-static Str csRoute(const Img &im, const Str &path, const Params &q) {
+// маршруты: csst (короткий статус), csinfo, csbind, csfind, csapply, csstop;  параметр s = chunk | fov | p_hp | ...
+static Str csRoute(const Str &path, const Params &q) {
+    CsSlot *sp = csSlot(P(q, "s", "chunk"));
+    if (!sp) return "неизвестная привязка\n";
+    CsSlot &s = *sp;
+    Img im;
+    if (!loadImg(im, MGG_TARGET_LIB)) return Str(MGG_TARGET_LIB) + " не найдена в процессе игры\n";
     if (path == "csstop") {
-        std::lock_guard<std::mutex> lk(g_cm); g_cfreeze = false; return "заморозка снята, значение осталось как есть (верни дальность в настройках игры)\n";
+        std::lock_guard<std::mutex> lk(g_cm); s.freeze = false;
+        return "заморозка снята, значение осталось как есть (верни его в настройках игры)\n";
     }
-    if (path == "csinfo") {
+    if (path == "csst" || path == "csinfo") {
         std::lock_guard<std::mutex> lk(g_cm);
-        CsSig fs; bool has = !g_cs.w.empty() || csLoad(fs);
-        Str o = Str("привязка: ") + (has ? "есть" : "нет (нужно «Привязать адрес»)") + "\n";
-        if (g_ca) { bool ok; unsigned long long v = memVal(g_ca, 4, ok); o += "адрес: " + hx(g_ca) + (ok ? ", сейчас " + std::to_string((int)v) : Str(", не читается")) + "\n"; }
-        o += Str("заморозка: ") + (g_cfreeze ? "включена, " + std::to_string(g_cval) : Str("выключена")) + "\n";
-        if (!g_cmsg.empty()) o += g_cmsg + "\n";
-        return o;
+        uintptr_t a = 0; int st = csState(s, im, a);
+        Str o = st == 0 ? "не привязано" : st == 1 ? "привязано" : "привязано, адрес устарел (кнопка «Применить» найдёт заново)";
+        if (st == 1) { bool ok; unsigned long long v = memVal(a, 4, ok); o += ok ? " · сейчас " + csFmt(s, (uint32_t)v) : Str(" · не читается"); }
+        if (s.freeze) o += " · заморожено на " + csFmt(s, s.val);
+        if (!s.msg.empty()) o += "\n" + s.msg;
+        if (path == "csinfo" && s.a) o += "\nадрес: " + hx(s.a);
+        return o + "\n";
     }
     if (path == "csbind") {
-        uintptr_t a = 0; if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
-        CsSig sg; Str err; if (!csBuild(im, a, sg, err)) return "не привязал: " + err + "\n";
+        uintptr_t a = 0;
+        if (!hexNum(q, "a", a)) {
+            if (g_cand.size() == 1) a = g_cand[0];
+            else return g_cand.empty() ? "нужен адрес (hex): впиши его или найди значение во вкладке Mem\n"
+                                       : "во вкладке Mem найдено адресов: " + std::to_string(g_cand.size()) + ". Впиши нужный или сузь поиск до одного\n";
+        }
         bool ok; unsigned long long v = memVal(a, 4, ok);
-        if (!csSave(sg)) return "не могу записать mgg_chunk.txt\n";
+        if (!ok) return "адрес не читается\n";
+        if (!csValOk(s, (uint32_t)v)) return "значение по адресу (" + csFmt(s, (uint32_t)v) + ") не подходит для этой привязки: проверь тип (int / float) в поиске\n";
+        CsSig sg; Str err; if (!csBuild(im, a, sg, err)) return "не привязал: " + err + "\n";
+        if (!csSave(s, sg)) return "не могу записать файл привязки\n";
         std::lock_guard<std::mutex> lk(g_cm);
-        g_cs = sg; g_ca = a; g_cbase = im.base; g_cmsg.clear();
+        s.sg = sg; s.tried = true; s.a = a; s.base = im.base; s.msg.clear(); s.freeze = false;
         int an = 0; for (const CsWord &c : sg.w) if (csIsAnchor(c)) an++;
-        return "привязано: " + hx(a) + (ok ? ", значение " + std::to_string((int)v) : Str("")) + "\nякорных слов: " + std::to_string(an) + " из " + std::to_string(sg.w.size() - 1) + "\nтеперь ползунок найдёт адрес сам после перезапуска игры\n";
+        return "привязано: " + hx(a) + ", значение " + csFmt(s, (uint32_t)v) + "\nякорных слов: " + std::to_string(an) + " из " + std::to_string(sg.w.size() - 1) + "\nпосле перезапуска игры адрес найдётся сам\n";
     }
-    if (path == "csapply") {
-        int val = (int)decNum(q, "v", 24); if (val < 1) val = 1; if (val > 96) val = 96;
+    if (path == "csfind" || path == "csapply") {
         CsSig sg; uintptr_t cur;
-        { std::lock_guard<std::mutex> lk(g_cm); sg = g_cs; cur = g_ca; }
-        if (sg.w.empty() && !csLoad(sg)) return "сначала «Привязать адрес» (адрес из вкладки Mem)\n";
+        { std::lock_guard<std::mutex> lk(g_cm); csHas(s); sg = s.sg; cur = s.a; }
+        if (sg.w.empty()) return "сначала «Привязать» адрес (значение ищется во вкладке Mem)\n";
         uintptr_t a = 0; Str how;
-        if (cur && csOk(sg, im.base, cur, 0.8)) { a = cur; how = "адрес прежний"; }
-        else { Str e = csFind(sg, im.base, a); if (!e.empty() || !a) return e.empty() ? Str("не нашёл адрес\n") : e; how = "адрес найден заново"; }
-        if (!memWrite(a, (unsigned long long)(uint32_t)val, 4)) return "запись не удалась\n";
+        if (cur && csOk(s, sg, im.base, cur, 0.8)) { a = cur; how = "адрес прежний"; }
+        else { Str e = csFind(s, sg, im.base, a); if (!e.empty() || !a) return e.empty() ? Str("не нашёл адрес\n") : e; how = "адрес найден заново"; }
+        if (path == "csfind") { std::lock_guard<std::mutex> lk(g_cm); s.sg = sg; s.a = a; s.base = im.base; return "ok: " + hx(a) + "\n"; }
+        if (!s.canSet) return "эту привязку нельзя записывать\n";
+        uint32_t raw;
+        if (s.isf) {
+            double d = strtod(P(q, "v").c_str(), nullptr); if (!(d == d) || d < s.lo) d = s.lo; if (d > s.hi) d = s.hi;
+            float f = (float)d; memcpy(&raw, &f, 4);
+        } else {
+            size_t n = decNum(q, "v", (size_t)s.lo); if (n < (size_t)s.lo) n = (size_t)s.lo; if (n > (size_t)s.hi) n = (size_t)s.hi;
+            raw = (uint32_t)n;
+        }
+        if (!memWrite(a, (unsigned long long)raw, 4)) return "запись не удалась\n";
         bool ok; unsigned long long rb = memVal(a, 4, ok);
         std::lock_guard<std::mutex> lk(g_cm);
-        g_cs = sg; g_ca = a; g_cbase = im.base; g_cval = val; g_cfreeze = true; g_cmsg.clear();
+        s.sg = sg; s.a = a; s.base = im.base; s.val = raw; s.freeze = true; s.msg.clear();
         if (!g_cth) { g_cth = true; std::thread(csThread).detach(); }
-        return "дальность " + std::to_string(val) + " (" + how + " " + hx(a) + ")" + (ok && (int)rb == val ? "" : ", но чтение вернуло " + std::to_string((int)rb)) + "\n";
+        return Str(s.name) + " = " + csFmt(s, raw) + " (" + how + " " + hx(a) + ")" + (ok && (uint32_t)rb == raw ? "" : ", но чтение вернуло " + csFmt(s, (uint32_t)rb)) + "\n";
     }
     return "неизвестный маршрут\n";
+}
+
+// ---------------------------------------------------------------- World: игрок, ближайший моб, последний сломанный блок
+// Игрок: значения берутся из привязок p_* (вкладка World, кнопка-ссылка у строки), скорость считается по смещению позиции.
+// Моб и блок: нужны смещения из файла mgg_world.txt (цепочки указателей от базы libminecraftpe.so, они зависят от версии игры).
+// Формат файла mgg_world.txt (hex без 0x допустим):
+//   player.chain|ГЛОБАЛ,смещ1,смещ2       необязательно: цепочка к структуре игрока (первое число — смещение глобальной переменной от базы lib)
+//   player.f|Название|смещение|тип         поле внутри этой структуры
+//   mob.list|ГЛОБАЛ,смещ1,...             цепочка к началу вектора указателей на сущности (begin, затем end)
+//   mob.pos|смещение                       три float (x,y,z) внутри сущности: по ним ищется ближайший
+//   mob.f|Название|смещение|тип            поля сущности (ник, HP ...)
+//   block.chain|ГЛОБАЛ,смещ1,...          цепочка к структуре с данными последнего сломанного блока
+//   block.f|Название|смещение|тип          поля этой структуры
+// тип: float, int, byte, bool, hex, str (std::string / C-строка, автоопределение)
+static Str trimS(Str t);
+struct WField { Str label; uintptr_t off; Str type; };
+struct WCfg { Str pchain, mlist, bchain; uintptr_t mpos = 0; bool hasMpos = false; std::vector<WField> pf, mf, bf; };
+static Str worldFile() { return dataDir() + "/mgg_world.txt"; }
+static const char *kWorldHelp =
+    "# MGG World: настройки для Mob и Block (и необязательно Player)\n"
+    "# Цепочка: ГЛОБАЛ,смещ1,смещ2 — первое число: смещение глобальной переменной от базы libminecraftpe.so,\n"
+    "# дальше на каждом шаге читается указатель и прибавляется смещение. Всё в hex.\n"
+    "# player.chain|1A2B3C,10\n"
+    "# player.f|Прыжок|2C0|byte\n"
+    "# mob.list|1A2B3C,40        (вектор указателей на сущности: begin, затем end)\n"
+    "# mob.pos|A0                (три float x,y,z внутри сущности)\n"
+    "# mob.f|Ник|1D0|str\n"
+    "# mob.f|HP|2B4|float\n"
+    "# block.chain|1A2B3C,8\n"
+    "# block.f|X|0|int\n"
+    "# block.f|Y|4|int\n"
+    "# block.f|Z|8|int\n"
+    "# типы: float, int, byte, bool, hex, str\n";
+
+static WCfg worldLoad() {
+    WCfg c; Str txt;
+    if (!readFile(worldFile(), txt)) { FILE *f = fopen(worldFile().c_str(), "w"); if (f) { fputs(kWorldHelp, f); fclose(f); } return c; }
+    size_t i = 0;
+    while (i <= txt.size()) {
+        size_t e = txt.find('\n', i); if (e == Str::npos) e = txt.size();
+        Str ln = trimS(txt.substr(i, e - i)); i = e + 1;
+        if (ln.empty() || ln[0] == '#') continue;
+        std::vector<Str> p; size_t j = 0;
+        while (j <= ln.size()) { size_t k = ln.find('|', j); if (k == Str::npos) k = ln.size(); p.push_back(trimS(ln.substr(j, k - j))); j = k + 1; }
+        if (p.size() < 2) continue;
+        const Str &k = p[0];
+        auto fld = [&](std::vector<WField> &v) { if (p.size() >= 4) v.push_back({p[1], (uintptr_t)strtoull(p[2].c_str(), nullptr, 16), p[3]}); };
+        if (k == "player.chain") c.pchain = p[1];
+        else if (k == "mob.list") c.mlist = p[1];
+        else if (k == "block.chain") c.bchain = p[1];
+        else if (k == "mob.pos") { c.mpos = (uintptr_t)strtoull(p[1].c_str(), nullptr, 16); c.hasMpos = true; }
+        else if (k == "player.f") fld(c.pf);
+        else if (k == "mob.f") fld(c.mf);
+        else if (k == "block.f") fld(c.bf);
+    }
+    return c;
+}
+
+static bool wChain(const Img &im, const Str &spec, uintptr_t &out) {
+    std::vector<uintptr_t> t; size_t i = 0;
+    while (i <= spec.size()) {
+        size_t j = spec.find(',', i); if (j == Str::npos) j = spec.size();
+        Str tk = trimS(spec.substr(i, j - i)); if (!tk.empty()) t.push_back((uintptr_t)strtoull(tk.c_str(), nullptr, 16));
+        i = j + 1;
+    }
+    if (t.empty()) return false;
+    uintptr_t a = im.base + t[0];
+    for (size_t k = 1; k < t.size(); k++) {
+        uintptr_t p = 0;
+        if (!guarded(&p, (const void *)a, sizeof p) || p < 0x10000) return false;
+        a = p + t[k];
+    }
+    out = a; return true;
+}
+
+static bool wPrintable(const char *s, size_t n) { if (!n) return false; for (size_t i = 0; i < n; i++) { unsigned char c = (unsigned char)s[i]; if (c < 32 || c == 127) return false; } return true; }
+static Str wStr(uintptr_t a, bool &ok) {
+    const size_t PS = sizeof(void *);
+    uint8_t h[32]; char tmp[96]; ok = true;
+    if (!guarded(h, (const void *)a, 3 * PS)) { ok = false; return "—"; }
+    if ((h[0] & 1) == 0) {                                        // libc++ короткая строка: длина в первом байте, текст со второго
+        size_t n = h[0] >> 1;
+        if (n > 0 && n <= 3 * PS - 2 && wPrintable((const char *)h + 1, n)) return Str((const char *)h + 1, n);
+    } else {                                                      // libc++ длинная: cap, size, data
+        size_t n = 0; uintptr_t p = 0; memcpy(&n, h + PS, PS); memcpy(&p, h + 2 * PS, PS);
+        if (n > 0 && n < sizeof tmp && p > 0x10000 && guarded(tmp, (const void *)p, n) && wPrintable(tmp, n)) return Str(tmp, n);
+    }
+    uintptr_t p = 0; memcpy(&p, h, PS);                           // запасные варианты: указатель на C-строку / текст прямо по адресу
+    if (p > 0x10000 && guarded(tmp, (const void *)p, 64)) { size_t n = strnlen(tmp, 64); if (n < 64 && wPrintable(tmp, n)) return Str(tmp, n); }
+    size_t n = strnlen((const char *)h, 3 * PS); if (n < 3 * PS && wPrintable((const char *)h, n)) return Str((const char *)h, n);
+    ok = false; return "—";
+}
+static Str wRead(uintptr_t a, const Str &ty, bool &ok) {
+    char b[48]; ok = true;
+    if (ty == "str") return wStr(a, ok);
+    unsigned long long v = memVal(a, ty == "byte" || ty == "bool" ? 1 : 4, ok);
+    if (!ok) return "—";
+    if (ty == "float") { uint32_t u = (uint32_t)v; float f; memcpy(&f, &u, 4); if (!(f == f) || f > 1e9f || f < -1e9f) { ok = false; return "—"; } snprintf(b, sizeof b, "%.2f", f); return b; }
+    if (ty == "int") { snprintf(b, sizeof b, "%d", (int)(uint32_t)v); return b; }
+    if (ty == "byte") { snprintf(b, sizeof b, "%u", (unsigned)v); return b; }
+    if (ty == "bool") return v ? "да" : "нет";
+    snprintf(b, sizeof b, "0x%llX", v); return b;
+}
+static Str wRow(const Str &key, const Str &label, const Str &val, int st) { return key + "\t" + label + "\t" + val + "\t" + std::to_string(st) + "\n"; }
+
+static Str wFields(uintptr_t base, const std::vector<WField> &fs) {
+    Str o;
+    for (const WField &f : fs) { bool ok; Str v = wRead(base + f.off, f.type, ok); o += wRow("-", f.label, v, ok ? 1 : 0); }
+    return o;
+}
+
+static bool wPlayerPos(const Img &im, float p[3]) {
+    std::lock_guard<std::mutex> lk(g_cm);
+    CsSlot *s = csSlot("p_pos"); uintptr_t a = 0;
+    if (!s || csState(*s, im, a) != 1) return false;
+    return guarded(p, (const void *)a, 12);
+}
+
+static double g_wpx = 0, g_wpy = 0, g_wpz = 0; static long long g_wpt = 0; static bool g_wph = false;
+
+static Str worldPlayer() {
+    Img im;
+    if (!loadImg(im, MGG_TARGET_LIB)) return Str("#\t") + MGG_TARGET_LIB + " не найдена в процессе игры\n";
+    struct R { const char *key, *label; int n; };
+    static const R rs[] = {{"p_hp", "Здоровье", 1}, {"p_armor", "Броня", 1}, {"p_food", "Голод", 1}, {"p_pos", "Позиция X / Y / Z", 3}, {"p_rot", "Поворот", 2}};
+    Str rows, staleKey; int bound = 0, live = 0, stale = 0; bool posOk = false; float pos[3] = {0, 0, 0};
+    {
+        std::lock_guard<std::mutex> lk(g_cm);
+        for (const R &r : rs) {
+            CsSlot *s = csSlot(r.key); uintptr_t a = 0; int st = csState(*s, im, a);
+            Str val = "—";
+            if (st) bound++;
+            if (st == 2) { stale++; if (staleKey.empty()) staleKey = r.key; }
+            if (st == 1) {
+                float v[3] = {0, 0, 0};
+                if (guarded(v, (const void *)a, r.n * 4)) {
+                    live++; char b[96];
+                    if (r.n == 1) snprintf(b, sizeof b, "%.2f", v[0]); else if (r.n == 2) snprintf(b, sizeof b, "%.2f / %.2f", v[0], v[1]); else snprintf(b, sizeof b, "%.2f / %.2f / %.2f", v[0], v[1], v[2]);
+                    val = b;
+                    if (r.n == 3) { posOk = true; memcpy(pos, v, 12); }
+                } else st = 2;
+            }
+            rows += wRow(r.key, r.label, val, st);
+        }
+    }
+    if (posOk) {                                                  // движение: скорость по смещению позиции
+        long long t = nowMs();
+        if (g_wph && t - g_wpt >= 50 && t - g_wpt <= 3000) {
+            double dt = (t - g_wpt) / 1000.0, dx = pos[0] - g_wpx, dy = pos[1] - g_wpy, dz = pos[2] - g_wpz; char b[48];
+            snprintf(b, sizeof b, "%.2f", __builtin_sqrt(dx * dx + dz * dz) / dt); rows += wRow("-", "Скорость (блок/с)", b, 1);
+            snprintf(b, sizeof b, "%.2f", dy / dt); rows += wRow("-", "Верт. скорость (блок/с)", b, 1);
+        }
+        g_wpx = pos[0]; g_wpy = pos[1]; g_wpz = pos[2]; g_wpt = t; g_wph = true;
+    } else g_wph = false;
+    WCfg c = worldLoad(); uintptr_t pa = 0;
+    if (!c.pchain.empty() && wChain(im, c.pchain, pa)) rows += wFields(pa, c.pf);
+    Str h = live ? "в мире · данные идут" : stale ? "адреса устарели (вышел из мира?) · ищу заново" : bound ? "ждём мир" : "ничего не привязано: нажми значок-ссылку у строки";
+    return "#\t" + h + "\n" + (staleKey.empty() ? Str() : "#stale\t" + staleKey + "\n") + rows;
+}
+
+static Str worldMob() {
+    Img im;
+    if (!loadImg(im, MGG_TARGET_LIB)) return Str("#\t") + MGG_TARGET_LIB + " не найдена в процессе игры\n";
+    WCfg c = worldLoad();
+    if (c.mlist.empty() || !c.hasMpos) return "#\tне настроено: нужны mob.list и mob.pos в mgg_world.txt (кнопка «Конфиг»)\n";
+    const size_t PS = sizeof(void *);
+    uintptr_t la = 0, be[2] = {0, 0};
+    if (!wChain(im, c.mlist, la) || !guarded(be, (const void *)la, 2 * PS)) return "#\tсписок сущностей не читается (ты не в мире или неверная цепочка)\n";
+    if (be[0] < 0x10000 || be[1] < be[0]) return "#\tсписок сущностей пуст\n";
+    size_t n = (be[1] - be[0]) / PS;
+    if (n == 0 || n > 5000) return "#\tсписок сущностей выглядит неверно (" + std::to_string(n) + " шт.): проверь mob.list\n";
+    std::vector<uintptr_t> ents(n);
+    if (!guarded(ents.data(), (const void *)be[0], n * PS)) return "#\tсписок сущностей не читается\n";
+    float me[3] = {0, 0, 0}; bool hasMe = wPlayerPos(im, me);
+    uintptr_t best = 0; double bd = 1e18; size_t good = 0;
+    for (uintptr_t e : ents) {
+        if (e < 0x10000) continue;
+        float p[3]; if (!guarded(p, (const void *)(e + c.mpos), 12)) continue;
+        bool fin = true; for (int k = 0; k < 3; k++) if (!(p[k] == p[k]) || p[k] > 3e7f || p[k] < -3e7f) fin = false;
+        if (!fin) continue;
+        good++;
+        double d = 0;
+        if (hasMe) { double dx = p[0] - me[0], dy = p[1] - me[1], dz = p[2] - me[2]; d = dx * dx + dy * dy + dz * dz; if (d < 0.0025) continue; }   // сам игрок
+        if (!best || d < bd) { best = e; bd = d; }
+    }
+    if (!best) return "#\tсущностей в списке: " + std::to_string(n) + ", подходящих нет\n";
+    char b[48]; Str rows;
+    if (hasMe) { snprintf(b, sizeof b, "%.1f", __builtin_sqrt(bd)); rows += wRow("-", "Расстояние (блоков)", b, 1); }
+    rows += wFields(best, c.mf);
+    return "#\tсущностей: " + std::to_string(good) + (hasMe ? " · показан ближайший" : " · позиция игрока не привязана (Player → Позиция), показан первый") + "\n" + rows;
+}
+
+static Str worldBlock() {
+    Img im;
+    if (!loadImg(im, MGG_TARGET_LIB)) return Str("#\t") + MGG_TARGET_LIB + " не найдена в процессе игры\n";
+    WCfg c = worldLoad(); uintptr_t a = 0;
+    if (c.bchain.empty() || c.bf.empty()) return "#\tне настроено: нужны block.chain и block.f в mgg_world.txt (кнопка «Конфиг»)\n";
+    if (!wChain(im, c.bchain, a)) return "#\tданные блока не читаются (ты не в мире или неверная цепочка)\n";
+    return "#\tпоследний сломанный блок\n" + wFields(a, c.bf);
+}
+
+static Str worldCfg() {
+    WCfg c = worldLoad(); Str t; readFile(worldFile(), t);
+    return "файл: " + worldFile() + "\n(правится во вкладке File)\n\n" + t;
 }
 
 // ---------------------------------------------------------------- функции (готовые наборы патчей из файла mgg_functions.txt)
@@ -1667,6 +1940,13 @@ static int elfBits(const Str &path) {            // 32 / 64 / 0 (не прочи
     return h[4] == 2 ? 64 : h[4] == 1 ? 32 : 0;
 }
 
+static bool isMcLib(const Str &n, const Str &path) {
+    if (n == MGG_TARGET_LIB) return true;
+    if (n == "libmggpanel.so") return false;
+    if (n.find("minecraft") != Str::npos) return true;
+    return path.compare(0, 10, "/data/app/") == 0 || path.compare(0, 11, "/data/data/") == 0 || path.compare(0, 11, "/data/user/") == 0 || path.compare(0, 12, "/mnt/expand/") == 0;
+}
+
 struct LibEnt { Str name, path; unsigned long lo, hi; int bits; };
 
 static std::vector<LibEnt> listLibs() {
@@ -1719,7 +1999,7 @@ static Str libRoute(const Str &path, const Params &q) {
     for (const LibEnt &c : v) if (c.name == g_lib) sb = c.bits;
     o += std::to_string(sb) + "\n";
     for (const LibEnt &c : v)
-        o += c.name + "\t" + std::to_string(c.bits) + "\t" + hx(c.hi - c.lo) + "\t" + libInfo(c.name, c.path) + "\t" + (c.name == g_lib ? "1" : "0") + "\n";
+        o += c.name + "\t" + std::to_string(c.bits) + "\t" + hx(c.hi - c.lo) + "\t" + libInfo(c.name, c.path) + "\t" + (c.name == g_lib ? "1" : "0") + "\t" + (isMcLib(c.name, c.path) ? "1" : "0") + "\n";
     return o;
 }
 
@@ -1778,6 +2058,19 @@ small{color:var(--dim);display:block;margin-top:4px}
 .pre.sm button{flex:1 1 20%;padding:6px 3px;font-size:11px;margin:0}
 .lb{font-weight:600;font-size:10px;color:var(--dim);margin:7px 0 3px;display:block}
 #ll .fn{cursor:pointer}
+.seg{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:3px;margin:7px 0}
+.seg button{margin:0;flex:1;background:none;color:var(--dim);padding:7px 4px;font-weight:600}
+.seg button.on{background:var(--ac);color:var(--acTx)}
+.qv{background:var(--card2);border:1px solid var(--line);border-radius:var(--r);padding:6px;margin:4px 0 6px}
+.qv .seg{margin:0 0 6px;padding:2px}.qv .seg button{padding:5px 2px;font-size:11px}
+.chips{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.chips button{width:auto;flex:none;margin:0;padding:5px 9px;font-size:11px}
+.chips b{font-size:10px;color:var(--dim);margin:0 1px 0 5px;font-weight:600}
+.rg{display:flex;align-items:center;gap:8px}.rg b{min-width:34px;text-align:right}
+.kv{display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid var(--line)}
+.kv:last-child{border-bottom:0}.kv span{color:var(--dim);flex:1}.kv b{font:600 13px ui-monospace,monospace;text-align:right;word-break:break-all}
+.kv b.no{color:var(--dim);font-weight:400}
+.kv button{width:28px;height:28px;padding:0;margin:0;flex:none;border-radius:8px}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
 <symbol id="i-bolt" viewBox="0 0 24 24"><path class="fi" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
@@ -1809,6 +2102,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
 <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 3v18M5 4h11l-2 4 2 4H5"/></symbol>
 <symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 5v2M12 17v2M5 12H3M21 12h-2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx="12" cy="12" r="4"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></symbol>
 <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></symbol>
 </defs></svg>
 <div id=top><pre id=out>MGG готов. Открой вкладку «Функции».</pre>
@@ -1818,12 +2112,23 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Готовые функции</h3><div id=fl>…</div>
 <select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
 <button class=s onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg>Обновить список</button></div>
+<div id=sl></div>
 <details class=card><summary><svg class=ic><use href="#i-plus"/></svg>Создать функцию из патчей сессии<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=fnn placeholder="название (например Disable render limit)">
 <button onclick="call('fnsave',{n:v('fnn')}).then(fnl)"><svg class=ic><use href="#i-save"/></svg>Сохранить патчи сессии</button>
 <input id=fpn placeholder="профиль: название"><input id=fpl placeholder="функции через запятую">
 <button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)"><svg class=ic><use href="#i-flag"/></svg>Создать профиль (набор функций)</button>
 <small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
+</div>
+
+<div class=pg id=pw style="display:none">
+<div class=seg><button id=wsp class=on onclick="wsub('p')">Player</button><button id=wsm onclick="wsub('m')">Mob</button><button id=wsb onclick="wsub('b')">Block</button></div>
+<div class=card id=wp><h3><svg class=ic><use href="#i-eye"/></svg>Игрок</h3><small id=wtp>…</small><div id=wlp></div>
+<small>Привязка: вкладка Mem → найди значение (HP — float 20) → сузь поиск → нажми значок-ссылку у строки (адрес берётся из поля Mem или единственный найденный). Позиция: привяжи X, Y и Z идут следом. После перезапуска адреса находятся сами.</small></div>
+<div class=card id=wm style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Ближайший моб</h3><small id=wtm>…</small><div id=wlm></div>
+<button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
+<div class=card id=wb style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Последний блок</h3><small id=wtb>…</small><div id=wlb></div>
+<button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
 </div>
 
 <div class=pg id=pm style="display:none">
@@ -1837,13 +2142,11 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button class=s style="margin-top:6px" onclick="call('mlist',{n:60})"><svg class=ic><use href="#i-list"/></svg>Список найденных</button></div>
 <div class=card><h3><svg class=ic><use href="#i-snow"/></svg>Запись и заморозка</h3>
 <input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
-<span class=lb>Заготовки значений</span>
-<select id=mpm><option value=0>по нажатию: только вставить в поле</option><option value=w>по нажатию: сразу записать</option><option value=f>по нажатию: сразу заморозить</option></select>
-<div class="pre sm"><button class=s onclick="pv('0','4','OFF')">OFF 0</button><button class=s onclick="pv('1','4','ON')">ON 1</button><button class=s onclick="pv('-1','4','-1')">-1</button><button class=s onclick="pv('100','4','100')">100</button><button class=s onclick="pv('999','4','999')">999</button><button class=s onclick="pv('9999','4','9999')">9999</button><button class=s onclick="pv('2147483647','4','МАКС')">МАКС</button></div>
-<span class=lb>float</span>
-<div class="pre sm"><button class=s onclick="pv('0','f','0.0')">0.0</button><button class=s onclick="pv('0.5','f','0.5')">0.5</button><button class=s onclick="pv('1','f','1.0')">1.0</button><button class=s onclick="pv('2','f','2.0')">2.0</button><button class=s onclick="pv('10','f','10.0')">10.0</button><button class=s onclick="pv('100','f','100.0')">100.0</button></div>
-<span class=lb>1 байт (флаги, вкл/выкл)</span>
-<div class="pre sm"><button class=s onclick="pv('0','1','byte OFF 0')">OFF 0</button><button class=s onclick="pv('1','1','byte ON 1')">ON 1</button><button class=s onclick="pv('255','1','byte 255')">255</button></div>
+<button class=s onclick="qvT()"><svg class=ic><use href="#i-bolt"/></svg>Быстрые значения<svg class=ic><use href="#i-plus"/></svg></button>
+<div id=qvp class=qv style="display:none"><div class=seg id=qvm><button class=on onclick="qvM('0',this)">вставить</button><button onclick="qvM('w',this)">записать</button><button onclick="qvM('f',this)">заморозить</button></div>
+<div class=chips><b>int</b><button class=s onclick="pv('0','4','0')">0</button><button class=s onclick="pv('1','4','1')">1</button><button class=s onclick="pv('-1','4','-1')">-1</button><button class=s onclick="pv('100','4','100')">100</button><button class=s onclick="pv('999','4','999')">999</button><button class=s onclick="pv('9999','4','9999')">9999</button><button class=s onclick="pv('2147483647','4','МАКС')">МАКС</button>
+<b>float</b><button class=s onclick="pv('0','f','0.0')">0</button><button class=s onclick="pv('0.5','f','0.5')">.5</button><button class=s onclick="pv('1','f','1.0')">1</button><button class=s onclick="pv('2','f','2.0')">2</button><button class=s onclick="pv('10','f','10.0')">10</button><button class=s onclick="pv('100','f','100.0')">100</button>
+<b>byte</b><button class=s onclick="pv('0','1','byte 0')">0</button><button class=s onclick="pv('1','1','byte 1')">1</button><button class=s onclick="pv('255','1','byte 255')">255</button></div></div>
 <div class=grid2><button onclick="call('mset',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-save"/></svg>Записать</button><button onclick="call('mset',{all:1,v:v('mw')})"><svg class=ic><use href="#i-save"/></svg>Во все найденные</button>
 <button class=g onclick="call('mfreeze',{a:v('ma'),v:v('mw'),...ty()})"><svg class=ic><use href="#i-snow"/></svg>Заморозить</button><button class=g onclick="call('mfreeze',{all:1,v:v('mw')})"><svg class=ic><use href="#i-snow"/></svg>Все найденные</button>
 <button class=s onclick="call('mfrlist',{})"><svg class=ic><use href="#i-list"/></svg>Список заморозок</button><button class=d onclick="call('munfreeze',{all:1})"><svg class=ic><use href="#i-sun"/></svg>Разморозить всё</button></div></div>
@@ -1857,9 +2160,9 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=card><h3><svg class=ic><use href="#i-lib"/></svg>Библиотека для патчинга</h3>
 <div class=fn onclick="libOpen()"><div class=nm><span id=lnm>…</span><div class=sub id=lsub></div></div><svg class=ic><use href="#i-list"/></svg></div>
 <div id=lpick style="display:none">
-<div class=grid2><button id=lb32 class=s onclick="libBits(32)">32 bit</button><button id=lb64 class=s onclick="libBits(64)">64 bit</button></div>
+<div class=seg style="margin:5px 0"><button id=lgm class=on onclick="libGrp('mc')">Minecraft</button><button id=lgo onclick="libGrp('ot')">Другое</button></div>
 <small id=lnote></small><div id=ll></div></div>
-<small>По умолчанию libminecraftpe.so, разрядность берётся из игры. Все вкладки Lib (хекс, патчи, сигнатуры, строки) работают с выбранной библиотекой.</small></div>
+<small>«Minecraft» — игра и её библиотеки, «Другое» — система, графика, звук. Все вкладки Lib (хекс, патчи, сигнатуры, строки) работают с выбранной библиотекой.</small></div>
 <details class=card open><summary><svg class=ic><use href="#i-hex"/></svg>Константы в коде<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=cv placeholder="число (например 13 или 0xD)"><input id=cv2 placeholder="второе число рядом (необязательно)">
 <input id=cw placeholder="окно, байт (по умолч. 768)">
@@ -1936,6 +2239,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 </div>
 <aside><div class=lg>MGG<span>panel</span></div>
 <button id=bn class="nav on" onclick="tab('n')"><span class=bx><svg class=ic><use href="#i-bolt"/></svg></span>Функции</button>
+<button id=bw class=nav onclick="tab('w')"><span class=bx><svg class=ic><use href="#i-globe"/></svg></span>World</button>
 <button id=bm class=nav onclick="tab('m')"><span class=bx><svg class=ic><use href="#i-mem"/></svg></span>Mem</button>
 <button id=bl class=nav onclick="tab('l')"><span class=bx><svg class=ic><use href="#i-lib"/></svg></span>Lib</button>
 <button id=bf class=nav onclick="tab('f')"><span class=bx><svg class=ic><use href="#i-file"/></svg></span>File</button>
@@ -1943,10 +2247,11 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button></aside>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){for(const k of ['n','m','l','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
-if(x=='n')fnl();if(x=='l')libLoad();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
+function tab(x){for(const k of ['n','w','m','l','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
+clearInterval(W.t);W.t=null;if(x=='w'){wsub(W.sub);W.t=setInterval(wTick,800)}if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
 function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
+async function api(p,o){const q=new URLSearchParams(o||{});q.set('t',T);try{return await(await fetch('/api/'+p+'?'+q)).text()}catch(e){return ''}}
 async function call(p,o){const q=new URLSearchParams(o);q.set('t',T);out.textContent='…';
 try{const r=await fetch('/api/'+p+'?'+q);const t=await r.text();out.textContent=t;return t}catch(e){out.textContent='ошибка: '+e;return ''}}
 function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navigator.clipboard){navigator.clipboard.writeText(t)}}
@@ -1961,25 +2266,28 @@ const sw=document.createElement('div');sw.className='sw '+(on?'on':s=='3'?'bad':
 row.onclick=async()=>{if(s=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
 await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}}
 async function findopt(){const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m)document.getElementById('op').value=m.trim()}
-const LB={proc:32,sel:'',selBits:32,pick:0,list:[]};
+const LB={proc:32,sel:'',selBits:32,grp:'',list:[]};
 async function libLoad(){let r='';try{r=await(await fetch('/api/libs?'+new URLSearchParams({t:T}))).text()}catch(e){document.getElementById('lnm').textContent='ошибка';return}
 const ls=r.trim().split('\n');const h=ls.shift().split('\t');if(h[0]!='#'){document.getElementById('lnm').textContent=r;return}
-LB.proc=+h[1];LB.sel=h[2];LB.selBits=+h[3];if(!LB.pick)LB.pick=LB.proc;
-LB.list=ls.map(l=>{const a=l.split('\t');return{n:a[0],b:+a[1],sz:a[2],d:a[3],on:a[4]=='1'}});libRender()}
+LB.proc=+h[1];LB.sel=h[2];LB.selBits=+h[3];
+LB.list=ls.map(l=>{const a=l.split('\t');return{n:a[0],b:+a[1],sz:a[2],d:a[3],on:a[4]=='1',g:a[5]=='1'}});
+if(!LB.grp){const c=LB.list.find(x=>x.on);LB.grp=c&&!c.g?'ot':'mc'}libRender()}
 function libRender(){const cur=LB.list.find(x=>x.on);document.getElementById('lnm').textContent=LB.sel||'не найдена';
 document.getElementById('lsub').textContent=cur?(cur.b+' bit · '+cur.d):'нет в процессе игры';
-document.getElementById('lb32').className=LB.pick==32?'':'s';document.getElementById('lb64').className=LB.pick==64?'':'s';
-const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.b==LB.pick);
-document.getElementById('lnote').textContent=L.length?('Библиотек '+LB.pick+' bit: '+L.length+' (игра запущена в '+LB.proc+' bit)'):('Игра запущена в '+LB.proc+' bit: библиотек '+LB.pick+' bit в процессе нет');
+const mc=LB.grp=='mc';document.getElementById('lgm').className=mc?'on':'';document.getElementById('lgo').className=mc?'':'on';
+const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.g==mc);
+document.getElementById('lnote').textContent=(mc?'Minecraft: ':'Другое: ')+L.length+(mc?' (игра и её библиотеки)':' (система, графика, звук, панель)');
 for(const x of L){const row=document.createElement('div');row.className='fn';const nm=document.createElement('div');nm.className='nm';nm.textContent=x.n;
-const sub=document.createElement('div');sub.className='sub';sub.textContent=x.d+' · '+x.sz;nm.appendChild(sub);
+const sub=document.createElement('div');sub.className='sub';sub.textContent=x.b+' bit · '+x.d+' · '+x.sz;nm.appendChild(sub);
 const sw=document.createElement('div');sw.className='sw'+(x.on?' on':'');row.onclick=()=>libSel(x.n);row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}
 document.getElementById('pbs32').style.display=LB.selBits==64?'none':'';document.getElementById('pbs64').style.display=LB.selBits==64?'':'none'}
+function libGrp(g){LB.grp=g;libRender()}
 function libOpen(){const p=document.getElementById('lpick');p.style.display=p.style.display=='none'?'':'none';if(p.style.display=='')libLoad()}
-function libBits(b){LB.pick=b;libRender()}
 async function libSel(n){await call('libsel',{n:n});await libLoad();document.getElementById('lpick').style.display='none'}
 function pbv(b,t){document.getElementById('pb').value=b;out.textContent=t+'\nбайты вставлены. Впиши смещение функции и нажми «Записать».'}
-async function pv(val,t,name){document.getElementById('mw').value=val;document.getElementById('mt').value=t;const m=v('mpm');
+let QM='0';function qvT(){const p=document.getElementById('qvp');p.style.display=p.style.display=='none'?'':'none'}
+function qvM(m,b){QM=m;for(const x of document.querySelectorAll('#qvm button'))x.className=x==b?'on':''}
+async function pv(val,t,name){document.getElementById('mw').value=val;document.getElementById('mt').value=t;const m=QM;document.getElementById('qvp').style.display='none';
 if(m=='0'){out.textContent='значение '+name+' ('+val+') вставлено в поле'+(t=='f'?' · тип float':t=='1'?' · тип 1 байт':'')+'\nнажми «Записать» или «Заморозить»';return}
 if(!v('ma')){out.textContent='сначала впиши адрес';return}
 call(m=='w'?'mset':'mfreeze',{a:v('ma'),v:val,...ty()})}
@@ -1994,7 +2302,30 @@ if(save)try{localStorage.setItem('mggTheme',JSON.stringify([ac,bg,cd,hl,r]))}cat
 function preset(ac,bg,cd,hl){document.getElementById('c_ac').value=ac;document.getElementById('c_bg').value=bg;document.getElementById('c_card').value=cd;document.getElementById('c_hl').value=hl;applyTheme()}
 (function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme'))}catch(e){}t=t||['#85775a','#12141c','#1a1d29','#f0b429',10];
 document.getElementById('c_ac').value=t[0];document.getElementById('c_bg').value=t[1];document.getElementById('c_card').value=t[2];document.getElementById('c_hl').value=t[3];document.getElementById('c_r').value=t[4];applyTheme(false)})();
-fnl();libLoad();
+const SL=[{s:'chunk',t:'Дальность прорисовки (чанки)',min:2,max:96,def:24,opt:'gfx_viewdistance',h:'Mem: найди текущую дальность (int), смени её в настройках игры, сузь поиск до одного адреса → «Привязать».'},
+{s:'fov',t:'FOV (угол обзора)',min:30,max:150,def:70,opt:'gfx_field_of_view',h:'Mem: найди текущий FOV как float (например 70), смени в настройках, сузь → «Привязать».'}];
+function slotInit(){const d=document.getElementById('sl');d.textContent='';for(const x of SL){const c=document.createElement('div');c.className='card';
+c.innerHTML=`<h3><svg class=ic><use href="#i-eye"/></svg>${x.t}</h3><div class=rg><input type=range id=r_${x.s} min=${x.min} max=${x.max} value=${x.def} oninput="document.getElementById('rv_${x.s}').textContent=this.value"><b id=rv_${x.s}>${x.def}</b></div>
+<div class=grid3><button onclick="slA('${x.s}')">Применить</button><button class=s onclick="slS('${x.s}')">Снять</button><button class=s onclick="slO('${x.s}')">options.txt</button></div>
+<div class=row><input id=ba_${x.s} placeholder="адрес (hex) или пусто"><button class=s onclick="slB('${x.s}')"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
+<small id=st_${x.s}>…</small><small>${x.h}</small>`;d.appendChild(c)}slRefresh()}
+async function slRefresh(){for(const x of SL){const e=document.getElementById('st_'+x.s);if(e)e.textContent=(await api('csst',{s:x.s})).trim()}}
+async function slA(s){await call('csapply',{s:s,v:v('r_'+s)});slRefresh()}
+async function slS(s){await call('csstop',{s:s});slRefresh()}
+async function slB(s){await call('csbind',{s:s,a:v('ba_'+s)||v('ma')});slRefresh()}
+async function optPath(){let p=v('op');if(p)return p;const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m){document.getElementById('op').value=m.trim();return m.trim()}return''}
+async function slO(s){const x=SL.find(y=>y.s==s);const p=await optPath();if(!p)return;call('setkey',{p:p,k:x.opt,v:v('r_'+s)})}
+const W={sub:'p',t:null,busy:0,lf:0};
+function wsub(x){W.sub=x;for(const k of ['p','m','b']){document.getElementById('w'+k).style.display=k==x?'':'none';document.getElementById('ws'+k).className=k==x?'on':''}wTick()}
+async function wTick(){if(W.busy)return;W.busy=1;try{wRender(W.sub,await api({p:'wplayer',m:'wmob',b:'wblock'}[W.sub]))}finally{W.busy=0}}
+function wRender(k,t){let h='',stale='';const rows=[];for(const l of t.split('\n')){if(!l)continue;if(l[0]=='#'){const a=l.split('\t');if(a[0]=='#stale')stale=a[1];else h=a[1]||'';continue}rows.push(l.split('\t'))}
+document.getElementById('wt'+k).textContent=h;const d=document.getElementById('wl'+k);d.textContent='';
+for(const [key,lab,val,st] of rows){const r=document.createElement('div');r.className='kv';const a=document.createElement('span');a.textContent=lab;const b=document.createElement('b');
+b.textContent=st=='1'?val:(st=='2'?'устарел':'—');if(st!='1')b.className='no';r.appendChild(a);r.appendChild(b);
+if(k=='p'&&key.startsWith('p_')){const bt=document.createElement('button');bt.className='s';bt.title='Привязать';bt.innerHTML='<svg class=ic><use href="#i-link"/></svg>';bt.onclick=()=>call('csbind',{s:key,a:v('ma')}).then(wTick);r.appendChild(bt)}
+d.appendChild(r)}
+if(k=='p'&&stale&&Date.now()-W.lf>8000){W.lf=Date.now();api('csfind',{s:stale})}}
+fnl();libLoad();slotInit();
 </script></body></html>)MGG";
 
 
@@ -2004,6 +2335,11 @@ static Str route(const Str &path, const Params &q) {
     if (path == "mscan" || path == "mnext" || path == "mlist" || path == "mreset" || path == "mset" || path == "mdump" || path == "mfreeze" || path == "mfrlist" || path == "munfreeze" || path == "mwatch" || path == "mwlog" || path == "mwstop") return memRoute(path, q);
     if (path == "findopt" || path == "status" || path == "unlock" || path == "reenable" || path == "rollall") return miscRoute(path, q);
     if (path == "libs" || path == "libsel") return libRoute(path, q);
+    if (path.compare(0, 2, "cs") == 0) return csRoute(path, q);
+    if (path == "wplayer") return worldPlayer();
+    if (path == "wmob") return worldMob();
+    if (path == "wblock") return worldBlock();
+    if (path == "wcfg") return worldCfg();
     Img im;
     if (!loadImg(im)) return "библиотека " + g_lib + " не найдена в /proc/self/maps (выбери другую во вкладке Lib)\n";
     uintptr_t a = 0;
