@@ -1218,6 +1218,168 @@ static Str memRoute(const Str &path, const Params &q) {
     return "неизвестный маршрут\n";
 }
 
+// ---------------------------------------------------------------- Chunk limit disabler: ползунок дальности прорисовки
+// Значение лежит в куче, и адрес меняется при каждом запуске игры. Поэтому при «Привязать» запоминаем окружение адреса
+// (по 16 слов вокруг): слово-указатель в libminecraftpe.so хранится как смещение от базы (стабильно), указатель в любую другую
+// память игнорируется (нестабилен), остальное хранится как есть. При «Применить» окружение ищется в куче заново.
+// Пока значение заморожено, поток каждые 60 мс перепроверяет окружение: если оно изменилось (вышел из мира, память освобождена),
+// заморозка снимается и ничего не пишется в чужую память.
+struct CsWord { uint8_t k; uint32_t v; };                 // k: 0 пропуск, 1 точное значение, 2 указатель в lib (v = смещение от базы)
+struct CsSig { std::vector<CsWord> w; int tgt = 0; };
+static const int CS_BEFORE = 16, CS_AFTER = 16;
+static CsSig g_cs; static uintptr_t g_ca = 0, g_cbase = 0; static int g_cval = 0; static bool g_cfreeze = false, g_cth = false; static Str g_cmsg;
+static std::mutex g_cm;
+static Str csFile() { return dataDir() + "/mgg_chunk.txt"; }
+
+static std::vector<MapR> allMaps() {
+    std::vector<MapR> v; FILE *f = fopen("/proc/self/maps", "r"); if (!f) return v;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) { unsigned long s, e; if (sscanf(line, "%lx-%lx", &s, &e) == 2) v.push_back({(uintptr_t)s, (uintptr_t)e}); }
+    fclose(f); return v;
+}
+static bool csIsAnchor(const CsWord &c) { return c.k == 2 || (c.k == 1 && c.v >= 0x100); }
+
+static bool csBuild(const Img &im, uintptr_t a, CsSig &sg, Str &err) {
+    if (a & 3) { err = "адрес должен быть кратен 4"; return false; }
+    int n = CS_BEFORE + 1 + CS_AFTER; std::vector<uint32_t> raw(n);
+    if (!guarded(raw.data(), (const void *)(a - CS_BEFORE * 4), n * 4)) { err = "память вокруг адреса не читается"; return false; }
+    std::vector<MapR> mr = allMaps();
+    sg.w.assign(n, CsWord{0, 0}); sg.tgt = CS_BEFORE; int anch = 0;
+    for (int i = 0; i < n; i++) {
+        if (i == CS_BEFORE) continue;
+        uint32_t w = raw[i]; bool inlib = false;
+        for (const Seg &g : im.segs) if ((uintptr_t)w >= g.s && (uintptr_t)w < g.e) { inlib = true; break; }
+        if (inlib) { sg.w[i] = CsWord{2, (uint32_t)((uintptr_t)w - im.base)}; }
+        else {
+            bool ptr = false;
+            if (w >= 0x10000) for (const MapR &m : mr) if ((uintptr_t)w >= m.s && (uintptr_t)w < m.e) { ptr = true; break; }
+            if (!ptr) sg.w[i] = CsWord{1, w};
+        }
+        if (csIsAnchor(sg.w[i])) anch++;
+    }
+    if (anch < 3) { err = "вокруг адреса слишком мало уникальных данных, привязка ненадёжна"; return false; }
+    return true;
+}
+
+// доля совпавших слов: все слова и только «якорные»
+static bool csScore(const CsSig &sg, uintptr_t base, uintptr_t a, double &all, double &anc) {
+    int n = (int)sg.w.size(); if (!n) return false;
+    std::vector<uint32_t> raw(n);
+    if (!guarded(raw.data(), (const void *)(a - sg.tgt * 4), n * 4)) return false;
+    int t1 = 0, o1 = 0, t2 = 0, o2 = 0;
+    for (int i = 0; i < n; i++) {
+        const CsWord &c = sg.w[i]; if (!c.k) continue;
+        bool ok = c.k == 1 ? raw[i] == c.v : raw[i] == (uint32_t)(base + c.v);
+        t1++; if (ok) o1++;
+        if (csIsAnchor(c)) { t2++; if (ok) o2++; }
+    }
+    all = t1 ? (double)o1 / t1 : 0; anc = t2 ? (double)o2 / t2 : 0; return true;
+}
+static bool csOk(const CsSig &sg, uintptr_t base, uintptr_t a, double lo) {
+    double x, y; if (!csScore(sg, base, a, x, y)) return false;
+    bool ok; unsigned long long v = memVal(a, 4, ok);
+    return ok && x >= lo && y >= lo - 0.1 && v <= 4096;
+}
+
+// поиск окружения в куче: берём до 3 якорных слов, ищем каждое (шаг 4 байта), проверяем кандидатов
+static Str csFind(const CsSig &sg, uintptr_t base, uintptr_t &found) {
+    found = 0; int n = (int)sg.w.size(); std::vector<int> an;
+    for (int i = 0; i < n; i++) if (sg.w[i].k == 2) an.push_back(i);
+    for (int i = 0; i < n; i++) if (sg.w[i].k == 1 && sg.w[i].v >= 0x100) an.push_back(i);
+    if (an.empty()) return "в привязке нет якорных слов\n";
+    std::vector<MapR> regs = memMaps(false); std::vector<uint8_t> buf(1 << 20);
+    for (size_t ai = 0; ai < an.size() && ai < 3; ai++) {
+        int ix = an[ai]; uint32_t want = sg.w[ix].k == 2 ? (uint32_t)(base + sg.w[ix].v) : sg.w[ix].v;
+        std::vector<uintptr_t> hits; bool many = false;
+        for (const MapR &m : regs) {
+            for (uintptr_t a = m.s; a < m.e && !many;) {
+                size_t len = std::min<size_t>(buf.size(), m.e - a);
+                if (!guarded(buf.data(), (const void *)a, len)) { a += 4096; continue; }
+                for (size_t i = 0; i + 4 <= len; i += 4) { uint32_t x; memcpy(&x, buf.data() + i, 4); if (x == want) { hits.push_back(a + i); if (hits.size() > 100000) { many = true; break; } } }
+                a += len;
+            }
+            if (many) break;
+        }
+        if (many) continue;
+        double best = 0; uintptr_t bestA = 0; int ties = 0;
+        for (uintptr_t h : hits) {
+            uintptr_t t = h + (uintptr_t)(sg.tgt - ix) * 4; double x, y; if (!csScore(sg, base, t, x, y)) continue;
+            bool ok; unsigned long long v = memVal(t, 4, ok);
+            if (!ok || v > 4096 || x < 0.8 || y < 0.7) continue;
+            if (x > best + 1e-9) { best = x; bestA = t; ties = 1; } else if (x > best - 1e-9 && t != bestA) ties++;
+        }
+        if (bestA && ties == 1) { found = bestA; return ""; }
+        if (ties > 1) return "найдено несколько одинаково похожих мест (" + std::to_string(ties) + "), привяжи заново\n";
+    }
+    return "окружение не найдено в куче\n";
+}
+
+static bool csSave(const CsSig &sg) {
+    FILE *f = fopen(csFile().c_str(), "w"); if (!f) return false;
+    fprintf(f, "MGGCHUNK1 %d %d\n", sg.tgt, (int)sg.w.size());
+    for (const CsWord &c : sg.w) fprintf(f, "%d %X\n", (int)c.k, (unsigned)c.v);
+    fclose(f); return true;
+}
+static bool csLoad(CsSig &sg) {
+    FILE *f = fopen(csFile().c_str(), "r"); if (!f) return false;
+    int tgt = 0, n = 0; bool ok = fscanf(f, "MGGCHUNK1 %d %d", &tgt, &n) == 2 && n > 0 && n < 200 && tgt >= 0 && tgt < n;
+    CsSig s; s.tgt = tgt;
+    for (int i = 0; ok && i < n; i++) { int k = 0; unsigned v = 0; if (fscanf(f, "%d %x", &k, &v) != 2 || k < 0 || k > 2) ok = false; else s.w.push_back(CsWord{(uint8_t)k, (uint32_t)v}); }
+    fclose(f); if (ok) sg = s; return ok;
+}
+
+static void csThread() {
+    for (;;) {
+        usleep(60000);
+        std::lock_guard<std::mutex> lk(g_cm);
+        if (!g_cfreeze || !g_ca) continue;
+        if (!csOk(g_cs, g_cbase, g_ca, 0.6)) { g_cfreeze = false; g_cmsg = "заморозка снята: данные по адресу изменились (выход из мира или перезапуск игры)"; continue; }
+        bool ok; unsigned long long cur = memVal(g_ca, 4, ok);
+        if (ok && (int)cur != g_cval) memWrite(g_ca, (unsigned long long)(uint32_t)g_cval, 4);
+    }
+}
+
+static Str csRoute(const Img &im, const Str &path, const Params &q) {
+    if (path == "csstop") {
+        std::lock_guard<std::mutex> lk(g_cm); g_cfreeze = false; return "заморозка снята, значение осталось как есть (верни дальность в настройках игры)\n";
+    }
+    if (path == "csinfo") {
+        std::lock_guard<std::mutex> lk(g_cm);
+        CsSig fs; bool has = !g_cs.w.empty() || csLoad(fs);
+        Str o = Str("привязка: ") + (has ? "есть" : "нет (нужно «Привязать адрес»)") + "\n";
+        if (g_ca) { bool ok; unsigned long long v = memVal(g_ca, 4, ok); o += "адрес: " + hx(g_ca) + (ok ? ", сейчас " + std::to_string((int)v) : Str(", не читается")) + "\n"; }
+        o += Str("заморозка: ") + (g_cfreeze ? "включена, " + std::to_string(g_cval) : Str("выключена")) + "\n";
+        if (!g_cmsg.empty()) o += g_cmsg + "\n";
+        return o;
+    }
+    if (path == "csbind") {
+        uintptr_t a = 0; if (!hexNum(q, "a", a)) return "нужен адрес a (hex)\n";
+        CsSig sg; Str err; if (!csBuild(im, a, sg, err)) return "не привязал: " + err + "\n";
+        bool ok; unsigned long long v = memVal(a, 4, ok);
+        if (!csSave(sg)) return "не могу записать mgg_chunk.txt\n";
+        std::lock_guard<std::mutex> lk(g_cm);
+        g_cs = sg; g_ca = a; g_cbase = im.base; g_cmsg.clear();
+        int an = 0; for (const CsWord &c : sg.w) if (csIsAnchor(c)) an++;
+        return "привязано: " + hx(a) + (ok ? ", значение " + std::to_string((int)v) : Str("")) + "\nякорных слов: " + std::to_string(an) + " из " + std::to_string(sg.w.size() - 1) + "\nтеперь ползунок найдёт адрес сам после перезапуска игры\n";
+    }
+    if (path == "csapply") {
+        int val = (int)decNum(q, "v", 24); if (val < 1) val = 1; if (val > 96) val = 96;
+        CsSig sg; uintptr_t cur;
+        { std::lock_guard<std::mutex> lk(g_cm); sg = g_cs; cur = g_ca; }
+        if (sg.w.empty() && !csLoad(sg)) return "сначала «Привязать адрес» (адрес из вкладки Mem)\n";
+        uintptr_t a = 0; Str how;
+        if (cur && csOk(sg, im.base, cur, 0.8)) { a = cur; how = "адрес прежний"; }
+        else { Str e = csFind(sg, im.base, a); if (!e.empty() || !a) return e.empty() ? Str("не нашёл адрес\n") : e; how = "адрес найден заново"; }
+        if (!memWrite(a, (unsigned long long)(uint32_t)val, 4)) return "запись не удалась\n";
+        bool ok; unsigned long long rb = memVal(a, 4, ok);
+        std::lock_guard<std::mutex> lk(g_cm);
+        g_cs = sg; g_ca = a; g_cbase = im.base; g_cval = val; g_cfreeze = true; g_cmsg.clear();
+        if (!g_cth) { g_cth = true; std::thread(csThread).detach(); }
+        return "дальность " + std::to_string(val) + " (" + how + " " + hx(a) + ")" + (ok && (int)rb == val ? "" : ", но чтение вернуло " + std::to_string((int)rb)) + "\n";
+    }
+    return "неизвестный маршрут\n";
+}
+
 // ---------------------------------------------------------------- функции (готовые наборы патчей из файла mgg_functions.txt)
 // строка: Название|смещение_hex|оригинальные_байты|новые_байты   (одинаковые названия = одна функция)
 // профиль: @Название|функция1,функция2
@@ -1440,10 +1602,12 @@ aside .lg span{display:block;font-weight:400;color:var(--dim);font-size:9px;lett
 .nav.on{background:rgba(255,255,255,.03)}
 .nav.on .bx{background:var(--ac);color:var(--acTx)}
 .nav.on{color:var(--tx)}
-#top{background:var(--bg);padding:8px 8px 4px}
-#out{white-space:pre-wrap;word-break:break-all;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;margin:0;max-height:24vh;min-height:42px;overflow:auto;font:11px/1.35 ui-monospace,monospace;color:var(--tx)}
+#top{position:sticky;top:0;z-index:5;background:var(--bg);padding:6px 8px 4px;display:flex;gap:6px;align-items:stretch}
+.tb{display:flex;flex-direction:column;gap:5px;width:40px;flex:none}
+.tb button{margin:0;padding:0;flex:1;width:100%}
+#out{white-space:pre-wrap;word-break:break-all;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:6px 9px;margin:0;flex:1;min-width:0;max-height:22vh;min-height:40px;overflow:auto;font:11px/1.35 ui-monospace,monospace;color:var(--tx)}
 #out.big{max-height:60vh}
-.row{display:flex;gap:5px;margin-top:5px}.row>*{flex:1}
+.row{display:flex;gap:5px;margin-top:5px}.row>*{flex:1;min-width:0}
 .pg{padding:0 8px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:9px;margin:7px 0}
 .card h3{margin:0 0 6px;font-size:11px;color:var(--dim);font-weight:600;letter-spacing:.4px;text-transform:uppercase;display:flex;align-items:center;gap:6px}
@@ -1454,11 +1618,14 @@ details.card>div{padding:0 9px 9px}
 input,select{width:100%;background:var(--card2);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:8px 9px;margin:3px 0;font:inherit;outline:none}
 input:focus,select:focus{border-color:var(--ac)}
 input[type=color]{padding:2px;height:34px}input[type=range]{padding:0;accent-color:var(--ac)}
-button{font:inherit;color:var(--acTx);border:0;border-radius:var(--r);padding:8px 9px;margin:3px 0;background:var(--ac);width:100%;display:flex;align-items:center;justify-content:center;gap:7px}
+button{font:inherit;color:var(--acTx);border:0;border-radius:var(--r);padding:8px 9px;margin:3px 0;background:var(--ac);width:100%;min-width:0;display:flex;align-items:center;justify-content:center;gap:7px;text-align:center;line-height:1.15;white-space:normal;overflow-wrap:anywhere}
 button:active{filter:brightness(1.25)}button.s{background:var(--card2);border:1px solid var(--line);color:var(--tx)}
 button.d{background:#8a3a40}button.g{background:#3f7a63}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:5px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}
-.grid2 button,.grid3 button{margin:0}
+.grid2,.grid3{display:grid;gap:5px}.grid2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.grid2>*,.grid3>*{min-width:0}
+.grid2 button,.grid3 button{margin:0;height:100%}
+.grid2 button{padding:8px 6px;font-size:12px}
+.grid3 button{flex-direction:column;gap:3px;padding:8px 3px;font-size:11px}
 .fn{display:flex;align-items:center;gap:8px;background:var(--ac);color:var(--acTx);border-radius:var(--r);padding:9px 10px;margin:5px 0}
 .fn .nm{flex:1;font-weight:600}.fn .sub{opacity:.7;font-size:10px;font-weight:400}
 .sw{width:38px;height:21px;border-radius:999px;background:rgba(0,0,0,.35);flex:none;position:relative}
@@ -1468,18 +1635,18 @@ button.d{background:#8a3a40}button.g{background:#3f7a63}
 .sw.mid{background:#6b6450}.sw.mid::after{background:#fff3cf}
 .tag{font-size:9px;background:rgba(0,0,0,.3);border-radius:5px;padding:1px 5px;margin-left:6px}
 small{color:var(--dim);display:block;margin-top:4px}
-.pre{display:flex;gap:5px;flex-wrap:wrap}.pre button{width:auto;flex:1;min-width:70px}
+.pre{display:flex;gap:5px;flex-wrap:wrap}.pre button{width:auto;flex:1 1 30%;min-width:0}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
-<symbol id="i-bolt" viewBox="0 0 24 24"><path class=fi d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
-<symbol id="i-mem" viewBox="0 0 24 24"><circle cx=10 cy=10 r=6/><path d="M14.5 14.5 20 20M10 7v6M7 10h6"/></symbol>
-<symbol id="i-lib" viewBox="0 0 24 24"><rect x=6 y=6 width=12 height=12 rx=2/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
+<symbol id="i-bolt" viewBox="0 0 24 24"><path class="fi" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
+<symbol id="i-mem" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="10" rx="1.5"/><path d="M7 10h2M11 10h2M15 10h2M6 16v3M10 16v3M14 16v3M18 16v3"/></symbol>
+<symbol id="i-lib" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></symbol>
 <symbol id="i-file" viewBox="0 0 24 24"><path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6z"/></symbol>
 <symbol id="i-safe" viewBox="0 0 24 24"><path d="M12 2 4 5v6c0 5 3.5 8.5 8 11 4.5-2.5 8-6 8-11V5l-8-3z"/></symbol>
-<symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 8 0 1 0 0 16c1.5 0 2-1 2-2s-.5-1.5-.5-2.5S14 13 15 13h2a4 4 0 0 0 4-4c0-3.5-4-6-9-6z"/><circle class=fi cx=8 cy=12 r=1.3/><circle class=fi cx=9.5 cy=8 r=1.3/><circle class=fi cx=14.5 cy=8 r=1.3/></symbol>
-<symbol id="i-copy" viewBox="0 0 24 24"><rect x=8 y=8 width=12 height=12 rx=2/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><path d="M12 3a9 8 0 1 0 0 16c1.5 0 2-1 2-2s-.5-1.5-.5-2.5S14 13 15 13h2a4 4 0 0 0 4-4c0-3.5-4-6-9-6z"/><circle class="fi" cx="8" cy="12" r="1.3"/><circle class="fi" cx="9.5" cy="8" r="1.3"/><circle class="fi" cx="14.5" cy="8" r="1.3"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
 <symbol id="i-expand" viewBox="0 0 24 24"><path d="M9 3H3v6M15 21h6v-6M21 3h-6v6M3 21h6v-6"/></symbol>
-<symbol id="i-search" viewBox="0 0 24 24"><circle cx=11 cy=11 r=7/><path d="M21 21l-4.3-4.3"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
 <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></symbol>
 <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
 <symbol id="i-eq" viewBox="0 0 24 24"><path d="M5 9h14M5 15h14"/></symbol>
@@ -1487,7 +1654,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 3v5h5"/></symbol>
 <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v6h8V4M8 14h8v6H8z"/></symbol>
 <symbol id="i-snow" viewBox="0 0 24 24"><path d="M12 2v20M4.5 6.5l15 11M19.5 6.5l-15 11"/></symbol>
-<symbol id="i-stop" viewBox="0 0 24 24"><rect x=6 y=6 width=12 height=12 rx=1.5/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/></symbol>
 <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 6 0l3-3a4 4 0 0 0-6-6l-1.5 1.5"/><path d="M14 10a4 4 0 0 0-6 0l-3 3a4 4 0 0 0 6 6l1.5-1.5"/></symbol>
 <symbol id="i-start" viewBox="0 0 24 24"><path d="M8 5l12 7-12 7z"/></symbol>
 <symbol id="i-hex" viewBox="0 0 24 24"><path d="M9 3 3 7v10l6 4 6-4V7zM15 3l6 4v10l-6 4"/></symbol>
@@ -1495,15 +1662,15 @@ small{color:var(--dim);display:block;margin-top:4px}
 <symbol id="i-undo" viewBox="0 0 24 24"><path d="M3 10h9a6 6 0 0 1 0 12h-3"/><path d="M8 5 3 10l5 5"/></symbol>
 <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></symbol>
 <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12l-1 5a5 5 0 0 1-10 0z"/><path d="M12 17v5"/></symbol>
-<symbol id="i-unlock" viewBox="0 0 24 24"><rect x=5 y=11 width=14 height=9 rx=2/><path d="M8 11V7a4 4 0 0 1 7-2.6"/></symbol>
-<symbol id="i-info" viewBox="0 0 24 24"><circle cx=12 cy=12 r=9/><path d="M12 11v5M12 8h.01"/></symbol>
+<symbol id="i-unlock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7-2.6"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></symbol>
 <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
 <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 3v18M5 4h11l-2 4 2 4H5"/></symbol>
-<symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 5v2M12 17v2M5 12H3M21 12h-2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx=12 cy=12 r=4/></symbol>
-<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx=12 cy=12 r=3/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 5v2M12 17v2M5 12H3M21 12h-2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx="12" cy="12" r="4"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></symbol>
 </defs></svg>
 <div id=top><pre id=out>MGG готов. Открой вкладку «Функции».</pre>
-<div class=row><button class=s onclick="cp()"><svg class=ic><use href="#i-copy"/></svg>Копировать</button><button class=s onclick="document.getElementById('out').classList.toggle('big')"><svg class=ic><use href="#i-expand"/></svg>Размер</button></div></div>
+<div class=tb><button class=s title="Копировать" onclick="cp()"><svg class=ic><use href="#i-copy"/></svg></button><button class=s title="Размер" onclick="document.getElementById('out').classList.toggle('big')"><svg class=ic><use href="#i-expand"/></svg></button></div></div>
 
 <div class=pg id=pn>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Готовые функции</h3><div id=fl>…</div>
