@@ -1015,6 +1015,9 @@ static std::vector<uintptr_t> g_cand;
 static int g_csz = 4;
 
 #include <csetjmp>
+#include <set>
+#include <climits>
+#include <algorithm>
 #include <csignal>
 #include <chrono>
 static thread_local sigjmp_buf g_jb; static thread_local volatile sig_atomic_t g_guard = 0;
@@ -1479,8 +1482,13 @@ static Str csRoute(const Str &path, const Params &q) {
 //   block.f|Название|смещение|тип          поля этой структуры
 // тип: float, int, byte, bool, hex, str (std::string / C-строка, автоопределение)
 static Str trimS(Str t);
-struct WField { Str label; uintptr_t off; Str type; };
-struct WCfg { Str pchain, mlist, bchain; uintptr_t mpos = 0; bool hasMpos = false; std::vector<WField> pf, mf, bf; };
+struct WField { Str label; std::vector<uintptr_t> offs; Str type; };
+struct WCfg { int bits = 0; Str pchain, mlist, bchain; uintptr_t mpos = 0; bool hasMpos = false; std::vector<WField> pf, mf, bf; };
+static std::vector<uintptr_t> wParseOffs(const Str &t) {            // "2B4" или цепочка "10,2B4,8": первое прибавляется к базе, дальше «прочитать указатель + смещение»
+    std::vector<uintptr_t> v; size_t i = 0;
+    while (i <= t.size()) { size_t j = t.find(',', i); if (j == Str::npos) j = t.size(); Str tk = trimS(t.substr(i, j - i)); if (!tk.empty()) v.push_back((uintptr_t)strtoull(tk.c_str(), nullptr, 16)); i = j + 1; }
+    return v;
+}
 static Str worldFile() { return dataDir() + "/mgg_world.txt"; }
 static const char *kWorldHelp =
     "# MGG World: настройки для Mob и Block (и необязательно Player)\n"
@@ -1496,7 +1504,9 @@ static const char *kWorldHelp =
     "# block.f|X|0|int\n"
     "# block.f|Y|4|int\n"
     "# block.f|Z|8|int\n"
-    "# типы: float, int, byte, bool, hex, str\n";
+    "# типы: float, int, byte, bool, hex, str\n"
+    "# смещение поля может быть цепочкой: mob.f|HP|10,2B4,8 (первое прибавляется к началу сущности, дальше: прочитать указатель + смещение)\n"
+    "# bits|32   (для какой разрядности написан файл; при несовпадении панель предупредит)\n";
 
 static WCfg worldLoad() {
     WCfg c; Str txt;
@@ -1510,9 +1520,10 @@ static WCfg worldLoad() {
         while (j <= ln.size()) { size_t k = ln.find('|', j); if (k == Str::npos) k = ln.size(); p.push_back(trimS(ln.substr(j, k - j))); j = k + 1; }
         if (p.size() < 2) continue;
         const Str &k = p[0];
-        auto fld = [&](std::vector<WField> &v) { if (p.size() >= 4) v.push_back({p[1], (uintptr_t)strtoull(p[2].c_str(), nullptr, 16), p[3]}); };
+        auto fld = [&](std::vector<WField> &v) { if (p.size() >= 4) v.push_back({p[1], wParseOffs(p[2]), p[3]}); };
         if (k == "player.chain") c.pchain = p[1];
         else if (k == "mob.list") c.mlist = p[1];
+        else if (k == "bits") c.bits = atoi(p[1].c_str());
         else if (k == "block.chain") c.bchain = p[1];
         else if (k == "mob.pos") { c.mpos = (uintptr_t)strtoull(p[1].c_str(), nullptr, 16); c.hasMpos = true; }
         else if (k == "player.f") fld(c.pf);
@@ -1571,7 +1582,12 @@ static Str wRow(const Str &key, const Str &label, const Str &val, int st) { retu
 
 static Str wFields(uintptr_t base, const std::vector<WField> &fs) {
     Str o;
-    for (const WField &f : fs) { bool ok; Str v = wRead(base + f.off, f.type, ok); o += wRow("-", f.label, v, ok ? 1 : 0); }
+    for (const WField &f : fs) {
+        bool ok = !f.offs.empty(); uintptr_t a = base; Str v = "—";
+        if (ok) { a = base + f.offs[0]; for (size_t k = 1; k < f.offs.size() && ok; k++) { uintptr_t pp = 0; if (!guarded(&pp, (const void *)a, sizeof pp) || pp < 0x10000) ok = false; else a = pp + f.offs[k]; } }
+        if (ok) v = wRead(a, f.type, ok);
+        o += wRow("-", f.label, v, ok ? 1 : 0);
+    }
     return o;
 }
 
@@ -1619,7 +1635,7 @@ static Str worldPlayer() {
         g_wpx = pos[0]; g_wpy = pos[1]; g_wpz = pos[2]; g_wpt = t; g_wph = true;
     } else g_wph = false;
     WCfg c = worldLoad(); uintptr_t pa = 0;
-    if (!c.pchain.empty() && wChain(im, c.pchain, pa)) rows += wFields(pa, c.pf);
+    if ((!c.bits || c.bits == (int)(sizeof(void *) * 8)) && !c.pchain.empty() && wChain(im, c.pchain, pa)) rows += wFields(pa, c.pf);
     Str h = live ? "в мире · данные идут" : stale ? "адреса устарели (вышел из мира?) · ищу заново" : bound ? "ждём мир" : "ничего не привязано: нажми значок-ссылку у строки";
     return "#\t" + h + "\n" + (staleKey.empty() ? Str() : "#stale\t" + staleKey + "\n") + rows;
 }
@@ -1628,6 +1644,7 @@ static Str worldMob() {
     Img im;
     if (!loadImg(im, MGG_TARGET_LIB)) return Str("#\t") + MGG_TARGET_LIB + " не найдена в процессе игры\n";
     WCfg c = worldLoad();
+    if (c.bits && c.bits != (int)(sizeof(void *) * 8)) return "#\tконфиг написан для " + std::to_string(c.bits) + " bit, а игра сейчас " + std::to_string(sizeof(void *) * 8) + " bit: офсеты не подойдут\n";
     if (c.mlist.empty() || !c.hasMpos) return "#\tне настроено: нужны mob.list и mob.pos в mgg_world.txt (кнопка «Конфиг»)\n";
     const size_t PS = sizeof(void *);
     uintptr_t la = 0, be[2] = {0, 0};
@@ -1660,6 +1677,7 @@ static Str worldBlock() {
     Img im;
     if (!loadImg(im, MGG_TARGET_LIB)) return Str("#\t") + MGG_TARGET_LIB + " не найдена в процессе игры\n";
     WCfg c = worldLoad(); uintptr_t a = 0;
+    if (c.bits && c.bits != (int)(sizeof(void *) * 8)) return "#\tконфиг написан для " + std::to_string(c.bits) + " bit, а игра сейчас " + std::to_string(sizeof(void *) * 8) + " bit: офсеты не подойдут\n";
     if (c.bchain.empty() || c.bf.empty()) return "#\tне настроено: нужны block.chain и block.f в mgg_world.txt (кнопка «Конфиг»)\n";
     if (!wChain(im, c.bchain, a)) return "#\tданные блока не читаются (ты не в мире или неверная цепочка)\n";
     return "#\tпоследний сломанный блок\n" + wFields(a, c.bf);
@@ -1668,6 +1686,256 @@ static Str worldBlock() {
 static Str worldCfg() {
     WCfg c = worldLoad(); Str t; readFile(worldFile(), t);
     return "файл: " + worldFile() + "\n(правится во вкладке File)\n\n" + t;
+}
+
+// ---------------------------------------------------------------- Помощники поиска (строки, соседи, допуск по float, цепочки указателей, путь от объекта)
+static bool hInSeg(const Img &im, uintptr_t v) { for (const Seg &g : im.segs) if (v >= g.s && v < g.e) return true; return false; }
+static bool hInMaps(const std::vector<MapR> &m, uintptr_t v) {         // m отсортирован по возрастанию
+    size_t lo = 0, hi = m.size();
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (m[mid].e <= v) lo = mid + 1; else hi = mid; }
+    return lo < m.size() && v >= m[lo].s && v < m[lo].e;
+}
+static bool hPrint(const uint8_t *s, size_t n) { for (size_t i = 0; i < n; i++) if (s[i] < 32 || s[i] > 126) return false; return n > 0; }
+
+// float с допуском: игра показывает округлённые числа (HP 18.5, координаты 123.45), точное совпадение не годится
+static Str hScanF(double v, double tol, bool all) {
+    g_cand.clear(); g_prev.clear(); g_csz = 4; g_cf = true;
+    std::vector<uint8_t> buf(1 << 20); size_t regions = 0;
+    for (const MapR &m : memMaps(all)) {
+        regions++;
+        for (uintptr_t a = m.s; a < m.e;) {
+            size_t n = std::min<size_t>(buf.size(), m.e - a);
+            if (!guarded(buf.data(), (const void *)a, n)) { a += 4096; continue; }
+            for (size_t i = 0; i + 4 <= n; i += 4) {
+                uint32_t u; memcpy(&u, buf.data() + i, 4); float f; memcpy(&f, &u, 4);
+                if (!(f == f)) continue;
+                double d = (double)f - v; if (d < 0) d = -d;
+                if (d > tol) continue;
+                g_cand.push_back(a + i); g_prev.push_back(u);
+                if (g_cand.size() > 2000000) { g_cand.clear(); g_prev.clear(); return "слишком много совпадений: уменьши допуск или возьми менее частое число\n"; }
+            }
+            a += n;
+        }
+    }
+    return "областей: " + std::to_string(regions) + ", найдено: " + std::to_string(g_cand.size()) + "\n";
+}
+// off = 0: само значение; off != 0: float по соседнему адресу (для позиции: Z лежит через 8 байт от X)
+static Str hKeepF(intptr_t off, double v, double tol) {
+    std::vector<uintptr_t> ka; std::vector<unsigned long long> kp;
+    for (uintptr_t c : g_cand) {
+        bool ok; unsigned long long cur = memVal(c + off, 4, ok); if (!ok) continue;
+        uint32_t u = (uint32_t)cur; float f; memcpy(&f, &u, 4); double d = (double)f - v; if (d < 0) d = -d;
+        if (f == f && d <= tol) { ka.push_back(c); kp.push_back(off ? (unsigned long long)0 : cur); }
+    }
+    if (off) { for (size_t i = 0; i < ka.size(); i++) { bool ok; kp[i] = memVal(ka[i], 4, ok); } }
+    g_cand.swap(ka); g_prev.swap(kp);
+    return "осталось: " + std::to_string(g_cand.size()) + "\n";
+}
+
+// поиск ASCII-строки в памяти (имя моба, ник, id блока)
+static Str hStr(const Str &s, bool all) {
+    if (s.size() < 2) return "строка слишком короткая\n";
+    std::vector<uint8_t> buf(1 << 20); size_t cnt = 0; Str o;
+    for (const MapR &m : memMaps(all)) {
+        for (uintptr_t a = m.s; a < m.e;) {
+            size_t n = std::min<size_t>(buf.size(), m.e - a);
+            if (!guarded(buf.data(), (const void *)a, n)) { a += 4096; continue; }
+            for (size_t i = 0; i + s.size() <= n; i++) {
+                if (buf[i] != (uint8_t)s[0] || memcmp(buf.data() + i, s.data(), s.size()) != 0) continue;
+                if (a + i >= (uintptr_t)buf.data() && a + i < (uintptr_t)buf.data() + buf.size()) continue;      // собственный буфер
+                size_t k = 0; while (i + k < n && k < 32 && buf[i + k] >= 32 && buf[i + k] < 127) k++;
+                o += hx(a + i) + "\t" + Str((const char *)buf.data() + i, k) + "\n";
+                if (++cnt >= 300) return "#\tпоказаны первые 300, уточни строку\n" + o;
+            }
+            size_t adv = n; if (a + n < m.e && n > s.size()) adv = n - (s.size() - 1);
+            a += adv;
+        }
+    }
+    return "#\tнайдено: " + std::to_string(cnt) + (cnt ? " (часть копий — от самой панели)" : "") + "\n" + o;
+}
+
+// слова вокруг адреса с расшифровкой: int, float, указатель в lib / в память / на строку, ASCII внутри слова
+static Str hNear(uintptr_t a, size_t before, size_t after) {
+    Img im; loadImg(im, MGG_TARGET_LIB);
+    const size_t PS = sizeof(void *);
+    if (before > 512) before = 512; if (after > 1024) after = 1024;
+    a &= ~(uintptr_t)3; uintptr_t st = a - (before & ~(size_t)3); size_t n = ((before & ~(size_t)3) + after) & ~(size_t)3;
+    std::vector<uint8_t> b(n + 8, 0);
+    if (!guarded(b.data(), (const void *)st, n)) return "#\tпамять вокруг адреса не читается\n";
+    std::vector<MapR> mr = memMaps(true);
+    Str o = "#\tбаза " + Str(MGG_TARGET_LIB) + " = " + hx(im.base) + ", разрядность " + std::to_string(PS * 8) + "\n"; char t[128];
+    for (size_t i = 0; i + 4 <= n; i += 4) {
+        uintptr_t ad = st + i; uint32_t u; memcpy(&u, b.data() + i, 4); float f; memcpy(&f, &u, 4);
+        intptr_t rel = (intptr_t)ad - (intptr_t)a;
+        Str fs; if (f == f && ((f > -1e9f && f < 1e9f)) && (u == 0 || (f > 1e-4f || f < -1e-4f))) { snprintf(t, sizeof t, "%g", f); fs = t; }
+        Str note;
+        if (ad % PS == 0 && i + PS <= n) {
+            uintptr_t p = 0; memcpy(&p, b.data() + i, PS);
+            if (p >= 0x10000) {
+                if (hInSeg(im, p)) { snprintf(t, sizeof t, "→ lib+0x%lX", (unsigned long)(p - im.base)); note = t; }
+                else if (hInMaps(mr, p)) {
+                    uint8_t sb[24]; Str tx;
+                    if (guarded(sb, (const void *)p, sizeof sb)) { size_t k = 0; while (k < sizeof sb && sb[k] >= 32 && sb[k] < 127) k++; if (k >= 3) tx = " «" + Str((const char *)sb, k) + "»"; }
+                    note = "→ память" + tx;
+                }
+            }
+        }
+        if (note.empty() && hPrint(b.data() + i, 4) && b[i] != ' ') note = "«" + Str((const char *)b.data() + i, 4) + "»";
+        snprintf(t, sizeof t, "%s0x%lX", rel < 0 ? "-" : "+", (unsigned long)(rel < 0 ? -rel : rel));
+        o += hx(ad) + "\t" + t + "\t";
+        snprintf(t, sizeof t, "%08X", (unsigned)u); o += t; o += "\t" + std::to_string((int)u) + "\t" + fs + "\t" + note + "\n";
+    }
+    return o;
+}
+
+// ---- обратный поиск цепочки указателей: от адреса цели вверх, пока не дойдём до статики в libminecraftpe.so
+// Цепочка «ГЛОБАЛ,о1,о2…» читается тем же wChain: адрес = база+ГЛОБАЛ, дальше на каждом шаге читаем указатель и прибавляем смещение.
+struct PNode { uintptr_t addr, off; int par; };
+static std::mutex g_pm; static bool g_prun = false, g_pcancel = false; static Str g_pstat, g_pres;
+
+static void hPtrWorker(uintptr_t T, int depth, size_t maxoff, bool all) {
+    Img im; loadImg(im, MGG_TARGET_LIB);
+    const size_t PS = sizeof(void *);
+    auto setS = [](const Str &s) { std::lock_guard<std::mutex> lk(g_pm); g_pstat = s; };
+    struct Res { int lvl; uintptr_t sum; Str line; };
+    std::vector<Res> res;
+    std::vector<PNode> nodes; nodes.reserve(400001); nodes.push_back({T, 0, -1});
+    auto chainOf = [&](int id) {
+        char t[32]; snprintf(t, sizeof t, "%lX", (unsigned long)(nodes[id].addr - im.base)); Str c = t; uintptr_t sum = 0;
+        for (int k = id; k >= 0 && nodes[k].par >= 0; k = nodes[k].par) { snprintf(t, sizeof t, ",%lX", (unsigned long)nodes[k].off); c += t; sum += nodes[k].off; }
+        return std::make_pair(c, sum);
+    };
+    if (hInSeg(im, T)) { auto c = chainOf(0); res.push_back({0, 0, c.first}); }
+    std::vector<MapR> regs = memMaps(true);
+    std::vector<uint8_t> buf(1 << 20);
+    std::vector<int> cur{0}; std::vector<uintptr_t> visited{T}; bool trunc = false;
+    for (int lvl = 1; lvl <= depth && res.size() < 40 && !trunc; lvl++) {
+        std::vector<std::pair<uintptr_t, int>> tg; tg.reserve(cur.size());
+        for (int ix : cur) tg.push_back({nodes[ix].addr, ix});
+        std::sort(tg.begin(), tg.end());
+        std::vector<int> next; size_t regIx = 0;
+        for (const MapR &m : regs) {
+            regIx++;
+            { char t[96]; snprintf(t, sizeof t, "уровень %d из %d: область %zu из %zu, целей %zu", lvl, depth, regIx, regs.size(), tg.size()); setS(t); }
+            { std::lock_guard<std::mutex> lk(g_pm); if (g_pcancel) break; }
+            for (uintptr_t a = m.s; a < m.e && !trunc;) {
+                size_t n = std::min<size_t>(buf.size(), m.e - a);
+                if (!guarded(buf.data(), (const void *)a, n)) { a += 4096; continue; }
+                for (size_t i = 0; i + PS <= n; i += PS) {
+                    uintptr_t w = 0; memcpy(&w, buf.data() + i, PS); if (w < 0x10000) continue;
+                    auto it = std::lower_bound(tg.begin(), tg.end(), std::make_pair(w, INT_MIN));
+                    if (it == tg.end() || it->first - w > maxoff) continue;
+                    uintptr_t A = a + i;
+                    if ((A >= (uintptr_t)buf.data() && A < (uintptr_t)buf.data() + buf.size()) ||
+                        (A >= (uintptr_t)nodes.data() && A < (uintptr_t)(nodes.data() + 400001)) ||
+                        (A >= (uintptr_t)tg.data() && A < (uintptr_t)(tg.data() + tg.capacity()))) continue;      // собственные буферы помощника
+                    if (std::binary_search(visited.begin(), visited.end(), A)) continue;
+                    nodes.push_back({A, it->first - w, it->second}); int id = (int)nodes.size() - 1;
+                    if (hInSeg(im, A)) { auto c = chainOf(id); res.push_back({lvl, c.second, c.first}); }
+                    else next.push_back(id);
+                    if (nodes.size() >= 400000) { trunc = true; break; }
+                }
+                a += n;
+            }
+        }
+        { std::lock_guard<std::mutex> lk(g_pm); if (g_pcancel) break; }
+        if (next.size() > 5000) { std::sort(next.begin(), next.end(), [&](int x, int y) { return nodes[x].off < nodes[y].off; }); next.resize(5000); }
+        for (int ix : next) visited.push_back(nodes[ix].addr);
+        std::sort(visited.begin(), visited.end());
+        cur.swap(next);
+        if (cur.empty()) break;
+    }
+    std::sort(res.begin(), res.end(), [](const Res &x, const Res &y) { return x.lvl != y.lvl ? x.lvl < y.lvl : x.sum < y.sum; });
+    Str o; size_t k = 0;
+    for (const Res &r : res) { if (k++ >= 20) break; o += r.line + "\t" + (r.lvl ? "уровней: " + std::to_string(r.lvl) : Str("сам адрес в lib")) + "\n"; }
+    std::lock_guard<std::mutex> lk(g_pm);
+    g_pres = o; g_prun = false;
+    g_pstat = g_pcancel ? "остановлено" : res.empty() ? (trunc ? "слишком много совпадений: уменьши макс. смещение" : "цепочек до статики не найдено: увеличь глубину или смещение") : "найдено цепочек: " + std::to_string(res.size());
+}
+
+// ---- прямой поиск: как от начала объекта E добраться до поля A (смещения через запятую, формат полей mob.f / player.f / block.f)
+static Str hPath(uintptr_t E, uintptr_t A, int depth, size_t n) {
+    const size_t PS = sizeof(void *);
+    if (n > 0x1000) n = 0x1000;
+    std::vector<MapR> regs = memMaps(true);
+    struct N { uintptr_t w; std::vector<uintptr_t> tk; };
+    std::vector<N> cur, next; cur.push_back({E, {}});
+    std::set<uintptr_t> seen; seen.insert(E);
+    std::vector<std::vector<uintptr_t>> found; std::vector<uint8_t> b(n);
+    for (int lvl = 0; lvl <= depth && found.size() < 20; lvl++) {
+        for (const N &nd : cur) {
+            if (!guarded(b.data(), (const void *)nd.w, n)) continue;
+            if (A >= nd.w && A < nd.w + n) { std::vector<uintptr_t> t = nd.tk; t.push_back(A - nd.w); found.push_back(t); }
+            for (size_t i = 0; i + PS <= n; i += PS) {
+                uintptr_t x = 0; memcpy(&x, b.data() + i, PS);
+                if (x < 0x10000 || !hInMaps(regs, x)) continue;
+                if (A >= x && A < x + n) { std::vector<uintptr_t> t = nd.tk; t.push_back(i); t.push_back(A - x); found.push_back(t); }
+                else if (lvl < depth && next.size() < 20000 && !seen.count(x)) { seen.insert(x); std::vector<uintptr_t> t = nd.tk; t.push_back(i); next.push_back({x, t}); }
+            }
+        }
+        cur.swap(next); next.clear();
+    }
+    if (found.empty()) return "#\tпуть не найден: увеличь глубину / размер окна или проверь адрес объекта\n";
+    std::sort(found.begin(), found.end(), [](const std::vector<uintptr_t> &x, const std::vector<uintptr_t> &y) { return x.size() < y.size(); });
+    Str o = "#\tнайдено путей: " + std::to_string(found.size()) + "\n"; char t[32];
+    for (const auto &f : found) { Str c; for (size_t k = 0; k < f.size(); k++) { snprintf(t, sizeof t, k ? ",%lX" : "%lX", (unsigned long)f[k]); c += t; } o += c + "\t" + std::to_string(f.size() == 1 ? 0 : (f.size() - 1) / 2 + 0) + "\n"; }
+    return o;
+}
+
+// ---- запись строк в mgg_world.txt: одиночные ключи заменяются, поля (.f) добавляются
+static Str wCfgAdd(const Str &line) {
+    static const char *ok[] = {"player.chain|", "player.f|", "mob.list|", "mob.pos|", "mob.f|", "block.chain|", "block.f|", "bits|"};
+    bool good = line.size() < 300 && line.find('\n') == Str::npos && line.find('\r') == Str::npos;
+    Str key; bool multi = false;
+    if (good) { good = false; for (const char *k : ok) if (line.compare(0, strlen(k), k) == 0) { good = true; key = k; multi = key.size() > 3 && key.compare(key.size() - 3, 3, ".f|") == 0; } }
+    if (!good) return "строка не подходит для конфига\n";
+    worldLoad();                                                  // создаст файл с подсказкой, если его ещё нет
+    Str txt; readFile(worldFile(), txt); Str out; size_t i = 0;
+    while (i < txt.size()) {
+        size_t e = txt.find('\n', i); if (e == Str::npos) e = txt.size();
+        Str ln = txt.substr(i, e - i); i = e + 1;
+        Str tr = trimS(ln);
+        if (tr == line) return "такая строка уже есть\n";
+        if (!multi && tr.compare(0, key.size(), key) == 0) continue;     // заменяем прежнее значение ключа
+        out += ln + "\n";
+    }
+    out += line + "\n";
+    FILE *f = fopen(worldFile().c_str(), "w"); if (!f) return "не могу записать mgg_world.txt\n";
+    fputs(out.c_str(), f); fclose(f);
+    return "добавлено в mgg_world.txt: " + line + "\n";
+}
+
+static bool helperRoute(const Str &path, const Params &q, Str &o) {
+    if (path == "hscanf") { o = hScanF(strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr), P(q, "all") == "1"); return true; }
+    if (path == "hnextf") { o = hKeepF(0, strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr)); return true; }
+    if (path == "hrel") { o = hKeepF((intptr_t)strtol(P(q, "off", "0").c_str(), nullptr, 10), strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr)); return true; }
+    if (path == "hstr") { o = hStr(P(q, "s"), P(q, "all") == "1"); return true; }
+    if (path == "hnear") {
+        uintptr_t a = 0; if (!hexNum(q, "a", a)) { o = "#\tнужен адрес a (hex)\n"; return true; }
+        o = hNear(a, decNum(q, "b", 64), decNum(q, "n", 192)); return true;
+    }
+    if (path == "hpath") {
+        uintptr_t e = 0, a = 0; if (!hexNum(q, "e", e) || !hexNum(q, "a", a)) { o = "#\tнужны адрес объекта e и адрес поля a (hex)\n"; return true; }
+        int d = (int)decNum(q, "d", 2); if (d > 4) d = 4;
+        o = hPath(e, a, d, decNum(q, "n", 512)); return true;
+    }
+    if (path == "hptr") {
+        std::lock_guard<std::mutex> lk(g_pm);
+        if (P(q, "c") == "1") { g_pcancel = true; o = "останавливаю…\n"; return true; }
+        if (g_prun) { o = "поиск уже идёт\n"; return true; }
+        uintptr_t a = 0; if (!hexNum(q, "a", a)) { o = "нужен адрес цели a (hex)\n"; return true; }
+        int d = (int)decNum(q, "d", 3); if (d < 1) d = 1; if (d > 4) d = 4;
+        size_t mo = decNum(q, "o", 1024); if (mo < 16) mo = 16; if (mo > 0x4000) mo = 0x4000;
+        g_prun = true; g_pcancel = false; g_pres.clear(); g_pstat = "запускаю…";
+        std::thread(hPtrWorker, a, d, mo, true).detach();
+        o = "поиск запущен (глубина " + std::to_string(d) + ", смещение до " + hx(mo) + ")\n"; return true;
+    }
+    if (path == "hptrst") {
+        std::lock_guard<std::mutex> lk(g_pm);
+        o = Str("#\t") + (g_prun ? "идёт" : "готово") + "\t" + g_pstat + "\n" + g_pres; return true;
+    }
+    if (path == "wcfgadd") { o = wCfgAdd(P(q, "line")); return true; }
+    return false;
 }
 
 // ---------------------------------------------------------------- функции (готовые наборы патчей из файла mgg_functions.txt)
@@ -2125,7 +2393,15 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=seg><button id=wsp class=on onclick="wsub('p')">Player</button><button id=wsm onclick="wsub('m')">Mob</button><button id=wsb onclick="wsub('b')">Block</button></div>
 <div class=card id=wp><h3><svg class=ic><use href="#i-eye"/></svg>Игрок</h3><small id=wtp>…</small><div id=wlp></div>
 <small>Привязка: вкладка Mem → найди значение (HP — float 20) → сузь поиск → нажми значок-ссылку у строки (адрес берётся из поля Mem или единственный найденный). Позиция: привяжи X, Y и Z идут следом. После перезапуска адреса находятся сами.</small></div>
+<details class=card id=wz><summary><svg class=ic><use href="#i-search"/></svg>Мастер: найти игрока<svg class=ic><use href="#i-plus"/></svg></summary><div style="padding:0 9px 9px">
+<select id=zf onchange="zSet()"><option value=hp>Здоровье</option><option value=pos>Позиция</option><option value=armor>Броня</option><option value=food>Голод</option></select>
+<small id=zh></small>
+<div class=row><input id=zx placeholder="значение (X)" inputmode=decimal><input id=zy placeholder="Y" inputmode=decimal style="display:none"><input id=zz placeholder="Z" inputmode=decimal style="display:none"></div>
+<div class=grid2><button onclick="zFirst()">1. Искать</button><button class=s onclick="zNext()">2. Сузить</button></div>
+<div class=row><input id=zn value=1 inputmode=numeric placeholder="№ в списке"><button class=g onclick="zBind()"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
+<pre id=zs style="white-space:pre-wrap;font:11px/1.35 ui-monospace,monospace;margin:6px 0 0"></pre></div></details>
 <div class=card id=wm style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Ближайший моб</h3><small id=wtm>…</small><div id=wlm></div>
+<small>Настройка: Mem → Помощники (строки → соседи → путь → цепочка), результат пишется в конфиг кнопками у строк.</small>
 <button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
 <div class=card id=wb style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Последний блок</h3><small id=wtb>…</small><div id=wlb></div>
 <button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
@@ -2154,6 +2430,21 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=grid3><button onclick="call('mwatch',{a:v('ma'),...ty()})"><svg class=ic><use href="#i-start"/></svg>Старт</button><button class=s onclick="call('mwlog',{})"><svg class=ic><use href="#i-list"/></svg>Журнал</button><button class=d onclick="call('mwstop',{})"><svg class=ic><use href="#i-stop"/></svg>Стоп</button></div>
 <small>Показывает, когда и как меняется значение по адресу из поля выше.</small>
 <div class=row><input id=mn placeholder="байт (128)"><button class=s onclick="call('mdump',{a:v('ma'),n:v('mn')||128})"><svg class=ic><use href="#i-hex"/></svg>Hex</button></div></div>
+<div class=card><h3><svg class=ic><use href="#i-search"/></svg>Помощники поиска</h3>
+<div class=seg id=hseg><button class=on onclick="hs('s')">Строки</button><button onclick="hs('n')">Соседи</button><button onclick="hs('c')">Цепочка</button><button onclick="hs('p')">Путь</button></div>
+<div id=hs_s><input id=hsq placeholder="текст, например zombie или ник"><div class=row><select id=hsa><option value=0>куча</option><option value=1>вся rw-память</option></select><button onclick="hStr()"><svg class=ic><use href="#i-search"/></svg>Найти</button></div>
+<small>Нажми на строку: адрес попадёт во все поля помощников. Рядом со строкой лежит объект моба/блока.</small></div>
+<div id=hs_n style="display:none"><input id=hna placeholder="адрес (hex), пусто = из поля адреса выше"><div class=row><input id=hnb value=64 inputmode=numeric placeholder="назад, байт"><input id=hnc value=192 inputmode=numeric placeholder="вперёд, байт"><button onclick="hNear()">Показать</button></div>
+<small>Каждые 4 байта: int, float, указатель (в lib, в память, на строку). Жёлтым — указатели в libminecraftpe.so (обычно vtable = начало объекта). Нажми на строку: адрес уйдёт в «Путь» как поле.</small></div>
+<div id=hs_c style="display:none"><input id=hca placeholder="адрес цели (hex)"><div class=grid3><select id=hcd><option>1</option><option>2</option><option selected>3</option><option>4</option></select><select id=hco><option value=256>смещ. до 0x100</option><option value=1024 selected>до 0x400</option><option value=4096>до 0x1000</option><option value=16384>до 0x4000</option></select><button onclick="hChain()">Искать</button></div>
+<div class=row><select id=hck><option value="player.chain">→ player.chain</option><option value="mob.list">→ mob.list</option><option value="block.chain">→ block.chain</option></select><button class=d onclick="api('hptr',{c:1})">Стоп</button></div>
+<small>Ищет путь от статики libminecraftpe.so к адресу цели (глубина = число указателей). Идёт в фоне, каждый уровень сканирует память. Для mob.list цель — ячейка массива с указателем на сущность; последнее смещение (на элемент) отрежется само.</small></div>
+<div id=hs_p style="display:none"><input id=hpe placeholder="адрес начала объекта (hex)"><input id=hpa placeholder="адрес поля, которое нужно (hex)">
+<div class=grid3><select id=hpd><option>1</option><option selected>2</option><option>3</option><option>4</option></select><select id=hpn><option value=256>окно 0x100</option><option value=512 selected>окно 0x200</option><option value=1024>окно 0x400</option></select><button onclick="hPath()">Искать</button></div>
+<div class=grid3><select id=hpk><option value="mob.f">mob.f</option><option value="block.f">block.f</option><option value="player.f">player.f</option></select><input id=hpl placeholder="название"><select id=hpt><option>float</option><option>int</option><option>byte</option><option>bool</option><option>str</option><option>hex</option></select></div>
+<small>От начала объекта ищет смещения до поля (HP, ник) через вложенные указатели. Результат записывается в конфиг кнопкой у строки.</small></div>
+<small id=hst></small><div id=hres></div></div>
+
 </div>
 
 <div class=pg id=pl style="display:none">
@@ -2325,7 +2616,36 @@ b.textContent=st=='1'?val:(st=='2'?'устарел':'—');if(st!='1')b.classNam
 if(k=='p'&&key.startsWith('p_')){const bt=document.createElement('button');bt.className='s';bt.title='Привязать';bt.innerHTML='<svg class=ic><use href="#i-link"/></svg>';bt.onclick=()=>call('csbind',{s:key,a:v('ma')}).then(wTick);r.appendChild(bt)}
 d.appendChild(r)}
 if(k=='p'&&stale&&Date.now()-W.lf>8000){W.lf=Date.now();api('csfind',{s:stale})}}
-fnl();libLoad();slotInit();
+let HS='s';
+function hs(x){HS=x;const ks=['s','n','c','p'];for(const k of ks)document.getElementById('hs_'+k).style.display=k==x?'':'none';document.querySelectorAll('#hseg button').forEach((b,i)=>b.className=ks[i]==x?'on':'');document.getElementById('hres').textContent='';document.getElementById('hst').textContent=''}
+function hRows(t,mk){const d=document.getElementById('hres');d.textContent='';const st=document.getElementById('hst');st.textContent='';
+for(const l of t.split('\n')){if(!l)continue;const c=l.split('\t');if(c[0]=='#'){st.textContent=c.slice(1).join(' · ');continue}const r=document.createElement('div');r.className='kv';mk(r,c);d.appendChild(r)}}
+function hTx(r,txt,col){const b=document.createElement('b');b.textContent=txt;b.style.textAlign='left';b.style.flex='1';b.style.fontSize='11px';if(col)b.style.color=col;r.appendChild(b);return b}
+function hBtn(r,txt,fn){const b=document.createElement('button');b.className='s';b.textContent=txt;b.style.width='auto';b.style.padding='0 8px';b.onclick=fn;r.appendChild(b)}
+function hSet(a){for(const i of ['ma','hna','hca','hpa'])document.getElementById(i).value=a;out.textContent='адрес '+a+' → в поля помощников'}
+async function hStr(){document.getElementById('hst').textContent='ищу…';const t=await api('hstr',{s:v('hsq'),all:v('hsa')});
+hRows(t,(r,c)=>{hTx(r,c[0]+'  '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0])})}
+async function hNear(){const a=v('hna')||v('ma');document.getElementById('hst').textContent='читаю…';const t=await api('hnear',{a:a,b:v('hnb'),n:v('hnc')});
+hRows(t,(r,c)=>{hTx(r,c[1]+'  '+c[2]+'  i='+c[3]+(c[4]?'  f='+c[4]:'')+(c[5]?'  '+c[5]:''),c[5]&&c[5].startsWith('→ lib')?'var(--hl)':'');r.style.cursor='pointer';r.onclick=()=>{document.getElementById('hpa').value=c[0];document.getElementById('ma').value=c[0];out.textContent='поле '+c[0]}})}
+let HT=null;
+async function hChain(){const a=v('hca');if(!a)return;clearInterval(HT);out.textContent=await api('hptr',{a:a,d:v('hcd'),o:v('hco')});
+const tick=async()=>{const t=await api('hptrst');const run=t.startsWith('#\tидёт');
+hRows(t,(r,c)=>{hTx(r,c[0]+'  ('+c[1]+')');hBtn(r,'в конфиг',async()=>{let ch=c[0];const key=v('hck');if(key=='mob.list'){const k=ch.split(',');if(k.length>1)ch=k.slice(0,-1).join(',')}out.textContent=await api('wcfgadd',{line:key+'|'+ch})})});
+if(!run)clearInterval(HT)};HT=setInterval(tick,1200);tick()}
+async function hPath(){document.getElementById('hst').textContent='ищу…';const t=await api('hpath',{e:v('hpe'),a:v('hpa'),d:v('hpd'),n:v('hpn')});
+hRows(t,(r,c)=>{hTx(r,c[0]);hBtn(r,'в конфиг',async()=>{out.textContent=await api('wcfgadd',{line:v('hpk')+'|'+(v('hpl')||'поле')+'|'+c[0]+'|'+v('hpt')})})})}
+const ZK={hp:['p_hp','Введи текущее HP как в игре (например 20) → «Искать». Получи урон или вылечись, введи новое → «Сузить». Повторяй, пока адресов 1–3.'],
+pos:['p_pos','В настройках мира включи «Показывать координаты». Введи X, Y, Z с экрана → «Искать» (поиск по X и Z). Пройди несколько шагов, введи новые → «Сузить».'],
+armor:['p_armor','Введи число очков брони (например 5) → «Искать». Надень или сними часть брони, введи новое → «Сузить».'],
+food:['p_food','Введи текущий голод (например 20) → «Искать». Проголодайся или поешь, введи новое → «Сузить».']};
+function zSet(){const k=v('zf');document.getElementById('zh').textContent=ZK[k][1];document.getElementById('zy').style.display=document.getElementById('zz').style.display=k=='pos'?'':'none'}
+async function zList(){document.getElementById('zs').textContent=(await api('mlist',{n:8})).trim()}
+async function zFirst(){const k=v('zf');document.getElementById('zs').textContent='ищу…';
+if(k=='pos'){await api('hscanf',{v:v('zx'),tol:0.02,all:0});await api('hrel',{off:8,v:v('zz'),tol:0.02})}else await api('hscanf',{v:v('zx'),tol:0.01,all:0});zList()}
+async function zNext(){const k=v('zf');if(k=='pos'){await api('hnextf',{v:v('zx'),tol:0.02});await api('hrel',{off:8,v:v('zz'),tol:0.02})}else await api('hnextf',{v:v('zx'),tol:0.01});zList()}
+async function zBind(){const k=v('zf');const l=(await api('mlist',{n:60})).split('\n').filter(x=>x.startsWith('0x'));const a=(l[(+v('zn')||1)-1]||'').split(/\s/)[0];
+if(!a){document.getElementById('zs').textContent='нет такого номера в списке';return}await call('csbind',{s:ZK[k][0],a:a});wTick()}
+fnl();libLoad();slotInit();zSet();
 </script></body></html>)MGG";
 
 
@@ -2340,6 +2660,7 @@ static Str route(const Str &path, const Params &q) {
     if (path == "wmob") return worldMob();
     if (path == "wblock") return worldBlock();
     if (path == "wcfg") return worldCfg();
+    { Str ho; if (helperRoute(path, q, ho)) return ho; }
     Img im;
     if (!loadImg(im)) return "библиотека " + g_lib + " не найдена в /proc/self/maps (выбери другую во вкладке Lib)\n";
     uintptr_t a = 0;
