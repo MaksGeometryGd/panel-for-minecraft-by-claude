@@ -1809,8 +1809,24 @@ static Str hNear(uintptr_t a, size_t before, size_t after) {
 struct PNode { uintptr_t addr, off; int par; };
 static std::mutex g_pm; static bool g_prun = false, g_pcancel = false; static Str g_pstat, g_pres;
 
+// .bss библиотеки лежит анонимной областью сразу за её сегментами (в maps без имени файла): для цепочек это тоже статика
+static void addBss(Img &im) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f || im.segs.empty()) { if (f) fclose(f); return; }
+    char line[1024]; uintptr_t end = 0;
+    for (const Seg &g : im.segs) if (g.w && g.e > end) end = g.e;
+    while (end && fgets(line, sizeof line, f)) {
+        unsigned long s, e; char perms[8] = {0}; Str path;
+        if (!mapLine(line, s, e, perms, path) || (uintptr_t)s != end || perms[1] != 'w') continue;
+        if (!path.empty() && path != "[anon:.bss]") break;
+        im.segs.push_back({(uintptr_t)s, (uintptr_t)e, true, true, false});
+        end = (uintptr_t)e;
+    }
+    fclose(f);
+}
+
 static void hPtrWorker(uintptr_t T, int depth, size_t maxoff, bool all) {
-    Img im; loadImg(im, MGG_TARGET_LIB);
+    Img im; loadImg(im, MGG_TARGET_LIB); addBss(im);
     const size_t PS = sizeof(void *);
     auto setS = [](const Str &s) { std::lock_guard<std::mutex> lk(g_pm); g_pstat = s; };
     struct Res { int lvl; uintptr_t sum; Str line; };
@@ -2636,7 +2652,7 @@ static Str dexRoute(const Str &path, const Params &q) {
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1"><title>MGG</title>
 <style>
-:root{--bg:#12141c;--card:#1a1d29;--card2:#232736;--line:#2b3043;--tx:#e9eaf0;--dim:#8d92a6;--ac:#85775a;--acTx:#fff;--hl:#f0b429;--ok:#4cc38a;--r:10px}
+:root{--bg:#12141c;--card:#1a1d29;--card2:#232736;--line:#2b3043;--tx:#e9eaf0;--dim:#8d92a6;--ac:#85775a;--acTx:#fff;--hl:#f0b429;--ok:#4cc38a;--er:#ff6b6b;--wr:#f0c040;--cf:#f0c040;--ci:#6cb6ff;--cl:#c792ea;--cp:#4dd0e1;--cs:#ffab70;--cz:#6b7088;--r:10px}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{font:13px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--tx);margin:0;padding:0 0 10px 64px}
 .ic{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px;flex:none}
@@ -2655,6 +2671,12 @@ aside .lg span{display:block;font-weight:400;color:var(--dim);font-size:9px;lett
 .tb button{margin:0;padding:0;flex:1;width:100%}
 #out{white-space:pre-wrap;word-break:break-all;background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:6px 9px;margin:0;flex:1;min-width:0;max-height:22vh;min-height:40px;overflow:auto;font:11px/1.35 ui-monospace,monospace;color:var(--tx)}
 #out.big{max-height:60vh}
+#out .ok{color:var(--ok)}#out .er{color:var(--er)}#out .wr{color:var(--wr)}
+#out .ad{color:var(--cp)}#out .st{color:var(--cs)}#out .dm{color:var(--cz)}
+#out .m1{color:var(--cl)}#out .m2{color:var(--cs)}#out .m3{color:var(--cp)}#out .m4{color:var(--ci)}#out .m5{color:var(--cf)}
+#out div{min-height:1em}
+.lgd{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:10px;margin:4px 0}
+.lgd i{font-style:normal;font-weight:600}
 .row{display:flex;gap:5px;margin-top:5px}.row>*{flex:1;min-width:0}
 .pg{padding:0 8px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:9px;margin:7px 0}
@@ -2753,25 +2775,22 @@ small{color:var(--dim);display:block;margin-top:4px}
 <small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
 </div>
 
-<div class=pg id=pw style="display:none">
-<div class=seg><button id=wsp class=on onclick="wsub('p')">Player</button><button id=wsm onclick="wsub('m')">Mob</button><button id=wsb onclick="wsub('b')">Block</button></div>
-<div class=card id=wp><h3><svg class=ic><use href="#i-eye"/></svg>Игрок</h3><small id=wtp>…</small><div id=wlp></div>
-<small>Привязка: вкладка Mem → найди значение (HP — float 20) → сузь поиск → нажми значок-ссылку у строки (адрес берётся из поля Mem или единственный найденный). Позиция: привяжи X, Y и Z идут следом. После перезапуска адреса находятся сами.</small></div>
-<details class=card id=wz><summary><svg class=ic><use href="#i-search"/></svg>Мастер: найти игрока<svg class=ic><use href="#i-plus"/></svg></summary><div style="padding:0 9px 9px">
+<div class=pg id=pm style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-search"/></svg>Найти оффсет</h3>
+<div class=row><input id=ov placeholder="значение сейчас (например 20)" inputmode=decimal><select id=ot style="flex:.6"><option value=f>float</option><option value=i>int</option></select></div>
+<button id=ob1 onclick="ofStart()"><svg class=ic><use href="#i-search"/></svg>Найти оффсет</button>
+<div id=ostep style="display:none">
+<div class=grid2><button onclick="ofNext()">Изменил → сузить</button><button class=s onclick="ofSame()">Не менял → отсеять шум</button></div></div>
+<div class=grid2 style="margin-top:5px"><button class=s onclick="ofChains()">Цепочки заново</button><button class=d onclick="ofReset()">Сброс</button></div>
+<small id=omsg>Введи значение, как оно сейчас в игре. Дальше панель скажет, что делать.</small><div id=ores></div>
+<small>Глубина и макс. смещение берутся из «Помощники поиска → Цепочка». Нажми на строку: цепочка скопируется.</small></div>
+<details class=card id=wz><summary><svg class=ic><use href="#i-search"/></svg>Мастер: найти HP / позицию / броню / голод<svg class=ic><use href="#i-plus"/></svg></summary><div style="padding:0 9px 9px">
 <select id=zf onchange="zSet()"><option value=hp>Здоровье</option><option value=pos>Позиция</option><option value=armor>Броня</option><option value=food>Голод</option></select>
 <small id=zh></small>
 <div class=row><input id=zx placeholder="значение (X)" inputmode=decimal><input id=zy placeholder="Y" inputmode=decimal style="display:none"><input id=zz placeholder="Z" inputmode=decimal style="display:none"></div>
 <div class=grid2><button onclick="zFirst()">1. Искать</button><button class=s onclick="zNext()">2. Сузить</button></div>
 <div class=row><input id=zn value=1 inputmode=numeric placeholder="№ в списке"><button class=g onclick="zBind()"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
 <pre id=zs style="white-space:pre-wrap;font:11px/1.35 ui-monospace,monospace;margin:6px 0 0"></pre></div></details>
-<div class=card id=wm style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Ближайший моб</h3><small id=wtm>…</small><div id=wlm></div>
-<small>Настройка: Mem → Помощники (строки → соседи → путь → цепочка), результат пишется в конфиг кнопками у строк.</small>
-<button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
-<div class=card id=wb style="display:none"><h3><svg class=ic><use href="#i-eye"/></svg>Последний блок</h3><small id=wtb>…</small><div id=wlb></div>
-<button class=s onclick="call('wcfg',{})"><svg class=ic><use href="#i-file"/></svg>Конфиг</button></div>
-</div>
-
-<div class=pg id=pm style="display:none">
 <div class=card><h3><svg class=ic><use href="#i-search"/></svg>Поиск значения</h3>
 <input id=mv placeholder="значение (например 13)" inputmode=decimal>
 <div class=grid2><select id=mt><option value=4>int 4 байта</option><option value=f>float</option><option value=2>2 байта</option><option value=1>1 байт</option></select>
@@ -2780,7 +2799,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=grid3 style="margin-top:6px"><button class=s onclick="call('mnext',{m:'eq',v:v('mv')})"><svg class=ic><use href="#i-eq"/></svg>= значение</button><button class=s onclick="call('mnext',{m:'inc'})"><svg class=ic><use href="#i-up"/></svg>выросло</button><button class=s onclick="call('mnext',{m:'dec'})"><svg class=ic><use href="#i-down"/></svg>уменьшилось</button>
 <button class=s onclick="call('mnext',{m:'same'})"><svg class=ic><use href="#i-eq"/></svg>не менялось</button><button class=s onclick="call('mnext',{m:'chg'})"><svg class=ic><use href="#i-reset"/></svg>менялось</button><button class=s onclick="call('mreset',{})"><svg class=ic><use href="#i-trash"/></svg>сброс</button></div>
 <button class=s style="margin-top:6px" onclick="mList()"><svg class=ic><use href="#i-list"/></svg>Список найденных</button>
-<small id=mlst></small><div id=mlres></div></div>
+<div class=lgd><i style="color:var(--cf)">■ float</i><i style="color:var(--ci)">■ int</i><i style="color:var(--cz)">■ 0</i><i style="color:var(--er)">■ не читается</i></div><small id=mlst></small><div id=mlres></div></div>
 <div class=card><h3><svg class=ic><use href="#i-snow"/></svg>Запись и заморозка</h3>
 <input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
 <button class=s onclick="qvT()"><svg class=ic><use href="#i-bolt"/></svg>Быстрые значения<svg class=ic><use href="#i-plus"/></svg></button>
@@ -2794,12 +2813,15 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=card><h3><svg class=ic><use href="#i-eye"/></svg>Монитор адреса</h3>
 <div class=grid3><button onclick="call('mwatch',{a:v('ma'),...ty()})"><svg class=ic><use href="#i-start"/></svg>Старт</button><button class=s onclick="call('mwlog',{})"><svg class=ic><use href="#i-list"/></svg>Журнал</button><button class=d onclick="call('mwstop',{})"><svg class=ic><use href="#i-stop"/></svg>Стоп</button></div>
 <small>Показывает, когда и как меняется значение по адресу из поля выше.</small>
+<span class=lb>Авто-чекер</span>
+<div class=seg id=acseg><button class=on onclick="acSet(0,this)">выкл</button><button onclick="acSet(1,this)">1с</button><button onclick="acSet(5,this)">5с</button></div>
+<div id=acv class=lv></div><div id=aclog class=lv style="color:var(--dim);white-space:pre-wrap"></div>
 <div class=row><input id=mn placeholder="байт (128)"><button class=s onclick="call('mdump',{a:v('ma'),n:v('mn')||128})"><svg class=ic><use href="#i-hex"/></svg>Hex</button></div></div>
 <div class=card><h3><svg class=ic><use href="#i-search"/></svg>Помощники поиска</h3>
 <div class=seg id=hseg><button class=on onclick="hs('s')">Строки</button><button onclick="hs('n')">Соседи</button><button onclick="hs('c')">Цепочка</button><button onclick="hs('p')">Путь</button></div>
 <div id=hs_s><input id=hsq placeholder="текст, например zombie или ник"><div class=row><select id=hsa><option value=0>куча</option><option value=1>вся rw-память</option></select><button onclick="hStr()"><svg class=ic><use href="#i-search"/></svg>Найти</button></div>
 <small>Ищет текст в памяти игры (ник, имя моба, id блока). Нажми на результат: адрес подставится в остальные вкладки. Глаз справа показывает значение по этому адресу вживую.</small></div>
-<div id=hs_n style="display:none"><input id=hna placeholder="адрес (hex), пусто = из поля адреса выше"><div class=row><input id=hnb value=64 inputmode=numeric placeholder="назад, байт"><input id=hnc value=192 inputmode=numeric placeholder="вперёд, байт"><button onclick="hNear()">Показать</button></div>
+<div id=hs_n style="display:none"><div class=lgd><i style="color:var(--cf)">■ float</i><i style="color:var(--ci)">■ int</i><i style="color:var(--cl)">→ lib</i><i style="color:var(--cp)">→ память</i><i style="color:var(--cs)">■ текст</i><i style="color:var(--cz)">■ 0</i></div><input id=hna placeholder="адрес (hex), пусто = из поля адреса выше"><div class=row><input id=hnb value=64 inputmode=numeric placeholder="назад, байт"><input id=hnc value=192 inputmode=numeric placeholder="вперёд, байт"><button onclick="hNear()">Показать</button></div>
 <small>Показывает, что лежит в памяти вокруг адреса: числа (int / float), ссылки на другие места и текст. Так видно, где рядом HP, координаты и т.д. Жёлтые строки — ссылки внутрь libminecraftpe.so (часто это начало объекта). Нажми на строку: адрес уйдёт в «Путь».</small></div>
 <div id=hs_c style="display:none"><input id=hca placeholder="адрес цели (hex)"><div class=grid3><select id=hcd><option>1</option><option>2</option><option selected>3</option><option>4</option></select><select id=hco><option value=256>смещ. до 0x100</option><option value=1024 selected>до 0x400</option><option value=4096>до 0x1000</option><option value=16384>до 0x4000</option></select><button onclick="hChain()">Искать</button></div>
 <div class=row><select id=hck><option value="player.chain">→ player.chain</option><option value="mob.list">→ mob.list</option><option value="block.chain">→ block.chain</option></select><button class=d onclick="api('hptr',{c:1})">Стоп</button></div>
@@ -2904,7 +2926,6 @@ small{color:var(--dim);display:block;margin-top:4px}
 </div>
 <aside><div class=lg>MGG<span>panel</span></div>
 <button id=bn class="nav on" onclick="tab('n')"><span class=bx><svg class=ic><use href="#i-bolt"/></svg></span>Функции</button>
-<button id=bw class=nav onclick="tab('w')"><span class=bx><svg class=ic><use href="#i-globe"/></svg></span>World</button>
 <button id=bm class=nav onclick="tab('m')"><span class=bx><svg class=ic><use href="#i-mem"/></svg></span>Mem</button>
 <button id=bl class=nav onclick="tab('l')"><span class=bx><svg class=ic><use href="#i-lib"/></svg></span>Lib</button>
 <button id=bd class=nav onclick="tab('d')"><span class=bx><svg class=ic><use href="#i-dex"/></svg></span>Dex</button>
@@ -2913,8 +2934,34 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button></aside>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){for(const k of ['n','w','m','l','d','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
-clearInterval(W.t);W.t=null;if(x=='w'){wsub(W.sub);W.t=setInterval(wTick,800)}if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='d'&&!window.dxOnce){window.dxOnce=1;dexList()}if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
+const ERR=/не найден|не найдено|не найдена|ошибк|не удал|не читается|не могу|нужен |нужно |нужны |неверн|неизвестн|вне читаем|вне сегмент|не подход|слишком|нет такого|не совпал|не нашёл|ненадёжна|не привязано|не запускался|список пуст|нет привязки|нет ответа|ссылок не найдено|вызовов не найдено|заморозок нет|хуков нет|нет в процессе|патчей в этой сессии нет|сохранённых патчей нет|отключённых патчей нет|нет доступа|не папка|путь вне|не обычный|заморозка снята|запись не удалась|занят|сначала|нет описания|найдено: 0\b|осталось: 0\b|совпадений: 0\b|кандидатов: 0\b|только GET|bad request|mprotect|остановлено: |неправиль/i;
+const WRN=/внимание|лимит|частично|эвристик|опасно|устарел|другая версия|осторожн|только сейчас/i;
+const OKK=/^ok\b|включено:|выключено:|записано|заморожено|сохранён|сохранена|сохранены|привязано|откат|удален|снято|снят\b|заменено|добавлено|восстановлен|остановлен|слежу|выбрана:|создан|возвращены|блокировка снята|вставлен|в поля помощников|найдено: [1-9]|совпадений: [1-9]|осталось: [1-9]|поиск запущен|найдено путей|найдено цепочек|автопатч|готово|копия:|вхождений [^:]*: [1-9]/i;
+function cls(l){if(ERR.test(l))return 'er';if(WRN.test(l))return 'wr';if(OKK.test(l))return 'ok';return ''}
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function tok(l){return esc(l).replace(/(0x[0-9A-Fa-f]+)/g,'<span class=ad>$1</span>').replace(/("[^"]*"|«[^»]*»)/g,'<span class=st>$1</span>')}
+function mnc(x){x=x.replace(/\.w$/,'');
+if(/^(bl|blx)$/.test(x)||x=='b')return x=='b'?'m2':'m1';
+if(/^b(eq|ne|hs|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)$/.test(x)||/^cbn?z$/.test(x)||/^t(bb|bh)/.test(x))return 'm2';
+if(/^(push|pop|ldm|stm|ldmdb|stmdb)/.test(x))return 'm3';
+if(/^(ldr|str|vldr|vstr)/.test(x))return 'm4';
+if(/^(cmp|cmn|tst|teq|it[te]*|vcmp)/.test(x))return 'm5';
+if(/^(nop|bx|udf|bkpt|svc|\.hword|\.inst)/.test(x))return 'dm';
+return ''}
+function paintLine(l){
+let m;
+if((m=l.match(/^(0x[0-9a-f]{8})(\s+)([0-9a-f]{4}|[0-9a-f]{8})(\s+)(\S+)(.*)$/))&&!ERR.test(l)){const c=mnc(m[5]);
+return '<div><span class=ad>'+m[1]+'</span>'+m[2]+'<span class=dm>'+m[3]+'</span>'+m[4]+'<span class="'+c+'">'+esc(m[5])+'</span>'+tok(m[6]).replace(/(; \[0x[0-9a-f]+\]=0x[0-9a-f]+)/,'<span class=dm>$1</span>')+'</div>'}
+if((m=l.match(/^(0x[0-9A-Fa-f]+): ((?:[0-9A-F]{2} ?)+)$/))){
+return '<div><span class=ad>'+m[1]+'</span>: '+m[2].replace(/([0-9A-F]{2})/g,x=>x=='00'?'<span class=dm>00</span>':x)+'</div>'}
+const c=cls(l);if(c)return '<div class='+c+'>'+esc(l)+'</div>';
+return '<div>'+tok(l)+'</div>'}
+let RAW='';
+function paint(t){out.innerHTML=t.replace(/\n$/,'').split('\n').map(paintLine).join('')}
+Object.defineProperty(out,'textContent',{configurable:true,get(){return RAW},set(v){RAW=String(v);paint(RAW)}});
+function paintEl(el,t){el.textContent=t;const c=cls(t);el.style.color=c=='er'?'var(--er)':c=='ok'?'var(--ok)':c=='wr'?'var(--wr)':''}
+function tab(x){for(const k of ['n','m','l','d','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
+if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='d'&&!window.dxOnce){window.dxOnce=1;dexList()}if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
 function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
 async function api(p,o){const q=new URLSearchParams(o||{});q.set('t',T);try{return await(await fetch('/api/'+p+'?'+q)).text()}catch(e){return ''}}
@@ -2943,10 +2990,12 @@ document.getElementById('lsub').textContent=cur?(cur.b+' bit · '+cur.d):'нет
 for(const k of ['m','c','o'])document.getElementById('lg'+k).className=LB.grp==k?'on':'';
 const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.g==LB.grp);
 const nm={m:'Minecraft',c:'Кастомные',o:'Другое'}[LB.grp];
-document.getElementById('lnote').textContent=nm+': '+L.length+(LB.grp=='c'?' (не из игры, но лежат в её папке библиотек)':LB.grp=='m'?' (игра и её библиотеки)':' (система, графика, звук)');
-for(const x of L){const row=document.createElement('div');row.className='fn';const n=document.createElement('div');n.className='nm';n.textContent=x.n;
+document.getElementById('lnote').innerHTML='<span class=lgd><i style="color:var(--cf)">■ Minecraft</i><i style="color:var(--cl)">■ кастомные</i><i style="color:var(--cz)">■ другое / не загружена</i><i style="color:var(--ci)">■ 32 bit</i><i style="color:var(--er)">■ 64 bit</i></span><br>'+nm+': '+L.length+(LB.grp=='c'?' (не из игры, но лежат в её папке библиотек)':LB.grp=='m'?' (игра и её библиотеки)':' (система, графика, звук)');
+for(const x of L){const row=document.createElement('div');row.className='fn';const n=document.createElement('div');n.className='nm';const ttl=document.createElement('span');ttl.textContent=x.n;n.appendChild(ttl);
 const sub=document.createElement('div');sub.className='sub';sub.textContent=x.b+' bit · '+x.d+' · '+x.sz;n.appendChild(sub);
 const sw=document.createElement('div');sw.className='sw'+(x.on?' on':'');
+const gc={m:'var(--cf)',c:'var(--cl)',o:'var(--cz)'}[x.g]||'var(--cz)';row.style.borderLeft='4px solid '+(x.ld?gc:'var(--cz)');n.firstChild.style.color=x.ld?gc:'var(--cz)';
+if(x.b==64){sub.style.color='var(--er)'}else if(x.ld){sub.style.color='var(--ci)'}
 if(x.ld)row.onclick=()=>libSel(x.n);else{row.style.opacity='.55';sw.style.display='none'}
 row.appendChild(n);row.appendChild(sw);d.appendChild(row)}
 document.getElementById('pbs32').style.display=LB.selBits==64?'none':'';document.getElementById('pbs64').style.display=LB.selBits==64?'':'none'}
@@ -2980,22 +3029,12 @@ c.innerHTML=`<h3><svg class=ic><use href="#i-eye"/></svg>${x.t}</h3><div class=r
 <details style="margin-top:6px"><summary style="cursor:pointer;color:var(--dim);font-size:11px">Адрес и привязка</summary>
 <div class=row><input id=ba_${x.s} placeholder="адрес (hex) или пусто"><button class=s onclick="slB('${x.s}')"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
 <button class=s style="margin-top:5px" onclick="call('csexport',{s:'${x.s}'})">Экспорт привязки</button><small>${x.h}</small></details>`;d.appendChild(c)}slRefresh()}
-async function slRefresh(){for(const x of SL){const e=document.getElementById('st_'+x.s);if(e)e.textContent=(await api('csst',{s:x.s})).trim()}}
+async function slRefresh(){for(const x of SL){const e=document.getElementById('st_'+x.s);if(e)paintEl(e,(await api('csst',{s:x.s})).trim())}}
 async function slA(s){const st=document.getElementById('st_'+s).textContent;if(st.startsWith('не привязано')&&v('ba_'+s))await call('csbind',{s:s,a:v('ba_'+s)});await call('csapply',{s:s,v:v('r_'+s)});slRefresh()}
 async function slS(s){await call('csstop',{s:s});slRefresh()}
 async function slB(s){await call('csbind',{s:s,a:v('ba_'+s)||v('ma')});slRefresh()}
 async function optPath(){let p=v('op');if(p)return p;const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m){document.getElementById('op').value=m.trim();return m.trim()}return''}
 async function slO(s){const x=SL.find(y=>y.s==s);const p=await optPath();if(!p)return;call('setkey',{p:p,k:x.opt,v:v('r_'+s)})}
-const W={sub:'p',t:null,busy:0,lf:0};
-function wsub(x){W.sub=x;for(const k of ['p','m','b']){document.getElementById('w'+k).style.display=k==x?'':'none';document.getElementById('ws'+k).className=k==x?'on':''}wTick()}
-async function wTick(){if(W.busy)return;W.busy=1;try{wRender(W.sub,await api({p:'wplayer',m:'wmob',b:'wblock'}[W.sub]))}finally{W.busy=0}}
-function wRender(k,t){let h='',stale='';const rows=[];for(const l of t.split('\n')){if(!l)continue;if(l[0]=='#'){const a=l.split('\t');if(a[0]=='#stale')stale=a[1];else h=a[1]||'';continue}rows.push(l.split('\t'))}
-document.getElementById('wt'+k).textContent=h;const d=document.getElementById('wl'+k);d.textContent='';
-for(const [key,lab,val,st] of rows){const r=document.createElement('div');r.className='kv';const a=document.createElement('span');a.textContent=lab;const b=document.createElement('b');
-b.textContent=st=='1'?val:(st=='2'?'устарел':'—');if(st!='1')b.className='no';r.appendChild(a);r.appendChild(b);
-if(k=='p'&&key.startsWith('p_')){const bt=document.createElement('button');bt.className='s';bt.title='Привязать';bt.innerHTML='<svg class=ic><use href="#i-link"/></svg>';bt.onclick=()=>call('csbind',{s:key,a:v('ma')}).then(wTick);r.appendChild(bt)}
-d.appendChild(r)}
-if(k=='p'&&stale&&Date.now()-W.lf>8000){W.lf=Date.now();api('csfind',{s:stale})}}
 let HS='s';
 function hs(x){HS=x;const ks=['s','n','c','p'];for(const k of ks)document.getElementById('hs_'+k).style.display=k==x?'':'none';document.querySelectorAll('#hseg button').forEach((b,i)=>b.className=ks[i]==x?'on':'');document.getElementById('hres').textContent='';document.getElementById('hst').textContent=''}
 function hRender(box,stId,t,mk,per){per=per||40;const d=document.getElementById(box);d.textContent='';const st=document.getElementById(stId);st.textContent='';const rows=[];
@@ -3016,28 +3055,36 @@ if(!ks.length){clearInterval(EYT);EYT=null;return}
 const t=await api('hval',{a:ks.slice(0,80).join(',')});for(const l of t.split('\n')){const c=l.split('\t');if(EY[c[0]])EY[c[0]].textContent=c[1]=='?'?'не читается':'0x'+c[1]+'   int '+c[2]+(c[3]?'   float '+c[3]:'')+(c[4]?'   «'+c[4]+'»':'')}}
 async function mList(){document.getElementById('mlst').textContent='читаю…';const t=await api('mlist',{n:1000});const o=[];
 for(const l of t.split('\n')){if(!l)continue;const m=l.match(/^(0x[0-9A-Fa-f]+)\s+=\s+(.*)$/);o.push(m?m[1]+'\t'+m[2]:'#\t'+l)}
-hRender('mlres','mlst',o.join('\n'),(r,c)=>{hTx(r,c[0]+'   =   '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])},50)}
+const isf=/float/.test(t.split('\n')[0]);
+hRender('mlres','mlst',o.join('\n'),(r,c)=>{hTx(r,c[0]+'   =   '+c[1],c[1]=='?'?'var(--er)':isf?'var(--cf)':(c[1]=='0'?'var(--cz)':'var(--ci)'));r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])},50)}
 async function dexList(){const t=await api('dexlist');const ls=t.split('\n').filter(x=>x);const sel=document.getElementById('dxf');const inf=document.getElementById('dxi');
 if(!ls.length){inf.textContent='нет ответа';return}
 const h=ls[0].split('\t');if(h[0]!='#'||ls.length==1){inf.textContent=h[1]||'';return}
 inf.textContent='APK: '+h[1];sel.textContent='';const al=document.createElement('option');al.value='all';al.textContent='все classes';sel.appendChild(al);
 for(const l of ls.slice(1)){const c=l.split('\t');const o=document.createElement('option');o.value=c[0];o.textContent=c[0]+' ('+Math.round(c[1]/1024)+' КБ)';sel.appendChild(o)}}
 async function dexFind(){document.getElementById('dxs').textContent='ищу…';const t=await api('dexfind',{q:v('dxq'),f:v('dxf'),m:v('dxm'),ci:v('dxc')});
-hRender('dxr','dxs',t,(r,c)=>{hTx(r,c[0].replace('.dex','')+'  #'+c[1]+'   '+c[2]);r.style.cursor='pointer';r.onclick=async()=>{out.textContent=await api('dexctx',{f:c[0],i:c[1],n:6})}},50)}
+hRender('dxr','dxs',t,(r,c)=>{hTx(r,c[0].replace('.dex','')+'  #'+c[1]+'   '+c[2],'var(--cs)');r.style.cursor='pointer';r.onclick=async()=>{out.textContent=await api('dexctx',{f:c[0],i:c[1],n:6})}},50)}
 function hTx(r,txt,col){const b=document.createElement('b');b.textContent=txt;b.style.textAlign='left';b.style.flex='1';b.style.fontSize='11px';if(col)b.style.color=col;r.appendChild(b);return b}
 function hBtn(r,txt,fn){const b=document.createElement('button');b.className='s';b.textContent=txt;b.style.width='auto';b.style.padding='0 8px';b.onclick=fn;r.appendChild(b)}
 function hSet(a){for(const i of ['ma','hna','hca','hpa'])document.getElementById(i).value=a;out.textContent='адрес '+a+' → в поля помощников'}
 async function hStr(){document.getElementById('hst').textContent='ищу…';const t=await api('hstr',{s:v('hsq'),all:v('hsa')});
-hRows(t,(r,c)=>{hTx(r,c[0]+'  '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])})}
+hRows(t,(r,c)=>{hTx(r,c[0]+'  '+c[1],'var(--cs)');r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])})}
+function nearCol(c){const note=c[5]||'',fl=c[4],hw=c[2];
+if(note.startsWith('→ lib'))return 'var(--cl)';
+if(note.startsWith('→ память'))return note.indexOf('«')>=0?'var(--cs)':'var(--cp)';
+if(note.startsWith('«'))return 'var(--cs)';
+if(hw=='00000000')return 'var(--cz)';
+if(fl)return 'var(--cf)';
+return 'var(--ci)'}
 async function hNear(){const a=v('hna')||v('ma');document.getElementById('hst').textContent='читаю…';const t=await api('hnear',{a:a,b:v('hnb'),n:v('hnc')});
-hRows(t,(r,c)=>{hTx(r,c[1]+'  '+c[2]+'  i='+c[3]+(c[4]?'  f='+c[4]:'')+(c[5]?'  '+c[5]:''),c[5]&&c[5].startsWith('→ lib')?'var(--hl)':'');r.style.cursor='pointer';r.onclick=()=>{document.getElementById('hpa').value=c[0];document.getElementById('ma').value=c[0];out.textContent='поле '+c[0]}})}
+hRows(t,(r,c)=>{hTx(r,c[1]+'  '+c[2]+'  i='+c[3]+(c[4]?'  f='+c[4]:'')+(c[5]?'  '+c[5]:''),nearCol(c));r.style.cursor='pointer';r.onclick=()=>{document.getElementById('hpa').value=c[0];document.getElementById('ma').value=c[0];out.textContent='поле '+c[0]}})}
 let HT=null;
 async function hChain(){const a=v('hca');if(!a)return;clearInterval(HT);out.textContent=await api('hptr',{a:a,d:v('hcd'),o:v('hco')});
 const tick=async()=>{const t=await api('hptrst');const run=t.startsWith('#\tидёт');
-hRows(t,(r,c)=>{hTx(r,c[0]+'  ('+c[1]+')');hBtn(r,'в конфиг',async()=>{let ch=c[0];const key=v('hck');if(key=='mob.list'){const k=ch.split(',');if(k.length>1)ch=k.slice(0,-1).join(',')}out.textContent=await api('wcfgadd',{line:key+'|'+ch})})});
+hRows(t,(r,c)=>{hTx(r,c[0]+'  ('+c[1]+')','var(--cl)');hBtn(r,'в конфиг',async()=>{let ch=c[0];const key=v('hck');if(key=='mob.list'){const k=ch.split(',');if(k.length>1)ch=k.slice(0,-1).join(',')}out.textContent=await api('wcfgadd',{line:key+'|'+ch})})});
 if(!run)clearInterval(HT)};HT=setInterval(tick,1200);tick()}
 async function hPath(){document.getElementById('hst').textContent='ищу…';const t=await api('hpath',{e:v('hpe'),a:v('hpa'),d:v('hpd'),n:v('hpn')});
-hRows(t,(r,c)=>{hTx(r,c[0]);hBtn(r,'в конфиг',async()=>{out.textContent=await api('wcfgadd',{line:v('hpk')+'|'+(v('hpl')||'поле')+'|'+c[0]+'|'+v('hpt')})})})}
+hRows(t,(r,c)=>{hTx(r,c[0],'var(--cp)');hBtn(r,'в конфиг',async()=>{out.textContent=await api('wcfgadd',{line:v('hpk')+'|'+(v('hpl')||'поле')+'|'+c[0]+'|'+v('hpt')})})})}
 const ZK={hp:['p_hp','Введи текущее HP как в игре (например 20) → «Искать». Получи урон или вылечись, введи новое → «Сузить». Повторяй, пока адресов 1–3.'],
 pos:['p_pos','В настройках мира включи «Показывать координаты». Введи X, Y, Z с экрана → «Искать» (поиск по X и Z). Пройди несколько шагов, введи новые → «Сузить».'],
 armor:['p_armor','Введи число очков брони (например 5) → «Искать». Надень или сними часть брони, введи новое → «Сузить».'],
@@ -3048,7 +3095,67 @@ async function zFirst(){const k=v('zf');document.getElementById('zs').textConten
 if(k=='pos'){await api('hscanf',{v:v('zx'),tol:0.02,all:0});await api('hrel',{off:8,v:v('zz'),tol:0.02})}else await api('hscanf',{v:v('zx'),tol:0.01,all:0});zList()}
 async function zNext(){const k=v('zf');if(k=='pos'){await api('hnextf',{v:v('zx'),tol:0.02});await api('hrel',{off:8,v:v('zz'),tol:0.02})}else await api('hnextf',{v:v('zx'),tol:0.01});zList()}
 async function zBind(){const k=v('zf');const l=(await api('mlist',{n:60})).split('\n').filter(x=>x.startsWith('0x'));const a=(l[(+v('zn')||1)-1]||'').split(/\s/)[0];
-if(!a){document.getElementById('zs').textContent='нет такого номера в списке';return}await call('csbind',{s:ZK[k][0],a:a});wTick()}
+if(!a){document.getElementById('zs').textContent='нет такого номера в списке';return}await call('csbind',{s:ZK[k][0],a:a});zList()}
+const OF={gen:0,n:0,busy:false,t:'f'};
+const sleepMs=ms=>new Promise(r=>setTimeout(r,ms));
+function ofMsg(t){paintEl(document.getElementById('omsg'),t)}
+function ofShowStep(on){document.getElementById('ostep').style.display=on?'':'none'}
+async function ofList(){const t=await api('mlist',{n:3});const m=t.match(/кандидатов: (\d+)/);
+return{n:m?+m[1]:0,a:t.split('\n').filter(x=>x.startsWith('0x')).map(x=>x.split(/\s/)[0])}}
+async function ofRun(fn){if(OF.busy)return;OF.busy=true;try{await fn()}finally{OF.busy=false}}
+function ofVal(){const x=v('ov').replace(',','.');if(x===''||!isFinite(+x)){ofMsg('нужно число');return null}
+if(OF.t=='i'&&!Number.isInteger(+x)){ofMsg('нужно целое число или выбери float');return null}return x}
+async function ofStart(){await ofRun(async()=>{OF.t=v('ot');const x=ofVal();if(x===null)return;const g=++OF.gen;
+await api('hptr',{c:1});document.getElementById('ores').textContent='';ofShowStep(false);ofMsg('ищу…');
+const r=OF.t=='f'?await api('hscanf',{v:x,tol:0.01,all:0}):await api('mscan',{v:x,sz:4,f:0,all:0});
+if(g!=OF.gen)return;if(!r){ofMsg('нет ответа от панели');return}if(r.startsWith('слишком')){ofMsg(r.trim());return}
+await ofAfter(g)})}
+async function ofNext(){await ofRun(async()=>{const x=ofVal();if(x===null)return;const g=OF.gen;ofMsg('сужаю…');
+const r=OF.t=='f'?await api('hnextf',{v:x,tol:0.01}):await api('mnext',{m:'eq',v:x});
+if(g!=OF.gen)return;if(!r){ofMsg('нет ответа от панели');return}await ofAfter(g)})}
+async function ofSame(){await ofRun(async()=>{const g=OF.gen;ofMsg('отсеиваю…');const r=await api('mnext',{m:'same'});
+if(g!=OF.gen)return;if(!r){ofMsg('нет ответа от панели');return}await ofAfter(g)})}
+async function ofAfter(g){const l=await ofList();if(g!=OF.gen)return;OF.n=l.n;
+if(!l.n){ofShowStep(false);ofMsg('найдено: 0. Проверь значение и тип (float / int), потом «Найти оффсет» заново');return}
+if(l.n>3){ofShowStep(true);ofMsg('осталось: '+l.n+'. Измени значение в игре (получи урон, поешь, сними броню), впиши новое и нажми «Изменил → сузить»');return}
+ofShowStep(true);await ofSearch(g,l.a)}
+async function ofChains(){await ofRun(async()=>{const g=OF.gen;const l=await ofList();
+if(!l.n||l.n>3){ofMsg('сначала сузь поиск до 1–3 адресов (сейчас '+l.n+')');return}await ofSearch(g,l.a)})}
+function ofRow(txt,col,copy){const r=document.createElement('div');r.className='kv';hTx(r,txt,col);
+if(copy){r.style.cursor='pointer';r.onclick=()=>{document.getElementById('ma').value=copy.a;out.textContent=copy.c;cp();out.textContent='скопировано: '+copy.c}}
+document.getElementById('ores').appendChild(r);return r}
+async function ofSearch(g,addrs){document.getElementById('ores').textContent='';let total=0;
+for(let i=0;i<addrs.length;i++){const a=addrs[i];let s='';
+for(let k=0;k<40;k++){s=await api('hptr',{a:a,d:v('hcd'),o:v('hco')});if(g!=OF.gen)return;if(!s.startsWith('поиск уже идёт'))break;ofMsg('жду, пока закончится другой поиск…');await sleepMs(500)}
+if(!s.startsWith('поиск запущен')){ofMsg('ошибка: '+(s.trim()||'нет ответа'));return}
+let t='';let miss=0;
+for(;;){await sleepMs(1000);t=await api('hptrst');if(g!=OF.gen)return;
+if(!t){if(++miss>10){ofMsg('нет ответа от панели');return}continue}miss=0;
+const h=t.split('\n')[0].split('\t');if(h[1]!='идёт')break;ofMsg('ищу цепочку '+(i+1)+' из '+addrs.length+': '+(h[2]||''))}
+const ls=t.split('\n');const st=(ls[0].split('\t')[2]||'');const ch=ls.slice(1).filter(x=>x);
+hEye(ofRow('адрес '+a,'var(--cp)'),a);
+if(!ch.length)ofRow(st,'var(--wr)');
+for(const l of ch.slice(0,8)){const c=l.split('\t');const p=c[0].split(',');total++;
+ofRow(c[0]+(p.length>1?'   поле +0x'+p[p.length-1]:'')+'   ('+c[1]+')','var(--cl)',{a:a,c:c[0]})}}
+ofMsg(total?'найдено цепочек: '+total+'. Это кандидаты: перезапусти игру и проверь, какая всё ещё ведёт к значению':'цепочек до статики не найдено: увеличь глубину или смещение в «Цепочка» и нажми «Цепочки заново»')}
+async function ofReset(){OF.gen++;ofShowStep(false);document.getElementById('ores').textContent='';
+await api('hptr',{c:1});await api('mreset');ofMsg('сброшено')}
+
+const AC={sec:0,timer:null,gen:0,a:'',prev:null,log:[]};
+function acSet(sec,btn){for(const b of document.querySelectorAll('#acseg button'))b.className=b==btn?'on':'';
+clearTimeout(AC.timer);AC.sec=sec;AC.gen++;AC.a='';AC.prev=null;AC.log=[];
+document.getElementById('aclog').textContent='';document.getElementById('acv').textContent='';if(sec)acTick(AC.gen)}
+function acFmt(c){const t=v('mt');const u=parseInt(c[1],16);if(t=='f')return c[3]||'0x'+c[1];
+if(t=='1')return String(u&255);if(t=='2')return String(u<<16>>16);return c[2]}
+async function acTick(g){const a=v('ma');const box=document.getElementById('acv');
+if(!a)box.textContent='впиши адрес в поле «адрес (hex)»';
+else{const t=await api('hval',{a:a});if(g!=AC.gen)return;const c=t.split('\n')[0].split('\t');
+if(c.length<4||c[1]=='?')box.textContent=a+': не читается';
+else{const key=a+'|'+v('mt');if(key!=AC.a){AC.a=key;AC.prev=null;AC.log=[]}
+const x=acFmt(c);const now=new Date().toLocaleTimeString();
+if(AC.prev!==null&&x!==AC.prev){AC.log.unshift(now+'  '+AC.prev+' → '+x);AC.log.length=Math.min(AC.log.length,8)}
+AC.prev=x;box.textContent=a+' = '+x+'   ('+now+')';document.getElementById('aclog').textContent=AC.log.join('\n')}}
+AC.timer=setTimeout(()=>acTick(g),AC.sec*1000)}
 fnl();libLoad();slotInit();zSet();
 </script></body></html>)MGG";
 
