@@ -1372,12 +1372,21 @@ static bool csSave(const CsSlot &s, const CsSig &sg) {
     for (const CsWord &c : sg.w) fprintf(f, "%d %X\n", (int)c.k, (unsigned)c.v);
     fclose(f); return true;
 }
+// Встроенные привязки: сюда вставляется текст «Экспорт привязки» (Функции → карточка → «Адрес и привязка» → «Экспорт»),
+// тогда функция работает с первого запуска без ручной привязки. Файл на устройстве, если он есть, главнее.
+static const char *kCsPreset[][2] = {{"chunk", ""}, {"fov", ""}};
+static bool csParse(const Str &txt, CsSig &sg) {
+    const char *p = txt.c_str(); int used = 0, tgt = 0, n = 0;
+    if (sscanf(p, "MGGCHUNK1 %d %d%n", &tgt, &n, &used) != 2 || n <= 0 || n >= 200 || tgt < 0 || tgt >= n) return false;
+    p += used; CsSig t; t.tgt = tgt;
+    for (int i = 0; i < n; i++) { int k = 0; unsigned v = 0; if (sscanf(p, " %d %x%n", &k, &v, &used) != 2 || k < 0 || k > 2) return false; p += used; t.w.push_back(CsWord{(uint8_t)k, (uint32_t)v}); }
+    sg = t; return true;
+}
 static bool csLoad(const CsSlot &s, CsSig &sg) {
-    FILE *f = fopen(csFile(s).c_str(), "r"); if (!f) return false;
-    int tgt = 0, n = 0; bool ok = fscanf(f, "MGGCHUNK1 %d %d", &tgt, &n) == 2 && n > 0 && n < 200 && tgt >= 0 && tgt < n;
-    CsSig t; t.tgt = tgt;
-    for (int i = 0; ok && i < n; i++) { int k = 0; unsigned v = 0; if (fscanf(f, "%d %x", &k, &v) != 2 || k < 0 || k > 2) ok = false; else t.w.push_back(CsWord{(uint8_t)k, (uint32_t)v}); }
-    fclose(f); if (ok) sg = t; return ok;
+    Str txt;
+    if (readFile(csFile(s), txt) && csParse(txt, sg)) return true;
+    for (auto &pr : kCsPreset) if (Str(pr[0]) == s.name && pr[1][0] && csParse(pr[1], sg)) return true;
+    return false;
 }
 // есть ли привязка (в памяти или в файле); вызывать под g_cm
 static bool csHas(CsSlot &s) {
@@ -1424,6 +1433,13 @@ static Str csRoute(const Str &path, const Params &q) {
         if (!s.msg.empty()) o += "\n" + s.msg;
         if (path == "csinfo" && s.a) o += "\nадрес: " + hx(s.a);
         return o + "\n";
+    }
+    if (path == "csexport") {
+        std::lock_guard<std::mutex> lk(g_cm);
+        if (!csHas(s)) return "нет привязки: сначала привяжи адрес\n";
+        Str o = Str("# привязка ") + s.name + ": пришли весь текст ниже\nMGGCHUNK1 " + std::to_string(s.sg.tgt) + " " + std::to_string(s.sg.w.size()) + "\n"; char t[32];
+        for (const CsWord &c : s.sg.w) { snprintf(t, sizeof t, "%d %X\n", (int)c.k, (unsigned)c.v); o += t; }
+        return o;
     }
     if (path == "csbind") {
         uintptr_t a = 0;
@@ -1745,7 +1761,7 @@ static Str hStr(const Str &s, bool all) {
                 if (a + i >= (uintptr_t)buf.data() && a + i < (uintptr_t)buf.data() + buf.size()) continue;      // собственный буфер
                 size_t k = 0; while (i + k < n && k < 32 && buf[i + k] >= 32 && buf[i + k] < 127) k++;
                 o += hx(a + i) + "\t" + Str((const char *)buf.data() + i, k) + "\n";
-                if (++cnt >= 300) return "#\tпоказаны первые 300, уточни строку\n" + o;
+                if (++cnt >= 3000) return "#\tпоказаны первые 3000, уточни строку\n" + o;
             }
             size_t adv = n; if (a + n < m.e && n > s.size()) adv = n - (s.size() - 1);
             a += adv;
@@ -1905,7 +1921,24 @@ static Str wCfgAdd(const Str &line) {
     return "добавлено в mgg_world.txt: " + line + "\n";
 }
 
+// текущее значение по адресам (мониторинг «глазом»): адрес \t слово hex \t int \t float \t текст
+static Str hVal(const Str &tk) {
+    uintptr_t a = (uintptr_t)strtoull(tk.c_str(), nullptr, 16);
+    uint8_t b[24] = {0}; size_t n = sizeof b;
+    if (!guarded(b, (const void *)a, n)) { n = 4; memset(b, 0, sizeof b); if (!guarded(b, (const void *)a, 4)) return tk + "\t?\t\t\t\n"; }
+    uint32_t u; memcpy(&u, b, 4); float f; memcpy(&f, &u, 4); char t[48];
+    Str fs; if (f == f && f > -1e9f && f < 1e9f && (u == 0 || f > 1e-4f || f < -1e-4f)) { snprintf(t, sizeof t, "%g", f); fs = t; }
+    size_t k = 0; while (k < n && b[k] >= 32 && b[k] < 127) k++;
+    Str tx = k >= 2 ? Str((const char *)b, k) : Str();
+    snprintf(t, sizeof t, "%08X", (unsigned)u);
+    return tk + "\t" + t + "\t" + std::to_string((int)u) + "\t" + fs + "\t" + tx + "\n";
+}
 static bool helperRoute(const Str &path, const Params &q, Str &o) {
+    if (path == "hval") {
+        Str l = P(q, "a"); size_t i = 0, cnt = 0; o.clear();
+        while (i <= l.size() && cnt < 80) { size_t j = l.find(',', i); if (j == Str::npos) j = l.size(); Str tk = trimS(l.substr(i, j - i)); i = j + 1; if (tk.empty()) continue; cnt++; o += hVal(tk); }
+        return true;
+    }
     if (path == "hscanf") { o = hScanF(strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr), P(q, "all") == "1"); return true; }
     if (path == "hnextf") { o = hKeepF(0, strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr)); return true; }
     if (path == "hrel") { o = hKeepF((intptr_t)strtol(P(q, "off", "0").c_str(), nullptr, 10), strtod(P(q, "v").c_str(), nullptr), strtod(P(q, "tol", "0.01").c_str(), nullptr)); return true; }
@@ -2208,11 +2241,20 @@ static int elfBits(const Str &path) {            // 32 / 64 / 0 (не прочи
     return h[4] == 2 ? 64 : h[4] == 1 ? 32 : 0;
 }
 
-static bool isMcLib(const Str &n, const Str &path) {
-    if (n == MGG_TARGET_LIB) return true;
-    if (n == "libmggpanel.so") return false;
-    if (n.find("minecraft") != Str::npos) return true;
-    return path.compare(0, 10, "/data/app/") == 0 || path.compare(0, 11, "/data/data/") == 0 || path.compare(0, 11, "/data/user/") == 0 || path.compare(0, 12, "/mnt/expand/") == 0;
+static Str dirOf(const Str &p) { size_t k = p.rfind('/'); return k == Str::npos ? Str() : p.substr(0, k); }
+static bool isMcKnown(const Str &n) {
+    if (n == MGG_TARGET_LIB || n.find("minecraft") != Str::npos) return true;
+    static const char *pre[] = {"libfmod", "libc++_shared", "libMaesdk", "libHttpClient", "libXal", "libxal", "libpairip", "libmojang"};
+    for (const char *p : pre) if (n.compare(0, strlen(p), p) == 0) return true;
+    return false;
+}
+// 'm' — библиотеки самой игры, 'c' — кастомные (лежат в папке библиотек игры / каталоге приложения, но не из игры), 'o' — остальное (система, графика, звук)
+static char libGroup(const Str &n, const Str &path, const Str &gameDir) {
+    if (isMcKnown(n)) return 'm';
+    Str appDir = dirOf(dirOf(gameDir));
+    if (!gameDir.empty() && (dirOf(path) == gameDir || (appDir.size() > 8 && path.compare(0, appDir.size(), appDir) == 0))) return 'c';
+    if (gameDir.empty() && (path.compare(0, 10, "/data/app/") == 0 || path.compare(0, 11, "/data/data/") == 0 || path.compare(0, 11, "/data/user/") == 0)) return 'c';
+    return 'o';
 }
 
 struct LibEnt { Str name, path; unsigned long lo, hi; int bits; };
@@ -2266,9 +2308,328 @@ static Str libRoute(const Str &path, const Params &q) {
     int sb = procBits;
     for (const LibEnt &c : v) if (c.name == g_lib) sb = c.bits;
     o += std::to_string(sb) + "\n";
+    Str gameDir; for (const LibEnt &c : v) if (c.name == MGG_TARGET_LIB) gameDir = dirOf(c.path);
     for (const LibEnt &c : v)
-        o += c.name + "\t" + std::to_string(c.bits) + "\t" + hx(c.hi - c.lo) + "\t" + libInfo(c.name, c.path) + "\t" + (c.name == g_lib ? "1" : "0") + "\t" + (isMcLib(c.name, c.path) ? "1" : "0") + "\n";
+        o += c.name + "\t" + std::to_string(c.bits) + "\t" + hx(c.hi - c.lo) + "\t" + libInfo(c.name, c.path) + "\t" + (c.name == g_lib ? "1" : "0") + "\t" + libGroup(c.name, c.path, gameDir) + "\t1\n";
+    if (!gameDir.empty()) {                                   // .so из папки игры, которые сейчас не загружены (видны, но выбрать нельзя)
+        DIR *d = opendir(gameDir.c_str());
+        if (d) {
+            std::vector<Str> extra;
+            while (struct dirent *e = readdir(d)) {
+                Str n = e->d_name; if (n.size() < 4 || n.compare(n.size() - 3, 3, ".so") != 0) continue;
+                bool loaded = false; for (const LibEnt &c : v) if (c.name == n) { loaded = true; break; }
+                if (!loaded) extra.push_back(n);
+            }
+            closedir(d); std::sort(extra.begin(), extra.end());
+            for (const Str &n : extra) {
+                Str fp = gameDir + "/" + n; struct stat st; unsigned long sz = stat(fp.c_str(), &st) == 0 ? (unsigned long)st.st_size : 0;
+                int b = elfBits(fp);
+                o += n + "\t" + std::to_string(b ? b : procBits) + "\t" + hx(sz) + "\tне загружена в процесс\t0\t" + libGroup(n, fp, gameDir) + "\t0\n";
+            }
+        }
+    }
     return o;
+}
+
+// ---------------------------------------------------------------- Dex: строки из classes.dex … classes8.dex внутри APK
+// APK — это zip. Читаем центральный каталог, достаём classesN.dex (хранится как есть или сжат deflate), разбираем таблицу строк dex.
+// Свой inflate (по мотивам puff.c, public domain), чтобы не зависеть от линковки с zlib.
+struct InfState { const uint8_t *in; size_t inlen, incnt; long bitbuf; int bitcnt; uint8_t *out; size_t outlen, outcnt; bool err; };
+struct InfHuff { short *count; short *symbol; };
+static int infBits(InfState *s, int need) {
+    long val = s->bitbuf;
+    while (s->bitcnt < need) {
+        if (s->incnt == s->inlen) { s->err = true; return 0; }
+        val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    s->bitbuf = (long)(val >> need); s->bitcnt -= need;
+    return (int)(val & ((1L << need) - 1));
+}
+static int infDecode(InfState *s, const InfHuff *h) {
+    int code = 0, first = 0, index = 0;
+    for (int len = 1; len <= 15; len++) {
+        code |= infBits(s, 1);
+        if (s->err) return -1;
+        int count = h->count[len];
+        if (code - count < first) return h->symbol[index + (code - first)];
+        index += count; first += count; first <<= 1; code <<= 1;
+    }
+    return -10;
+}
+static int infConstruct(InfHuff *h, const short *length, int n) {
+    short offs[16]; int left = 1;
+    for (int len = 0; len <= 15; len++) h->count[len] = 0;
+    for (int sy = 0; sy < n; sy++) h->count[length[sy]]++;
+    if (h->count[0] == n) return 0;
+    for (int len = 1; len <= 15; len++) { left <<= 1; left -= h->count[len]; if (left < 0) return left; }
+    offs[1] = 0;
+    for (int len = 1; len < 15; len++) offs[len + 1] = offs[len] + h->count[len];
+    for (int sy = 0; sy < n; sy++) if (length[sy] != 0) h->symbol[offs[length[sy]]++] = (short)sy;
+    return left;
+}
+static int infCodes(InfState *s, const InfHuff *lc, const InfHuff *dc) {
+    static const short lens[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const short lext[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const short dists[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+    static const short dext[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+    int sy;
+    do {
+        sy = infDecode(s, lc);
+        if (sy < 0) return sy;
+        if (sy < 256) { if (s->outcnt == s->outlen) return 1; s->out[s->outcnt++] = (uint8_t)sy; }
+        else if (sy > 256) {
+            sy -= 257; if (sy >= 29) return -10;
+            int len = lens[sy] + infBits(s, lext[sy]);
+            sy = infDecode(s, dc); if (sy < 0) return sy;
+            if (sy >= 30) return -10;
+            size_t dist = (size_t)dists[sy] + infBits(s, dext[sy]);
+            if (s->err) return -1;
+            if (dist > s->outcnt) return -11;
+            if (s->outcnt + len > s->outlen) return 1;
+            while (len--) { s->out[s->outcnt] = s->out[s->outcnt - dist]; s->outcnt++; }
+        }
+    } while (sy != 256);
+    return 0;
+}
+static int infStored(InfState *s) {
+    s->bitbuf = 0; s->bitcnt = 0;
+    if (s->incnt + 4 > s->inlen) return 2;
+    unsigned len = s->in[s->incnt++]; len |= (unsigned)s->in[s->incnt++] << 8;
+    unsigned nl = s->in[s->incnt++]; nl |= (unsigned)s->in[s->incnt++] << 8;
+    if (nl != (~len & 0xFFFF)) return -2;
+    if (s->incnt + len > s->inlen) return 2;
+    if (s->outcnt + len > s->outlen) return 1;
+    while (len--) s->out[s->outcnt++] = s->in[s->incnt++];
+    return 0;
+}
+static int infFixed(InfState *s) {
+    static bool built = false; static short lc[16], ls[288], dcn[16], ds[30]; static InfHuff lh = {lc, ls}, dh = {dcn, ds};
+    if (!built) {
+        short l[288]; int sy;
+        for (sy = 0; sy < 144; sy++) l[sy] = 8;
+        for (; sy < 256; sy++) l[sy] = 9;
+        for (; sy < 280; sy++) l[sy] = 7;
+        for (; sy < 288; sy++) l[sy] = 8;
+        infConstruct(&lh, l, 288);
+        for (sy = 0; sy < 30; sy++) l[sy] = 5;
+        infConstruct(&dh, l, 30);
+        built = true;
+    }
+    return infCodes(s, &lh, &dh);
+}
+static int infDynamic(InfState *s) {
+    static const short order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    short lengths[320], lc[16], ls[288], dcn[16], ds[30]; InfHuff lh = {lc, ls}, dh = {dcn, ds};
+    int nlen = infBits(s, 5) + 257, ndist = infBits(s, 5) + 1, ncode = infBits(s, 4) + 4;
+    if (s->err) return -1;
+    if (nlen > 286 || ndist > 30) return -3;
+    int index;
+    for (index = 0; index < ncode; index++) lengths[order[index]] = (short)infBits(s, 3);
+    for (; index < 19; index++) lengths[order[index]] = 0;
+    if (infConstruct(&lh, lengths, 19) != 0) return -4;
+    index = 0;
+    while (index < nlen + ndist) {
+        int sy = infDecode(s, &lh); if (sy < 0) return sy;
+        if (sy < 16) lengths[index++] = (short)sy;
+        else {
+            int len = 0, rep;
+            if (sy == 16) { if (index == 0) return -5; len = lengths[index - 1]; rep = 3 + infBits(s, 2); }
+            else if (sy == 17) rep = 3 + infBits(s, 3);
+            else rep = 11 + infBits(s, 7);
+            if (index + rep > nlen + ndist) return -6;
+            while (rep--) lengths[index++] = (short)len;
+        }
+    }
+    if (s->err) return -1;
+    if (lengths[256] == 0) return -9;
+    int err = infConstruct(&lh, lengths, nlen);
+    if (err && (err < 0 || nlen != lh.count[0] + lh.count[1])) return -7;
+    err = infConstruct(&dh, lengths + nlen, ndist);
+    if (err && (err < 0 || ndist != dh.count[0] + dh.count[1])) return -8;
+    return infCodes(s, &lh, &dh);
+}
+static bool inflateRaw(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen) {
+    InfState s = {in, inlen, 0, 0, 0, out, outlen, 0, false};
+    int last;
+    do {
+        last = infBits(&s, 1); int type = infBits(&s, 2);
+        if (s.err) return false;
+        int err = type == 0 ? infStored(&s) : type == 1 ? infFixed(&s) : type == 2 ? infDynamic(&s) : -1;
+        if (err) return false;
+    } while (!last);
+    return s.outcnt == outlen;
+}
+
+static uint32_t zr16(const uint8_t *p) { return p[0] | (p[1] << 8); }
+static uint32_t zr32(const uint8_t *p) { return p[0] | (p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+struct ZEnt { Str name; uint32_t method, csize, usize, lho; };
+
+static bool zipList(FILE *f, std::vector<ZEnt> &out) {
+    if (fseek(f, 0, SEEK_END) != 0) return false;
+    long fsz = ftell(f); if (fsz < 22) return false;
+    long tail = fsz < 65557 ? fsz : 65557;
+    std::vector<uint8_t> b(tail);
+    if (fseek(f, fsz - tail, SEEK_SET) != 0 || fread(b.data(), 1, tail, f) != (size_t)tail) return false;
+    long e = -1;
+    for (long i = tail - 22; i >= 0; i--) if (zr32(&b[i]) == 0x06054b50) { e = i; break; }
+    if (e < 0) return false;
+    uint32_t cdSize = zr32(&b[e + 12]), cdOff = zr32(&b[e + 16]); uint32_t total = zr16(&b[e + 10]);
+    if (cdOff == 0xFFFFFFFFu || cdSize > 64u * 1024 * 1024 || (long)cdOff + (long)cdSize > fsz) return false;
+    std::vector<uint8_t> cd(cdSize);
+    if (fseek(f, cdOff, SEEK_SET) != 0 || fread(cd.data(), 1, cdSize, f) != cdSize) return false;
+    size_t p = 0;
+    for (uint32_t i = 0; i < total && p + 46 <= cd.size(); i++) {
+        if (zr32(&cd[p]) != 0x02014b50) break;
+        ZEnt z; z.method = zr16(&cd[p + 10]); z.csize = zr32(&cd[p + 20]); z.usize = zr32(&cd[p + 24]);
+        uint32_t nl = zr16(&cd[p + 28]), el = zr16(&cd[p + 30]), cl = zr16(&cd[p + 32]); z.lho = zr32(&cd[p + 42]);
+        if (p + 46 + nl > cd.size()) break;
+        z.name.assign((const char *)&cd[p + 46], nl);
+        out.push_back(z); p += 46 + nl + el + cl;
+    }
+    return !out.empty();
+}
+static bool zipRead(FILE *f, const ZEnt &z, std::vector<uint8_t> &out) {
+    if (z.usize > 96u * 1024 * 1024 || z.csize > 96u * 1024 * 1024) return false;
+    uint8_t h[30];
+    if (fseek(f, z.lho, SEEK_SET) != 0 || fread(h, 1, 30, f) != 30 || zr32(h) != 0x04034b50) return false;
+    long data = (long)z.lho + 30 + zr16(h + 26) + zr16(h + 28);
+    std::vector<uint8_t> c(z.csize);
+    if (fseek(f, data, SEEK_SET) != 0 || fread(c.data(), 1, z.csize, f) != z.csize) return false;
+    out.assign(z.usize, 0);
+    if (z.method == 0) { if (z.csize != z.usize) return false; memcpy(out.data(), c.data(), z.usize); return true; }
+    if (z.method == 8) return inflateRaw(c.data(), c.size(), out.data(), out.size());
+    return false;
+}
+
+static bool dexNameOk(const Str &n) {                              // classes.dex, classes2.dex … classes99.dex в корне
+    if (n.compare(0, 7, "classes") != 0 || n.size() < 11 || n.compare(n.size() - 4, 4, ".dex") != 0) return false;
+    for (size_t i = 7; i + 4 < n.size(); i++) if (n[i] < '0' || n[i] > '9') return false;
+    return true;
+}
+static int dexNum(const Str &n) { return n.size() == 11 ? 1 : atoi(n.substr(7, n.size() - 11).c_str()); }
+
+// число строк и i-я строка таблицы строк dex
+static bool dexHdr(const std::vector<uint8_t> &d, uint32_t &cnt, uint32_t &off) {
+    if (d.size() < 0x70 || memcmp(d.data(), "dex\n", 4) != 0) return false;
+    cnt = zr32(&d[0x38]); off = zr32(&d[0x3C]);
+    return (uint64_t)off + (uint64_t)cnt * 4 <= d.size();
+}
+static bool dexStr(const std::vector<uint8_t> &d, uint32_t off, uint32_t i, size_t &st, size_t &len) {
+    uint32_t so = zr32(&d[off + 4 * (size_t)i]); if (so >= d.size()) return false;
+    size_t p = so; while (p < d.size() && (d[p] & 0x80)) p++;
+    p++; if (p >= d.size()) return false;
+    const uint8_t *z = (const uint8_t *)memchr(&d[p], 0, d.size() - p);
+    st = p; len = z ? (size_t)(z - &d[p]) : d.size() - p; return true;
+}
+static Str dexClean(const uint8_t *s, size_t n) {
+    if (n > 200) n = 200; Str o((const char *)s, n);
+    for (char &c : o) if ((unsigned char)c < 32) c = '?';
+    return o;
+}
+
+// APK игры: ищем в /proc/self/maps пути на .apk, затем рядом с libminecraftpe.so (…/lib/<abi>/lib.so → …/base.apk)
+static std::vector<Str> dexApks() {
+    std::vector<Str> v;
+    auto add = [&](const Str &p) { if (!p.empty() && std::find(v.begin(), v.end(), p) == v.end() && access(p.c_str(), R_OK) == 0) v.push_back(p); };
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            unsigned long s, e; char perms[8] = {0}; Str path;
+            if (!mapLine(line, s, e, perms, path) || path.empty() || path[0] != '/') continue;
+            size_t k = path.find(".apk"); if (k == Str::npos) continue;
+            Str p = path.substr(0, k + 4);
+            if (p.find("base.apk") != Str::npos) add(p);
+        }
+        rewind(f);
+        while (fgets(line, sizeof line, f)) {
+            unsigned long s, e; char perms[8] = {0}; Str path;
+            if (!mapLine(line, s, e, perms, path) || path.empty() || path[0] != '/') continue;
+            size_t k = path.find(".apk"); if (k != Str::npos) add(path.substr(0, k + 4));
+            if (path.size() > 4 && path.find("/lib/") != Str::npos && mapBase(path) == MGG_TARGET_LIB) {
+                Str d = path.substr(0, path.rfind('/')); d = d.substr(0, d.rfind('/')); d = d.substr(0, d.rfind('/'));
+                add(d + "/base.apk");
+            }
+        }
+        fclose(f);
+    }
+    return v;
+}
+static Str g_dexApk; static std::vector<ZEnt> g_dexEnt;
+static bool dexOpen(Str &err) {
+    if (!g_dexEnt.empty()) return true;
+    std::vector<Str> aks = dexApks();
+    if (aks.empty()) { err = "APK игры не найден (нужен base.apk рядом с библиотеками)"; return false; }
+    for (const Str &a : aks) {
+        FILE *f = fopen(a.c_str(), "rb"); if (!f) continue;
+        std::vector<ZEnt> all, dx;
+        if (zipList(f, all)) for (const ZEnt &z : all) if (dexNameOk(z.name)) dx.push_back(z);
+        fclose(f);
+        if (!dx.empty()) { std::sort(dx.begin(), dx.end(), [](const ZEnt &x, const ZEnt &y) { return dexNum(x.name) < dexNum(y.name); }); g_dexApk = a; g_dexEnt = dx; return true; }
+    }
+    err = "в APK нет classes*.dex (или файл не читается)"; return false;
+}
+static Str g_dcName; static std::vector<uint8_t> g_dcData;
+static bool dexLoad(const Str &name, std::vector<uint8_t> &out) {
+    if (g_dcName == name) { out = g_dcData; return true; }
+    for (const ZEnt &z : g_dexEnt) if (z.name == name) {
+        FILE *f = fopen(g_dexApk.c_str(), "rb"); if (!f) return false;
+        bool ok = zipRead(f, z, out); fclose(f);
+        if (ok) { g_dcName = name; g_dcData = out; }
+        return ok;
+    }
+    return false;
+}
+
+static bool dexMatch(const uint8_t *s, size_t n, const Str &nd, int mode, bool ci) {   // mode: 0 содержит, 1 начинается, 2 точно
+    size_t m = nd.size(); if (m > n) return false;
+    auto eq = [&](size_t at) { for (size_t k = 0; k < m; k++) { unsigned char a = s[at + k], b = (unsigned char)nd[k]; if (ci) { if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32; } if (a != b) return false; } return true; };
+    if (mode == 2) return n == m && eq(0);
+    if (mode == 1) return eq(0);
+    for (size_t i = 0; i + m <= n; i++) if (eq(i)) return true;
+    return false;
+}
+
+// dexlist | dexfind (q, f = classesN.dex или all, m = sub|start|exact, ci = 1) | dexctx (f, i, n)
+static Str dexRoute(const Str &path, const Params &q) {
+    Str err;
+    if (!dexOpen(err)) return "#\t" + err + "\n";
+    if (path == "dexlist") {
+        Str o = "#\t" + g_dexApk + "\n";
+        for (const ZEnt &z : g_dexEnt) o += z.name + "\t" + std::to_string(z.usize) + "\n";
+        return o;
+    }
+    if (path == "dexctx") {
+        Str f = P(q, "f"); size_t idx = decNum(q, "i", 0), n = decNum(q, "n", 6);
+        std::vector<uint8_t> d; uint32_t cnt, off;
+        if (!dexLoad(f, d) || !dexHdr(d, cnt, off)) return "не открыл " + f + "\n";
+        Str o = f + ": строк " + std::to_string(cnt) + "\n";
+        size_t lo = idx > n ? idx - n : 0;
+        for (size_t i = lo; i <= idx + n && i < cnt; i++) {
+            size_t st, len; if (!dexStr(d, off, (uint32_t)i, st, len)) continue;
+            o += std::string(i == idx ? "> " : "  ") + "#" + std::to_string(i) + "  " + dexClean(&d[st], len) + "\n";
+        }
+        return o;
+    }
+    if (path == "dexfind") {
+        Str nd = P(q, "q"); if (nd.empty()) return "#\tвведи, что искать\n";
+        Str want = P(q, "f", "all"); Str m = P(q, "m", "sub"); int mode = m == "exact" ? 2 : m == "start" ? 1 : 0; bool ci = P(q, "ci", "1") == "1";
+        Str o; size_t cnt = 0, files = 0; const size_t CAP = 3000;
+        for (const ZEnt &z : g_dexEnt) {
+            if (want != "all" && want != z.name) continue;
+            std::vector<uint8_t> d; uint32_t n, off;
+            if (!dexLoad(z.name, d) || !dexHdr(d, n, off)) { o += "#\tне открыл " + z.name + "\n"; continue; }
+            files++;
+            for (uint32_t i = 0; i < n && cnt < CAP; i++) {
+                size_t st, len; if (!dexStr(d, off, i, st, len)) continue;
+                if (!dexMatch(&d[st], len, nd, mode, ci)) continue;
+                o += z.name + "\t" + std::to_string(i) + "\t" + dexClean(&d[st], len) + "\n"; cnt++;
+            }
+        }
+        return "#\tсовпадений: " + std::to_string(cnt) + (cnt >= CAP ? " (лимит, уточни запрос)" : "") + ", файлов dex: " + std::to_string(files) + "\n" + o;
+    }
+    return "неизвестный маршрут\n";
 }
 
 // ---------------------------------------------------------------- маршруты
@@ -2338,6 +2699,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 .kv{display:flex;align-items:center;gap:8px;padding:7px 2px;border-bottom:1px solid var(--line)}
 .kv:last-child{border-bottom:0}.kv span{color:var(--dim);flex:1}.kv b{font:600 13px ui-monospace,monospace;text-align:right;word-break:break-all}
 .kv b.no{color:var(--dim);font-weight:400}
+.kv.wrap{flex-wrap:wrap}.lv{flex-basis:100%;font:11px/1.3 ui-monospace,monospace;color:var(--ok);padding:0 2px 2px}
 .kv button{width:28px;height:28px;padding:0;margin:0;flex:none;border-radius:8px}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
@@ -2370,6 +2732,8 @@ small{color:var(--dim);display:block;margin-top:4px}
 <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
 <symbol id="i-flag" viewBox="0 0 24 24"><path d="M5 3v18M5 4h11l-2 4 2 4H5"/></symbol>
 <symbol id="i-sun" viewBox="0 0 24 24"><path d="M12 5v2M12 17v2M5 12H3M21 12h-2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M6.3 17.7l1.4-1.4M16.3 7.7l1.4-1.4"/><circle cx="12" cy="12" r="4"/></symbol>
+<symbol id="i-look" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3.2"/><circle cx="12" cy="12" r=".9" class="fi"/></symbol>
+<symbol id="i-dex" viewBox="0 0 24 24"><path d="M9 4C6 4 7.5 9 4 12c3.5 3 2 8 5 8M15 4c3 0 1.5 5 5 8-3.5 3-2 8-5 8"/></symbol>
 <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></symbol>
 <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></symbol>
 </defs></svg>
@@ -2415,7 +2779,8 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button onclick="call('mscan',{v:v('mv'),...ty(),all:v('mall')})"><svg class=ic><use href="#i-search"/></svg>Первый поиск</button>
 <div class=grid3 style="margin-top:6px"><button class=s onclick="call('mnext',{m:'eq',v:v('mv')})"><svg class=ic><use href="#i-eq"/></svg>= значение</button><button class=s onclick="call('mnext',{m:'inc'})"><svg class=ic><use href="#i-up"/></svg>выросло</button><button class=s onclick="call('mnext',{m:'dec'})"><svg class=ic><use href="#i-down"/></svg>уменьшилось</button>
 <button class=s onclick="call('mnext',{m:'same'})"><svg class=ic><use href="#i-eq"/></svg>не менялось</button><button class=s onclick="call('mnext',{m:'chg'})"><svg class=ic><use href="#i-reset"/></svg>менялось</button><button class=s onclick="call('mreset',{})"><svg class=ic><use href="#i-trash"/></svg>сброс</button></div>
-<button class=s style="margin-top:6px" onclick="call('mlist',{n:60})"><svg class=ic><use href="#i-list"/></svg>Список найденных</button></div>
+<button class=s style="margin-top:6px" onclick="mList()"><svg class=ic><use href="#i-list"/></svg>Список найденных</button>
+<small id=mlst></small><div id=mlres></div></div>
 <div class=card><h3><svg class=ic><use href="#i-snow"/></svg>Запись и заморозка</h3>
 <input id=ma placeholder="адрес (hex)"><input id=mw placeholder="новое значение">
 <button class=s onclick="qvT()"><svg class=ic><use href="#i-bolt"/></svg>Быстрые значения<svg class=ic><use href="#i-plus"/></svg></button>
@@ -2433,27 +2798,36 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=card><h3><svg class=ic><use href="#i-search"/></svg>Помощники поиска</h3>
 <div class=seg id=hseg><button class=on onclick="hs('s')">Строки</button><button onclick="hs('n')">Соседи</button><button onclick="hs('c')">Цепочка</button><button onclick="hs('p')">Путь</button></div>
 <div id=hs_s><input id=hsq placeholder="текст, например zombie или ник"><div class=row><select id=hsa><option value=0>куча</option><option value=1>вся rw-память</option></select><button onclick="hStr()"><svg class=ic><use href="#i-search"/></svg>Найти</button></div>
-<small>Нажми на строку: адрес попадёт во все поля помощников. Рядом со строкой лежит объект моба/блока.</small></div>
+<small>Ищет текст в памяти игры (ник, имя моба, id блока). Нажми на результат: адрес подставится в остальные вкладки. Глаз справа показывает значение по этому адресу вживую.</small></div>
 <div id=hs_n style="display:none"><input id=hna placeholder="адрес (hex), пусто = из поля адреса выше"><div class=row><input id=hnb value=64 inputmode=numeric placeholder="назад, байт"><input id=hnc value=192 inputmode=numeric placeholder="вперёд, байт"><button onclick="hNear()">Показать</button></div>
-<small>Каждые 4 байта: int, float, указатель (в lib, в память, на строку). Жёлтым — указатели в libminecraftpe.so (обычно vtable = начало объекта). Нажми на строку: адрес уйдёт в «Путь» как поле.</small></div>
+<small>Показывает, что лежит в памяти вокруг адреса: числа (int / float), ссылки на другие места и текст. Так видно, где рядом HP, координаты и т.д. Жёлтые строки — ссылки внутрь libminecraftpe.so (часто это начало объекта). Нажми на строку: адрес уйдёт в «Путь».</small></div>
 <div id=hs_c style="display:none"><input id=hca placeholder="адрес цели (hex)"><div class=grid3><select id=hcd><option>1</option><option>2</option><option selected>3</option><option>4</option></select><select id=hco><option value=256>смещ. до 0x100</option><option value=1024 selected>до 0x400</option><option value=4096>до 0x1000</option><option value=16384>до 0x4000</option></select><button onclick="hChain()">Искать</button></div>
 <div class=row><select id=hck><option value="player.chain">→ player.chain</option><option value="mob.list">→ mob.list</option><option value="block.chain">→ block.chain</option></select><button class=d onclick="api('hptr',{c:1})">Стоп</button></div>
-<small>Ищет путь от статики libminecraftpe.so к адресу цели (глубина = число указателей). Идёт в фоне, каждый уровень сканирует память. Для mob.list цель — ячейка массива с указателем на сущность; последнее смещение (на элемент) отрежется само.</small></div>
+<small>Адрес в памяти меняется при каждом запуске игры, а «постоянный путь» к нему — нет. Это поиск такого пути: от неподвижной точки внутри libminecraftpe.so до твоего значения. Идёт в фоне. Кнопка «в конфиг» запишет путь в настройки World. Для mob.list цель — ячейка списка с указателем на моба.</small></div>
 <div id=hs_p style="display:none"><input id=hpe placeholder="адрес начала объекта (hex)"><input id=hpa placeholder="адрес поля, которое нужно (hex)">
 <div class=grid3><select id=hpd><option>1</option><option selected>2</option><option>3</option><option>4</option></select><select id=hpn><option value=256>окно 0x100</option><option value=512 selected>окно 0x200</option><option value=1024>окно 0x400</option></select><button onclick="hPath()">Искать</button></div>
 <div class=grid3><select id=hpk><option value="mob.f">mob.f</option><option value="block.f">block.f</option><option value="player.f">player.f</option></select><input id=hpl placeholder="название"><select id=hpt><option>float</option><option>int</option><option>byte</option><option>bool</option><option>str</option><option>hex</option></select></div>
-<small>От начала объекта ищет смещения до поля (HP, ник) через вложенные указатели. Результат записывается в конфиг кнопкой у строки.</small></div>
+<small>Если знаешь адрес, где начинается моб, и адрес его HP, эта вкладка найдёт, через какие ссылки и смещения от первого дойти до второго. Результат пишется в настройки World кнопкой у строки.</small></div>
 <small id=hst></small><div id=hres></div></div>
 
 </div>
+
+<div class=pg id=pd style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-dex"/></svg>Dex: строки из classes1–8</h3>
+<small id=dxi>…</small>
+<input id=dxq placeholder="что искать, например MainActivity">
+<div class=grid3><select id=dxf><option value=all>все classes</option></select><select id=dxm><option value=sub>содержит</option><option value=start>начинается</option><option value=exact>точно</option></select><select id=dxc><option value=1>Aa = aa</option><option value=0>Aa ≠ aa</option></select></div>
+<button onclick="dexFind()"><svg class=ic><use href="#i-search"/></svg>Найти</button>
+<small id=dxs></small><div id=dxr></div>
+<small>Ищет в Java-части игры (внутри APK): имена классов и методов, текстовые константы. Нажми на результат: покажет соседние строки.</small></div></div>
 
 <div class=pg id=pl style="display:none">
 <div class=card><h3><svg class=ic><use href="#i-lib"/></svg>Библиотека для патчинга</h3>
 <div class=fn onclick="libOpen()"><div class=nm><span id=lnm>…</span><div class=sub id=lsub></div></div><svg class=ic><use href="#i-list"/></svg></div>
 <div id=lpick style="display:none">
-<div class=seg style="margin:5px 0"><button id=lgm class=on onclick="libGrp('mc')">Minecraft</button><button id=lgo onclick="libGrp('ot')">Другое</button></div>
+<div class=seg style="margin:5px 0"><button id=lgm class=on onclick="libGrp('m')">Minecraft</button><button id=lgc onclick="libGrp('c')">Кастомные</button><button id=lgo onclick="libGrp('o')">Другое</button></div>
 <small id=lnote></small><div id=ll></div></div>
-<small>«Minecraft» — игра и её библиотеки, «Другое» — система, графика, звук. Все вкладки Lib (хекс, патчи, сигнатуры, строки) работают с выбранной библиотекой.</small></div>
+<small>«Minecraft» — библиотеки самой игры, «Кастомные» — чужие .so из папки игры (моды, загрузчики, эта панель), «Другое» — система, графика, звук. Все вкладки Lib (хекс, патчи, сигнатуры, строки) работают с выбранной библиотекой.</small></div>
 <details class=card open><summary><svg class=ic><use href="#i-hex"/></svg>Константы в коде<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=cv placeholder="число (например 13 или 0xD)"><input id=cv2 placeholder="второе число рядом (необязательно)">
 <input id=cw placeholder="окно, байт (по умолч. 768)">
@@ -2533,13 +2907,14 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button id=bw class=nav onclick="tab('w')"><span class=bx><svg class=ic><use href="#i-globe"/></svg></span>World</button>
 <button id=bm class=nav onclick="tab('m')"><span class=bx><svg class=ic><use href="#i-mem"/></svg></span>Mem</button>
 <button id=bl class=nav onclick="tab('l')"><span class=bx><svg class=ic><use href="#i-lib"/></svg></span>Lib</button>
+<button id=bd class=nav onclick="tab('d')"><span class=bx><svg class=ic><use href="#i-dex"/></svg></span>Dex</button>
 <button id=bf class=nav onclick="tab('f')"><span class=bx><svg class=ic><use href="#i-file"/></svg></span>File</button>
 <button id=bs class=nav onclick="tab('s')"><span class=bx><svg class=ic><use href="#i-safe"/></svg></span>Safe</button>
 <button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button></aside>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
-function tab(x){for(const k of ['n','w','m','l','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
-clearInterval(W.t);W.t=null;if(x=='w'){wsub(W.sub);W.t=setInterval(wTick,800)}if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
+function tab(x){for(const k of ['n','w','m','l','d','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
+clearInterval(W.t);W.t=null;if(x=='w'){wsub(W.sub);W.t=setInterval(wTick,800)}if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='d'&&!window.dxOnce){window.dxOnce=1;dexList()}if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
 function v(i){return document.getElementById(i).value.trim()}
 function ty(){const t=v('mt');return t=='f'?{sz:4,f:1}:{sz:t,f:0}}
 async function api(p,o){const q=new URLSearchParams(o||{});q.set('t',T);try{return await(await fetch('/api/'+p+'?'+q)).text()}catch(e){return ''}}
@@ -2561,16 +2936,19 @@ const LB={proc:32,sel:'',selBits:32,grp:'',list:[]};
 async function libLoad(){let r='';try{r=await(await fetch('/api/libs?'+new URLSearchParams({t:T}))).text()}catch(e){document.getElementById('lnm').textContent='ошибка';return}
 const ls=r.trim().split('\n');const h=ls.shift().split('\t');if(h[0]!='#'){document.getElementById('lnm').textContent=r;return}
 LB.proc=+h[1];LB.sel=h[2];LB.selBits=+h[3];
-LB.list=ls.map(l=>{const a=l.split('\t');return{n:a[0],b:+a[1],sz:a[2],d:a[3],on:a[4]=='1',g:a[5]=='1'}});
-if(!LB.grp){const c=LB.list.find(x=>x.on);LB.grp=c&&!c.g?'ot':'mc'}libRender()}
+LB.list=ls.map(l=>{const a=l.split('\t');return{n:a[0],b:+a[1],sz:a[2],d:a[3],on:a[4]=='1',g:a[5]||'o',ld:a[6]!='0'}});
+if(!LB.grp){const c=LB.list.find(x=>x.on);LB.grp=c?c.g:'m'}libRender()}
 function libRender(){const cur=LB.list.find(x=>x.on);document.getElementById('lnm').textContent=LB.sel||'не найдена';
 document.getElementById('lsub').textContent=cur?(cur.b+' bit · '+cur.d):'нет в процессе игры';
-const mc=LB.grp=='mc';document.getElementById('lgm').className=mc?'on':'';document.getElementById('lgo').className=mc?'':'on';
-const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.g==mc);
-document.getElementById('lnote').textContent=(mc?'Minecraft: ':'Другое: ')+L.length+(mc?' (игра и её библиотеки)':' (система, графика, звук, панель)');
-for(const x of L){const row=document.createElement('div');row.className='fn';const nm=document.createElement('div');nm.className='nm';nm.textContent=x.n;
-const sub=document.createElement('div');sub.className='sub';sub.textContent=x.b+' bit · '+x.d+' · '+x.sz;nm.appendChild(sub);
-const sw=document.createElement('div');sw.className='sw'+(x.on?' on':'');row.onclick=()=>libSel(x.n);row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}
+for(const k of ['m','c','o'])document.getElementById('lg'+k).className=LB.grp==k?'on':'';
+const d=document.getElementById('ll');d.textContent='';const L=LB.list.filter(x=>x.g==LB.grp);
+const nm={m:'Minecraft',c:'Кастомные',o:'Другое'}[LB.grp];
+document.getElementById('lnote').textContent=nm+': '+L.length+(LB.grp=='c'?' (не из игры, но лежат в её папке библиотек)':LB.grp=='m'?' (игра и её библиотеки)':' (система, графика, звук)');
+for(const x of L){const row=document.createElement('div');row.className='fn';const n=document.createElement('div');n.className='nm';n.textContent=x.n;
+const sub=document.createElement('div');sub.className='sub';sub.textContent=x.b+' bit · '+x.d+' · '+x.sz;n.appendChild(sub);
+const sw=document.createElement('div');sw.className='sw'+(x.on?' on':'');
+if(x.ld)row.onclick=()=>libSel(x.n);else{row.style.opacity='.55';sw.style.display='none'}
+row.appendChild(n);row.appendChild(sw);d.appendChild(row)}
 document.getElementById('pbs32').style.display=LB.selBits==64?'none':'';document.getElementById('pbs64').style.display=LB.selBits==64?'':'none'}
 function libGrp(g){LB.grp=g;libRender()}
 function libOpen(){const p=document.getElementById('lpick');p.style.display=p.style.display=='none'?'':'none';if(p.style.display=='')libLoad()}
@@ -2598,10 +2976,12 @@ const SL=[{s:'chunk',t:'Дальность прорисовки (чанки)',mi
 function slotInit(){const d=document.getElementById('sl');d.textContent='';for(const x of SL){const c=document.createElement('div');c.className='card';
 c.innerHTML=`<h3><svg class=ic><use href="#i-eye"/></svg>${x.t}</h3><div class=rg><input type=range id=r_${x.s} min=${x.min} max=${x.max} value=${x.def} oninput="document.getElementById('rv_${x.s}').textContent=this.value"><b id=rv_${x.s}>${x.def}</b></div>
 <div class=grid3><button onclick="slA('${x.s}')">Применить</button><button class=s onclick="slS('${x.s}')">Снять</button><button class=s onclick="slO('${x.s}')">options.txt</button></div>
+<small id=st_${x.s}>…</small>
+<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--dim);font-size:11px">Адрес и привязка</summary>
 <div class=row><input id=ba_${x.s} placeholder="адрес (hex) или пусто"><button class=s onclick="slB('${x.s}')"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
-<small id=st_${x.s}>…</small><small>${x.h}</small>`;d.appendChild(c)}slRefresh()}
+<button class=s style="margin-top:5px" onclick="call('csexport',{s:'${x.s}'})">Экспорт привязки</button><small>${x.h}</small></details>`;d.appendChild(c)}slRefresh()}
 async function slRefresh(){for(const x of SL){const e=document.getElementById('st_'+x.s);if(e)e.textContent=(await api('csst',{s:x.s})).trim()}}
-async function slA(s){await call('csapply',{s:s,v:v('r_'+s)});slRefresh()}
+async function slA(s){const st=document.getElementById('st_'+s).textContent;if(st.startsWith('не привязано')&&v('ba_'+s))await call('csbind',{s:s,a:v('ba_'+s)});await call('csapply',{s:s,v:v('r_'+s)});slRefresh()}
 async function slS(s){await call('csstop',{s:s});slRefresh()}
 async function slB(s){await call('csbind',{s:s,a:v('ba_'+s)||v('ma')});slRefresh()}
 async function optPath(){let p=v('op');if(p)return p;const t=await call('findopt',{});const m=t.split('\n').find(l=>l.endsWith('options.txt'));if(m){document.getElementById('op').value=m.trim();return m.trim()}return''}
@@ -2618,13 +2998,37 @@ d.appendChild(r)}
 if(k=='p'&&stale&&Date.now()-W.lf>8000){W.lf=Date.now();api('csfind',{s:stale})}}
 let HS='s';
 function hs(x){HS=x;const ks=['s','n','c','p'];for(const k of ks)document.getElementById('hs_'+k).style.display=k==x?'':'none';document.querySelectorAll('#hseg button').forEach((b,i)=>b.className=ks[i]==x?'on':'');document.getElementById('hres').textContent='';document.getElementById('hst').textContent=''}
-function hRows(t,mk){const d=document.getElementById('hres');d.textContent='';const st=document.getElementById('hst');st.textContent='';
-for(const l of t.split('\n')){if(!l)continue;const c=l.split('\t');if(c[0]=='#'){st.textContent=c.slice(1).join(' · ');continue}const r=document.createElement('div');r.className='kv';mk(r,c);d.appendChild(r)}}
+function hRender(box,stId,t,mk,per){per=per||40;const d=document.getElementById(box);d.textContent='';const st=document.getElementById(stId);st.textContent='';const rows=[];
+for(const l of t.split('\n')){if(!l)continue;const c=l.split('\t');if(c[0]=='#'){st.textContent=c.slice(1).join(' · ');continue}rows.push(c)}
+let shown=0;const more=document.createElement('div');more.className='row';d.appendChild(more);
+function draw(n){const e=Math.min(rows.length,shown+n);for(;shown<e;shown++){const r=document.createElement('div');r.className='kv';mk(r,rows[shown]);d.insertBefore(r,more)}
+more.textContent='';const left=rows.length-shown;if(left>0){const b=document.createElement('button');b.className='s';b.textContent='Ещё '+Math.min(per,left)+' (осталось '+left+')';b.onclick=()=>draw(per);more.appendChild(b);
+const a=document.createElement('button');a.className='s';a.textContent='Показать все';a.onclick=()=>draw(rows.length);more.appendChild(a)}}
+draw(per)}
+function hRows(t,mk){hRender('hres','hst',t,mk)}
+const EY={};let EYT=null;
+function hEye(r,a){const b=document.createElement('button');b.className='s';b.title='Показать значение вживую';b.innerHTML='<svg class=ic><use href="#i-look"/></svg>';
+const lv=document.createElement('div');lv.className='lv';lv.style.display='none';r.classList.add('wrap');
+b.onclick=e=>{e.stopPropagation();if(EY[a]){delete EY[a];lv.style.display='none';b.className='s'}else{EY[a]=lv;lv.style.display='';lv.textContent='…';b.className='g';if(!EYT)EYT=setInterval(eyTick,900);eyTick()}};
+r.appendChild(b);r.appendChild(lv)}
+async function eyTick(){for(const k of Object.keys(EY))if(!document.body.contains(EY[k]))delete EY[k];const ks=Object.keys(EY);
+if(!ks.length){clearInterval(EYT);EYT=null;return}
+const t=await api('hval',{a:ks.slice(0,80).join(',')});for(const l of t.split('\n')){const c=l.split('\t');if(EY[c[0]])EY[c[0]].textContent=c[1]=='?'?'не читается':'0x'+c[1]+'   int '+c[2]+(c[3]?'   float '+c[3]:'')+(c[4]?'   «'+c[4]+'»':'')}}
+async function mList(){document.getElementById('mlst').textContent='читаю…';const t=await api('mlist',{n:1000});const o=[];
+for(const l of t.split('\n')){if(!l)continue;const m=l.match(/^(0x[0-9A-Fa-f]+)\s+=\s+(.*)$/);o.push(m?m[1]+'\t'+m[2]:'#\t'+l)}
+hRender('mlres','mlst',o.join('\n'),(r,c)=>{hTx(r,c[0]+'   =   '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])},50)}
+async function dexList(){const t=await api('dexlist');const ls=t.split('\n').filter(x=>x);const sel=document.getElementById('dxf');const inf=document.getElementById('dxi');
+if(!ls.length){inf.textContent='нет ответа';return}
+const h=ls[0].split('\t');if(h[0]!='#'||ls.length==1){inf.textContent=h[1]||'';return}
+inf.textContent='APK: '+h[1];sel.textContent='';const al=document.createElement('option');al.value='all';al.textContent='все classes';sel.appendChild(al);
+for(const l of ls.slice(1)){const c=l.split('\t');const o=document.createElement('option');o.value=c[0];o.textContent=c[0]+' ('+Math.round(c[1]/1024)+' КБ)';sel.appendChild(o)}}
+async function dexFind(){document.getElementById('dxs').textContent='ищу…';const t=await api('dexfind',{q:v('dxq'),f:v('dxf'),m:v('dxm'),ci:v('dxc')});
+hRender('dxr','dxs',t,(r,c)=>{hTx(r,c[0].replace('.dex','')+'  #'+c[1]+'   '+c[2]);r.style.cursor='pointer';r.onclick=async()=>{out.textContent=await api('dexctx',{f:c[0],i:c[1],n:6})}},50)}
 function hTx(r,txt,col){const b=document.createElement('b');b.textContent=txt;b.style.textAlign='left';b.style.flex='1';b.style.fontSize='11px';if(col)b.style.color=col;r.appendChild(b);return b}
 function hBtn(r,txt,fn){const b=document.createElement('button');b.className='s';b.textContent=txt;b.style.width='auto';b.style.padding='0 8px';b.onclick=fn;r.appendChild(b)}
 function hSet(a){for(const i of ['ma','hna','hca','hpa'])document.getElementById(i).value=a;out.textContent='адрес '+a+' → в поля помощников'}
 async function hStr(){document.getElementById('hst').textContent='ищу…';const t=await api('hstr',{s:v('hsq'),all:v('hsa')});
-hRows(t,(r,c)=>{hTx(r,c[0]+'  '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0])})}
+hRows(t,(r,c)=>{hTx(r,c[0]+'  '+c[1]);r.style.cursor='pointer';r.onclick=()=>hSet(c[0]);hEye(r,c[0])})}
 async function hNear(){const a=v('hna')||v('ma');document.getElementById('hst').textContent='читаю…';const t=await api('hnear',{a:a,b:v('hnb'),n:v('hnc')});
 hRows(t,(r,c)=>{hTx(r,c[1]+'  '+c[2]+'  i='+c[3]+(c[4]?'  f='+c[4]:'')+(c[5]?'  '+c[5]:''),c[5]&&c[5].startsWith('→ lib')?'var(--hl)':'');r.style.cursor='pointer';r.onclick=()=>{document.getElementById('hpa').value=c[0];document.getElementById('ma').value=c[0];out.textContent='поле '+c[0]}})}
 let HT=null;
@@ -2656,6 +3060,7 @@ static Str route(const Str &path, const Params &q) {
     if (path == "findopt" || path == "status" || path == "unlock" || path == "reenable" || path == "rollall") return miscRoute(path, q);
     if (path == "libs" || path == "libsel") return libRoute(path, q);
     if (path.compare(0, 2, "cs") == 0) return csRoute(path, q);
+    if (path.compare(0, 3, "dex") == 0) return dexRoute(path, q);
     if (path == "wplayer") return worldPlayer();
     if (path == "wmob") return worldMob();
     if (path == "wblock") return worldBlock();
