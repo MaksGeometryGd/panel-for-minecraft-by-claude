@@ -1,4 +1,4 @@
-# Положи как .github/workflows/build.yml. Рядом в репозитории: mgg_panel.cpp (корень), mgg/Overlay.java, mgg/Loader.java.
+# Положи как .github/workflows/build.yml. Рядом в репозитории: mgg_panel.cpp (корень), mgg/Overlay.java, mgg/FMenu.java, mgg/Loader.java.
 # Каждый пуш собирает: libmggpanel.so (панель), overlay.jar (окно поверх игры), loader.dex (ставится в APK один раз)
 # и выкладывает их в релиз "latest" с постоянными ссылками. Загрузчик в игре сам скачивает свежую сборку.
 # Токен панели: Settings -> Secrets and variables -> Actions -> New secret -> MGG_TOKEN (буквы, цифры, _ и -). Нет секрета: токен "mgg".
@@ -116,7 +116,8 @@ jobs:
           mkdir -p build/src/mgg build/ov build/ld
           sed "s|__MGG_TOKEN__|$TOKEN|" mgg/Overlay.java > build/src/mgg/Overlay.java
           sed "s|__MGG_REPO__|$GITHUB_REPOSITORY|" mgg/Loader.java > build/src/mgg/Loader.java
-          javac --release 8 -cp "$AJAR" -d build/ov build/src/mgg/Overlay.java
+          cp mgg/FMenu.java build/src/mgg/FMenu.java
+          javac --release 8 -cp "$AJAR" -d build/ov build/src/mgg/Overlay.java build/src/mgg/FMenu.java
           javac --release 8 -cp "$AJAR" -d build/ld build/src/mgg/Loader.java
           "$BT/d8" --release --min-api 21 --lib "$AJAR" --output overlay.jar $(find build/ov -name '*.class')
           mkdir -p build/ldout
