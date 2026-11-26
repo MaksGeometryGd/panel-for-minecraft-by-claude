@@ -30,23 +30,56 @@ jobs:
           MAIN=$(git -C Dobby rev-parse HEAD)
           echo "=== Dobby: коммитов в истории: $(git -C Dobby rev-list --count "$MAIN"), теги: $(git -C Dobby tag | tail -n 5 | tr '\n' ' ')"
           DOBBY_LIBS=""
+          # Ошибка "write to reserved register 'R7'": в Thumb-режиме clang держит r7 как frame pointer, а Dobby
+          # (cpu.cc, cacheflush через svc) пишет в r7. Лечим двумя способами:
+          #   вариант A — собираем Dobby в ARM-режиме (там frame pointer = r11) и без frame pointer;
+          #   вариант B — A + правим исходник: asm-вызов cacheflush заменяется на __builtin___clear_cache.
+          patch_r7() {
+            python3 - <<'PY'
+          import re, pathlib
+          for f in pathlib.Path("Dobby").rglob("*.cc"):
+              t = f.read_text(errors="ignore")
+              if not re.search(r'asm\s*\(\s*"r7"\s*\)', t): continue
+              lines = t.split("\n")
+              k = next(i for i, l in enumerate(lines) if re.search(r'asm\s*\(\s*"r7"\s*\)', l))
+              st = k
+              while st > 0 and not re.match(r'^[A-Za-z_].*\)\s*\{?\s*$', lines[st]): st -= 1   # заголовок функции
+              depth, en, seen = 0, st, False
+              for i in range(st, len(lines)):
+                  depth += lines[i].count("{") - lines[i].count("}")
+                  if "{" in lines[i]: seen = True
+                  if seen and depth == 0: en = i; break
+              m = re.search(r'\(([^)]*)\)', lines[st])
+              ps = [re.split(r'[\s*&]+', p.strip())[-1] for p in m.group(1).split(",")] if m else []
+              if len(ps) < 2: continue
+              s2 = f"(char*){ps[0]}, (char*)" + (ps[1] if "end" in ps[1].lower() else f"((char*){ps[0]} + {ps[1]})")
+              head = lines[st].rstrip().rstrip("{").rstrip()
+              lines[st:en + 1] = [head + " {", f"  __builtin___clear_cache({s2});", "}"]
+              f.write_text("\n".join(lines)); print("patched", f)
+          PY
+          }
           for N in 1 10 30 60 100 200 400; do
             C=$(git -C Dobby rev-list --first-parent "$MAIN" | sed -n "${N}p")
             [ -n "$C" ] || { echo "=== Dobby: на глубине $N коммитов нет"; continue; }
             echo "=== Dobby: пробую $(git -C Dobby log -1 --format='%h %ad %s' --date=short "$C") (на $N назад)"
-            git -C Dobby checkout -q -f "$C"
-            rm -rf Dobby/build
-            if cmake -S Dobby -B Dobby/build \
-                 -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-                 -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-21 -DANDROID_STL=c++_static \
-                 -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF -DDOBBY_DEBUG=OFF \
-                 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > dobby_try.log 2>&1 \
-               && cmake --build Dobby/build -j4 >> dobby_try.log 2>&1; then
-              DOBBY_LIBS=$(find Dobby/build -name '*.a' | tr '\n' ' ')
-              [ -n "$DOBBY_LIBS" ] && { echo "=== Dobby собран ($N назад): $DOBBY_LIBS"; break; }
-            fi
-            echo "=== Dobby не собрался ($N назад), ошибки:"
-            grep -E "error|Error" dobby_try.log | head -n 4 || true
+            for VAR in A B; do
+              git -C Dobby checkout -q -f "$C"
+              [ "$VAR" = B ] && patch_r7
+              rm -rf Dobby/build
+              if cmake -S Dobby -B Dobby/build \
+                   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+                   -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-21 -DANDROID_STL=c++_static \
+                   -DANDROID_ARM_MODE=arm \
+                   -DCMAKE_C_FLAGS="-fomit-frame-pointer" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer" \
+                   -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF -DDOBBY_DEBUG=OFF \
+                   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > dobby_try.log 2>&1 \
+                 && cmake --build Dobby/build -j4 >> dobby_try.log 2>&1; then
+                DOBBY_LIBS=$(find Dobby/build -name '*.a' | tr '\n' ' ')
+                [ -n "$DOBBY_LIBS" ] && { echo "=== Dobby собран ($N назад, вариант $VAR): $DOBBY_LIBS"; break 2; }
+              fi
+              echo "=== Dobby не собрался ($N назад, вариант $VAR), ошибки:"
+              grep -E "error|Error" dobby_try.log | head -n 8 || true
+            done
           done
           [ -n "$DOBBY_LIBS" ] || { echo "=== Dobby не собрался ни на одной глубине"; exit 1; }
 
