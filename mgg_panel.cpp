@@ -822,12 +822,14 @@ static void autoApply() {
 // ---------------------------------------------------------------- хуки (нужен Dobby)
 #ifdef MGG_HAS_DOBBY
 struct Slot {
-    bool used; void *target; void *orig; int mode; uintptr_t val;     // mode: 0 лог, 1 вернуть val без вызова, 2 вызвать и подменить результат, 3 вызвать, подставив val вместо аргумента arg
+    bool used; void *target; void *orig; int mode; uintptr_t val;     // mode: 0 лог, 1 вернуть val без вызова, 2 вызвать и подменить результат, 3 вызвать, подставив val вместо аргумента arg, 4 после успешного вызова сломать блоки вокруг (val = радиус 1–2)
     uintptr_t off; std::atomic<uint32_t> calls; uintptr_t last[8];
     int arg; uint8_t sig[8]; long long t0;                           // arg — какой аргумент подменять (режим 3); sig — первые байты функции до хука (для сохранения и проверки версии); t0 — время постановки, мс
     uintptr_t seen[8]; uint32_t seenN[8]; uint32_t rr;               // разные a0 (this), которые видели при вызовах: так находятся адреса объектов (моб, игрок)
 };
 static Slot g_slots[16];
+static bool guarded(void *dst, const void *src, size_t n);          // определена ниже (безопасное чтение памяти)
+static thread_local bool g_inArea = false;                         // защита от повторного входа в режиме 4
 
 template <int N>
 static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7) {
@@ -842,6 +844,19 @@ static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
     uintptr_t a[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
     if (s.mode == 3 && s.arg >= 0 && s.arg < 8) a[s.arg] = s.val;
     uintptr_t r = ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    if (s.mode == 4 && !g_inArea && (r & 0xFF) && a[1] > 0x10000) {   // слом вокруг: оригинал уже сломал блок, ломаем соседей
+        int p[3];
+        if (guarded(p, (const void *)a[1], 12) && p[0] > -30000000 && p[0] < 30000000 && p[2] > -30000000 && p[2] < 30000000) {
+            int R = s.val < 1 ? 1 : s.val > 2 ? 2 : (int)s.val;       // радиус 1 = 3x3x3, 2 = 5x5x5 (больше нельзя: зависнет)
+            g_inArea = true;
+            for (int dx = -R; dx <= R; dx++) for (int dy = -R; dy <= R; dy++) for (int dz = -R; dz <= R; dz++) {
+                if (!dx && !dy && !dz) continue;
+                int q[3] = {p[0] + dx, p[1] + dy, p[2] + dz};          // BlockPos const& = указатель на 3 int
+                ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], (uintptr_t)q, a[2], a[3], a[4], a[5], a[6], a[7]);
+            }
+            g_inArea = false;
+        }
+    }
     return s.mode == 2 ? s.val : r;
 }
 template <size_t... I>
@@ -849,7 +864,7 @@ static std::array<void *, sizeof...(I)> mkHooks(std::index_sequence<I...>) { ret
 static std::array<void *, 16> g_hk = mkHooks(std::make_index_sequence<16>{});
 
 static long long hkNow() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : 0; }
+static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : m == "area" ? 4 : 0; }
 static Str hooksFile() { return dataDir() + "/mgg_hooks.txt"; }
 
 static Str hooksList() {
@@ -857,7 +872,7 @@ static Str hooksList() {
     for (int i = 0; i < 16; i++) {
         const Slot &s = g_slots[i];
         if (!s.used) continue;
-        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : "арг";
+        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : "area";
         uint32_t c = s.calls.load(); double sec = (now - s.t0) / 1000.0; char t[64];
         snprintf(t, sizeof t, "%.1f", sec > 0.5 ? c / sec : 0.0);
         out += "#" + std::to_string(i) + " " + hx(s.off) + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
@@ -908,7 +923,7 @@ static Str hooksApply(const Img &im) {
     while (fgets(line, sizeof line, f)) {
         if (first) { first = false; if (strncmp(line, "HOOKS1", 6) != 0) { o += "неверный формат файла хуков\n"; break; } continue; }
         unsigned long off = 0, val = 0; int mode = 0, arg = 0; char sg[40] = {0};
-        if (sscanf(line, "%lx %d %d %lx %33s", &off, &mode, &arg, &val, sg) != 5 || strlen(sg) != 16 || mode < 0 || mode > 3) continue;
+        if (sscanf(line, "%lx %d %d %lx %33s", &off, &mode, &arg, &val, sg) != 5 || strlen(sg) != 16 || mode < 0 || mode > 4) continue;
         std::vector<uint8_t> want; if (!unhex(sg, want)) continue;
         bool already = false;
         for (const Slot &s : g_slots) if (s.used && s.off == off) already = true;
@@ -3052,14 +3067,14 @@ small{color:var(--dim);display:block;margin-top:4px}
 <small id=sys></small><div id=syr></div>
 <small>Работает, если библиотека экспортирует имена функций. Нажми на результат: смещение подставится в поля хука, патча и дизассемблера. T — Thumb (хукается), A — ARM (панель не хукает), D — переменная.</small></div></details>
 <details class=card><summary><svg class=ic><use href="#i-plug"/></svg>Хуки (нужен Dobby)<svg class=ic><use href="#i-plus"/></svg></summary><div>
-<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option><option value=arg>подменить аргумент</option></select>
+<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option><option value=arg>подменить аргумент</option><option value=area>слом вокруг (на destroyBlock)</option></select>
 <div class=row><input id=kv placeholder="значение, hex"><input id=kn placeholder="№ аргумента 0–7" inputmode=numeric></div>
 <button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
 <input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-reset"/></svg>Режим</button><button class=s onclick="call('unhook',{id:v('ki')})"><svg class=ic><use href="#i-stop"/></svg>Снять</button><button class=s onclick="call('hooks',{})"><svg class=ic><use href="#i-list"/></svg>Список</button></div>
 <div class=grid2><button class=s onclick="hkLive(this)"><svg class=ic><use href="#i-look"/></svg>Живой список</button><button class=s onclick="call('hookset',{id:v('ki'),reset:1})"><svg class=ic><use href="#i-reset"/></svg>Сбросить счётчики</button></div>
 <div id=hkl class=lv style="white-space:pre-wrap;display:none;color:var(--dim)"></div>
 <div class=grid3><button class=s onclick="call('hooksave',{})">Сохранить</button><button class=s onclick="call('hookload',{})">Применить сохр.</button><button class=d onclick="call('hookclear',{})">Удалить сохр.</button></div>
-<small>лог — считает вызовы, показывает аргументы a0–a7 и разные «this» (a0): так находятся адреса объектов, потом Mem → Соседи. ret — функция сразу возвращает значение. set — результат оригинала заменяется. арг — оригинал вызывается, но аргумент № заменяется на значение (float как hex: 170.0 = 432A0000). Сохранённые хуки ставятся при старте, только если байты функции те же.</small></div></details>
+<small>лог — считает вызовы, показывает аргументы a0–a7 и разные «this» (a0): так находятся адреса объектов, потом Mem → Соседи. ret — функция сразу возвращает значение. set — результат оригинала заменяется. арг — оригинал вызывается, но аргумент № заменяется на значение (float как hex: 170.0 = 432A0000). слом вокруг — ставь на GameMode::destroyBlock, в «значение» пиши радиус: 1 (3×3×3) или 2 (5×5×5). Сломал один блок — оригинал вызывается ещё для соседних. Сохранённые хуки ставятся при старте, только если байты функции те же.</small></div></details>
 </div>
 
 <div class=pg id=pf style="display:none">
