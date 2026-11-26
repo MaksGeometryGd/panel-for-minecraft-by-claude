@@ -47,9 +47,10 @@
 #endif
 
 #ifdef MGG_HAS_DOBBY
-#include "dobby.h"
-// Если у твоей версии Dobby другие типы параметров — правь только эти две строки.
-#define MGG_HOOK(addr, rep, orig) DobbyHook((void *)(addr), (dobby_dummy_func_t)(rep), (dobby_dummy_func_t *)(orig))
+// Свои объявления вместо dobby.h: у разных версий Dobby типы параметров разные, а символ в библиотеке один и тот же.
+extern "C" int DobbyHook(void *address, void *replace_func, void **origin_func);
+extern "C" int DobbyDestroy(void *address);
+#define MGG_HOOK(addr, rep, orig) DobbyHook((void *)(addr), (void *)(rep), (void **)(orig))
 #define MGG_UNHOOK(addr) DobbyDestroy((void *)(addr))
 #endif
 
@@ -3494,7 +3495,7 @@ static Str route(const Str &path, const Params &q) {
     return "неизвестный маршрут\n";
 }
 
-// ---------------------------------------------------------------- HTTP (только 127.0.0.1)ш
+// ---------------------------------------------------------------- HTTP (только 127.0.0.1)
 static void sendAll(int c, const Str &s) {
     size_t o = 0;
     while (o < s.size()) {
