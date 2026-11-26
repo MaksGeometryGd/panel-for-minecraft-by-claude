@@ -783,6 +783,9 @@ static Str doPatch(const Img &im, uintptr_t off, const std::vector<uint8_t> &b, 
     return r;
 }
 
+static bool hooksSavedExists();
+static void autoApplyHooks(const Img &im);
+static void hooksDisable();
 // автоприменение сохранённых патчей через несколько секунд после старта игры
 static void autoApply() {
     Img im;
@@ -792,12 +795,13 @@ static void autoApply() {
     std::lock_guard<std::mutex> lk(g_mu);
     Str lock = dataDir() + "/mgg_apply.lock";
     loadFile();
-    if (g_saved.empty()) return;
+    if (g_saved.empty() && !hooksSavedExists()) return;
     if (access(lock.c_str(), F_OK) == 0) {                       // прошлый запуск упал, пока патчи применялись
         rename(patchFile().c_str(), (patchFile() + ".disabled").c_str());
         remove(lock.c_str());
         g_saved.clear();
-        LOGI("прошлый запуск упал после применения патчей: они отключены (файл .disabled)");
+        hooksDisable();
+        LOGI("прошлый запуск упал после применения патчей и хуков: они отключены (файл .disabled)");
         return;
     }
     FILE *lf = fopen(lock.c_str(), "w"); if (lf) fclose(lf);
@@ -811,14 +815,17 @@ static void autoApply() {
         Str r = writeMem(im, s.off, s.now, true);
         LOGI("автопатч %lX: %s", (unsigned long)s.off, r.c_str());
     }
+    autoApplyHooks(im);
     std::thread([lock] { sleep(45); remove(lock.c_str()); }).detach();   // игра прожила 45 с: считаем запуск безопасным
 }
 
 // ---------------------------------------------------------------- хуки (нужен Dobby)
 #ifdef MGG_HAS_DOBBY
 struct Slot {
-    bool used; void *target; void *orig; int mode; uintptr_t val;     // mode: 0 лог, 1 вернуть val без вызова, 2 вызвать и подменить результат
+    bool used; void *target; void *orig; int mode; uintptr_t val;     // mode: 0 лог, 1 вернуть val без вызова, 2 вызвать и подменить результат, 3 вызвать, подставив val вместо аргумента arg
     uintptr_t off; std::atomic<uint32_t> calls; uintptr_t last[8];
+    int arg; uint8_t sig[8]; long long t0;                           // arg — какой аргумент подменять (режим 3); sig — первые байты функции до хука (для сохранения и проверки версии); t0 — время постановки, мс
+    uintptr_t seen[8]; uint32_t seenN[8]; uint32_t rr;               // разные a0 (this), которые видели при вызовах: так находятся адреса объектов (моб, игрок)
 };
 static Slot g_slots[16];
 
@@ -827,26 +834,100 @@ static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
     Slot &s = g_slots[N];
     s.calls++;
     s.last[0] = a0; s.last[1] = a1; s.last[2] = a2; s.last[3] = a3; s.last[4] = a4; s.last[5] = a5; s.last[6] = a6; s.last[7] = a7;
+    int ix = -1;
+    for (int i = 0; i < 8; i++) if (s.seen[i] == a0) { ix = i; break; }
+    if (ix < 0) { ix = (int)(s.rr++ & 7); s.seen[ix] = a0; s.seenN[ix] = 0; }
+    s.seenN[ix]++;
     if (s.mode == 1) return s.val;
-    uintptr_t r = ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a0, a1, a2, a3, a4, a5, a6, a7);
+    uintptr_t a[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    if (s.mode == 3 && s.arg >= 0 && s.arg < 8) a[s.arg] = s.val;
+    uintptr_t r = ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
     return s.mode == 2 ? s.val : r;
 }
 template <size_t... I>
 static std::array<void *, sizeof...(I)> mkHooks(std::index_sequence<I...>) { return {{(void *)&hk<(int)I>...}}; }
 static std::array<void *, 16> g_hk = mkHooks(std::make_index_sequence<16>{});
 
+static long long hkNow() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : 0; }
+static Str hooksFile() { return dataDir() + "/mgg_hooks.txt"; }
+
 static Str hooksList() {
-    Str out;
+    Str out; long long now = hkNow();
     for (int i = 0; i < 16; i++) {
         const Slot &s = g_slots[i];
         if (!s.used) continue;
-        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : "set";
-        out += "#" + std::to_string(i) + " " + hx(s.off) + " режим=" + m + " val=" + hx(s.val) + " вызовов=" + std::to_string(s.calls.load()) + "\n   арги:";
+        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : "арг";
+        uint32_t c = s.calls.load(); double sec = (now - s.t0) / 1000.0; char t[64];
+        snprintf(t, sizeof t, "%.1f", sec > 0.5 ? c / sec : 0.0);
+        out += "#" + std::to_string(i) + " " + hx(s.off) + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
         for (int k = 0; k < 8; k++) out += " " + hx(s.last[k]);
+        std::vector<std::pair<uint32_t, uintptr_t>> th;
+        for (int k = 0; k < 8; k++) if (s.seenN[k]) th.push_back({s.seenN[k], s.seen[k]});
+        std::sort(th.begin(), th.end(), [](const std::pair<uint32_t, uintptr_t> &x, const std::pair<uint32_t, uintptr_t> &y) { return x.first > y.first; });
+        if (!th.empty()) { out += "\n   this:"; for (auto &p : th) out += " " + hx(p.second) + "×" + std::to_string(p.first); }
         out += "\n";
     }
     return out.empty() ? "хуков нет\n" : out;
 }
+
+// единая постановка хука (из панели и из автозагрузки): off — смещение функции без +1 (Thumb)
+static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_t val, Str &msg) {
+    for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == off) { msg = "на этом смещении уже есть хук #" + std::to_string(i); return -1; }
+    int id = -1;
+    for (int i = 0; i < 16; i++) if (!g_slots[i].used) { id = i; break; }
+    if (id < 0) { msg = "все 16 слотов заняты"; return -1; }
+    uintptr_t a = im.base + off;
+    if (!segAt(im, a, 8)) { msg = "смещение вне сегмента библиотеки"; return -1; }
+    Slot &s = g_slots[id];
+    s.mode = mode; s.val = val; s.arg = arg > 7 ? 7 : arg < 0 ? 0 : arg; s.off = off; s.calls = 0; s.t0 = hkNow(); s.rr = 0;
+    for (int k = 0; k < 8; k++) { s.seen[k] = 0; s.seenN[k] = 0; s.last[k] = 0; }
+    memcpy(s.sig, (const void *)a, 8);                                 // до хука: потом тут будет прыжок Dobby
+    s.target = (void *)(a + 1);                                        // +1: Thumb
+    int rc = MGG_HOOK(s.target, g_hk[id], &s.orig);
+    if (rc != 0) { msg = "Dobby вернул ошибку " + std::to_string(rc); return -1; }
+    s.used = true; return id;
+}
+
+static Str hooksSave() {
+    int n = 0; Str body = "HOOKS1\n"; char t[96];
+    for (const Slot &s : g_slots) {
+        if (!s.used) continue;
+        snprintf(t, sizeof t, "%lX %d %d %lX ", (unsigned long)s.off, s.mode, s.arg, (unsigned long)s.val); body += t;
+        for (int k = 0; k < 8; k++) { snprintf(t, sizeof t, "%02X", s.sig[k]); body += t; }
+        body += "\n"; n++;
+    }
+    if (!n) return "нет хуков для сохранения\n";
+    FILE *f = fopen(hooksFile().c_str(), "w"); if (!f) return "не могу писать " + hooksFile() + "\n";
+    fputs(body.c_str(), f); fclose(f);
+    return "сохранено хуков: " + std::to_string(n) + ". Они поставятся при старте игры после патчей, если первые байты функции не изменились (проверка версии). Если игра упадёт при этом, хуки отключатся сами (файл .disabled)\n";
+}
+static Str hooksApply(const Img &im) {
+    FILE *f = fopen(hooksFile().c_str(), "r"); if (!f) return "сохранённых хуков нет\n";
+    Str o; char line[256]; bool first = true;
+    while (fgets(line, sizeof line, f)) {
+        if (first) { first = false; if (strncmp(line, "HOOKS1", 6) != 0) { o += "неверный формат файла хуков\n"; break; } continue; }
+        unsigned long off = 0, val = 0; int mode = 0, arg = 0; char sg[40] = {0};
+        if (sscanf(line, "%lx %d %d %lx %33s", &off, &mode, &arg, &val, sg) != 5 || strlen(sg) != 16 || mode < 0 || mode > 3) continue;
+        std::vector<uint8_t> want; if (!unhex(sg, want)) continue;
+        bool already = false;
+        for (const Slot &s : g_slots) if (s.used && s.off == off) already = true;
+        if (already) { o += hx(off) + ": хук уже стоит\n"; continue; }
+        uintptr_t a = im.base + off;
+        if (!segAt(im, a, 8)) { o += hx(off) + ": вне сегмента, пропущен\n"; continue; }
+        if (memcmp((const void *)a, want.data(), 8) != 0) { o += hx(off) + ": пропущен, байты функции другие (другая версия игры?)\n"; continue; }
+        Str msg; int id = hookInstall(im, off, mode, arg, val, msg);
+        o += id >= 0 ? "хук #" + std::to_string(id) + " на " + hx(off) + " поставлен\n" : hx(off) + ": " + msg + "\n";
+    }
+    fclose(f); return o.empty() ? "файл хуков пуст\n" : o;
+}
+static bool hooksSavedExists() { return access(hooksFile().c_str(), F_OK) == 0; }
+static void hooksDisable() { rename(hooksFile().c_str(), (hooksFile() + ".disabled").c_str()); }
+static void autoApplyHooks(const Img &im) { if (hooksSavedExists()) { Str r = hooksApply(im); LOGI("автохуки: %s", r.c_str()); } }
+#else
+static bool hooksSavedExists() { return false; }
+static void hooksDisable() {}
+static void autoApplyHooks(const Img &) {}
 #endif
 
 // ---------------------------------------------------------------- файлы игры (только внутри папок приложения)
@@ -1236,6 +1317,92 @@ static Str memRoute(const Str &path, const Params &q) {
         return o;
     }
     return "неизвестный маршрут\n";
+}
+
+// ---------------------------------------------------------------- Символы: имя функции → смещение (из .dynsym загруженной библиотеки)
+// Если libminecraftpe.so экспортирует имена (_ZN8GameMode12destroyBlockE…), офсет функции находится по имени, без ручного поиска.
+static Str symPretty(const Str &m) {                                  // _ZN8GameMode12destroyBlockE… → GameMode::destroyBlock
+    if (m.compare(0, 3, "_ZN") != 0) return Str();
+    size_t i = 3; if (i < m.size() && m[i] == 'K') i++;
+    Str out;
+    while (i < m.size() && isdigit((unsigned char)m[i])) {
+        size_t n = 0; while (i < m.size() && isdigit((unsigned char)m[i])) n = n * 10 + (size_t)(m[i++] - '0');
+        if (n == 0 || i + n > m.size()) break;
+        if (!out.empty()) out += "::";
+        out += m.substr(i, n); i += n;
+    }
+    if (out.empty()) return Str();
+    if (i + 1 < m.size() && m[i] == 'C' && isdigit((unsigned char)m[i + 1])) out += " (конструктор)";
+    else if (i + 1 < m.size() && m[i] == 'D' && isdigit((unsigned char)m[i + 1])) out += " (деструктор)";
+    return out;
+}
+static size_t symGnuCount(uintptr_t gh, bool is64) {
+    uint32_t h[4]; if (!guarded(h, (const void *)gh, 16)) return 0;
+    uint32_t nb = h[0], symoff = h[1], bloom = h[2];
+    if (nb == 0 || nb > (1u << 22)) return 0;
+    uintptr_t buckets = gh + 16 + (uintptr_t)bloom * (is64 ? 8 : 4), chain = buckets + (uintptr_t)nb * 4;
+    std::vector<uint32_t> b(nb); if (!guarded(b.data(), (const void *)buckets, (size_t)nb * 4)) return 0;
+    uint32_t mx = 0; for (uint32_t v : b) if (v > mx) mx = v;
+    if (mx < symoff) return symoff;
+    uint32_t idx = mx;
+    for (uint32_t k = 0; k < 4000000; k++) { uint32_t c; if (!guarded(&c, (const void *)(chain + (uintptr_t)(idx - symoff) * 4), 4)) break; idx++; if (c & 1) break; }
+    return idx;
+}
+// sym: s — часть имени (без регистра), all=1 — ещё и переменные, max — сколько показать
+static Str symRoute(const Img &im, const Params &q) {
+    if (im.segs.empty()) return "#\tбиблиотека не найдена\n";
+    uint8_t eh[64]; if (!guarded(eh, (const void *)im.base, sizeof eh) || memcmp(eh, "\x7f""ELF", 4) != 0) return "#\tзаголовок ELF не читается\n";
+    bool is64 = eh[4] == 2; size_t PS = is64 ? 8 : 4;
+    uint64_t phoff = 0; uint32_t phn = 0, phes = 0;
+    if (is64) { memcpy(&phoff, eh + 0x20, 8); phes = eh[0x36] | (eh[0x37] << 8); phn = eh[0x38] | (eh[0x39] << 8); }
+    else { uint32_t t; memcpy(&t, eh + 0x1C, 4); phoff = t; phes = eh[0x2A] | (eh[0x2B] << 8); phn = eh[0x2C] | (eh[0x2D] << 8); }
+    uintptr_t dyn = 0; size_t dynsz = 0;
+    for (uint32_t i = 0; i < phn && i < 64; i++) {
+        uint8_t ph[64]; if (!guarded(ph, (const void *)(im.base + phoff + (uint64_t)i * phes), phes < sizeof ph ? phes : sizeof ph)) break;
+        uint32_t type; memcpy(&type, ph, 4); if (type != 2) continue;
+        if (is64) { uint64_t va, ms; memcpy(&va, ph + 16, 8); memcpy(&ms, ph + 40, 8); dyn = im.base + (uintptr_t)va; dynsz = (size_t)ms; }
+        else { uint32_t va, ms; memcpy(&va, ph + 8, 4); memcpy(&ms, ph + 20, 4); dyn = im.base + va; dynsz = ms; }
+    }
+    if (!dyn) return "#\tнет секции динамики (PT_DYNAMIC)\n";
+    uintptr_t symtab = 0, strtab = 0, hash = 0, gnu = 0;
+    for (size_t o = 0; o + 2 * PS <= dynsz && o < 0x4000; o += 2 * PS) {
+        uint64_t tag = 0, val = 0; if (!guarded(&tag, (const void *)(dyn + o), PS) || !guarded(&val, (const void *)(dyn + o + PS), PS)) break;
+        if (!is64) { tag &= 0xFFFFFFFFull; val &= 0xFFFFFFFFull; }
+        if (tag == 0) break;
+        uintptr_t p = (uintptr_t)val; if (p < im.base) p += im.base;       // у разных линкеров адреса в .dynamic — относительные или уже абсолютные
+        if (tag == 6) symtab = p; else if (tag == 5) strtab = p; else if (tag == 4) hash = p; else if (tag == 0x6ffffef5) gnu = p;
+    }
+    if (!symtab || !strtab) return "#\tв библиотеке нет таблицы экспортируемых символов\n";
+    size_t n = 0;
+    if (hash) { uint32_t nc; if (guarded(&nc, (const void *)(hash + 4), 4)) n = nc; }
+    if (!n && gnu) n = symGnuCount(gnu, is64);
+    if (!n || n > 2000000) return "#\tне смог определить число символов\n";
+    Str nd = P(q, "s"); std::transform(nd.begin(), nd.end(), nd.begin(), [](unsigned char c) { return (char)tolower(c); });
+    if (nd.size() < 2) return "#\tвведи часть имени (от 2 символов), например destroyBlock\n";
+    bool allk = P(q, "all") == "1"; size_t mx = decNum(q, "max", 100), cnt = 0, total = 0; Str o;
+    size_t es = is64 ? 24 : 16; std::vector<uint8_t> blk;
+    for (size_t i0 = 0; i0 < n; i0 += 4096) {
+        size_t m = std::min<size_t>(4096, n - i0); blk.assign(m * es, 0);
+        if (!guarded(blk.data(), (const void *)(symtab + i0 * es), m * es)) continue;
+        for (size_t k = 0; k < m; k++) {
+            const uint8_t *e = &blk[k * es]; uint32_t nm; memcpy(&nm, e, 4);
+            uint8_t info; uint16_t shn; uint64_t val, sz;
+            if (is64) { info = e[4]; memcpy(&shn, e + 6, 2); memcpy(&val, e + 8, 8); memcpy(&sz, e + 16, 8); }
+            else { info = e[12]; memcpy(&shn, e + 14, 2); uint32_t v32, s32; memcpy(&v32, e + 4, 4); memcpy(&s32, e + 8, 4); val = v32; sz = s32; }
+            int ty = info & 0xF; if (shn == 0 || val == 0 || !(ty == 2 || (allk && ty == 1))) continue;
+            char nb[256]; size_t got = 0;
+            for (size_t L = sizeof nb; L >= 8; L /= 2) if (guarded(nb, (const void *)(strtab + nm), L)) { got = L; break; }
+            if (!got) continue;
+            size_t len = strnlen(nb, got); if (len == got) continue;
+            Str name(nb, len), low = name; std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return (char)tolower(c); });
+            if (low.find(nd) == Str::npos) continue;
+            total++; if (cnt >= mx) continue;
+            bool thumb = !is64 && (val & 1); uintptr_t off = (uintptr_t)(thumb ? (val & ~(uint64_t)1) : val);
+            char t[48]; snprintf(t, sizeof t, "0x%lX\t%lu\t%c\t", (unsigned long)off, (unsigned long)sz, ty == 1 ? 'D' : is64 ? 'A' : thumb ? 'T' : 'A');
+            o += Str(t) + name + "\t" + symPretty(name) + "\n"; cnt++;
+        }
+    }
+    return "#\tнайдено: " + std::to_string(total) + (total > cnt ? " (показаны первые " + std::to_string(cnt) + ")" : Str()) + " · всего символов в таблице: " + std::to_string(n) + "\n" + o;
 }
 
 // ---------------------------------------------------------------- Привязанные значения в куче: дальность прорисовки (чанки), FOV, данные игрока
@@ -2879,10 +3046,20 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=grid2><button class=s onclick="call('undo',{a:v('pa')})"><svg class=ic><use href="#i-undo"/></svg>Откатить</button><button class=s onclick="call('patches',{})"><svg class=ic><use href="#i-list"/></svg>Список (сессия)</button><button class=s onclick="call('saved',{})"><svg class=ic><use href="#i-list"/></svg>Сохранённые</button><button class=d onclick="call('clearsaved',{})"><svg class=ic><use href="#i-trash"/></svg>Удалить сохранённые</button></div>
 <input id=qa placeholder="начало функции, hex"><input id=qv placeholder="число для ret, hex (0-FF)"><input id=qn placeholder="сколько NOP (1)">
 <div class=grid2><button onclick="call('quick',{a:v('qa'),m:'ret',v:v('qv')||'0',k:v('pk')})"><svg class=ic><use href="#i-save"/></svg>Функция → число</button><button onclick="call('quick',{a:v('qa'),m:'nop',n:v('qn')||1,k:v('pk')})"><svg class=ic><use href="#i-stop"/></svg>Забить NOP</button></div></div></details>
+<details class=card><summary><svg class=ic><use href="#i-search"/></svg>Символы: имя → смещение<svg class=ic><use href="#i-plus"/></svg></summary><div>
+<input id=sq placeholder="часть имени, например destroyBlock или attack">
+<div class=row><select id=sk><option value=0>только функции</option><option value=1>и переменные</option></select><button onclick="symFind()"><svg class=ic><use href="#i-search"/></svg>Найти</button></div>
+<small id=sys></small><div id=syr></div>
+<small>Работает, если библиотека экспортирует имена функций. Нажми на результат: смещение подставится в поля хука, патча и дизассемблера. T — Thumb (хукается), A — ARM (панель не хукает), D — переменная.</small></div></details>
 <details class=card><summary><svg class=ic><use href="#i-plug"/></svg>Хуки (нужен Dobby)<svg class=ic><use href="#i-plus"/></svg></summary><div>
-<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option></select>
-<input id=kv placeholder="значение, hex"><button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv')})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
-<input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv')})"><svg class=ic><use href="#i-reset"/></svg>Режим</button><button class=s onclick="call('unhook',{id:v('ki')})"><svg class=ic><use href="#i-stop"/></svg>Снять</button><button class=s onclick="call('hooks',{})"><svg class=ic><use href="#i-list"/></svg>Список</button></div></div></details>
+<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option><option value=arg>подменить аргумент</option></select>
+<div class=row><input id=kv placeholder="значение, hex"><input id=kn placeholder="№ аргумента 0–7" inputmode=numeric></div>
+<button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
+<input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-reset"/></svg>Режим</button><button class=s onclick="call('unhook',{id:v('ki')})"><svg class=ic><use href="#i-stop"/></svg>Снять</button><button class=s onclick="call('hooks',{})"><svg class=ic><use href="#i-list"/></svg>Список</button></div>
+<div class=grid2><button class=s onclick="hkLive(this)"><svg class=ic><use href="#i-look"/></svg>Живой список</button><button class=s onclick="call('hookset',{id:v('ki'),reset:1})"><svg class=ic><use href="#i-reset"/></svg>Сбросить счётчики</button></div>
+<div id=hkl class=lv style="white-space:pre-wrap;display:none;color:var(--dim)"></div>
+<div class=grid3><button class=s onclick="call('hooksave',{})">Сохранить</button><button class=s onclick="call('hookload',{})">Применить сохр.</button><button class=d onclick="call('hookclear',{})">Удалить сохр.</button></div>
+<small>лог — считает вызовы, показывает аргументы a0–a7 и разные «this» (a0): так находятся адреса объектов, потом Mem → Соседи. ret — функция сразу возвращает значение. set — результат оригинала заменяется. арг — оригинал вызывается, но аргумент № заменяется на значение (float как hex: 170.0 = 432A0000). Сохранённые хуки ставятся при старте, только если байты функции те же.</small></div></details>
 </div>
 
 <div class=pg id=pf style="display:none">
@@ -2959,6 +3136,11 @@ return '<div>'+tok(l)+'</div>'}
 let RAW='';
 function paint(t){out.innerHTML=t.replace(/\n$/,'').split('\n').map(paintLine).join('')}
 Object.defineProperty(out,'textContent',{configurable:true,get(){return RAW},set(v){RAW=String(v);paint(RAW)}});
+async function symFind(){document.getElementById('sys').textContent='ищу…';const t=await api('sym',{s:v('sq'),all:v('sk'),max:300});
+hRender('syr','sys',t,(r,c)=>{hTx(r,c[0]+'  '+(c[4]||c[3])+'  ['+c[2]+', '+c[1]+' Б]','var(--cl)');r.style.cursor='pointer';r.onclick=()=>{for(const i of ['ka','pa','da','ha','fa','ca'])document.getElementById(i).value=c[0].replace('0x','');out.textContent='смещение '+c[0]+' → в поля хука, патча, дизассемблера и hex'}},40)}
+let HKT=null;
+function hkLive(b){const d=document.getElementById('hkl');if(HKT){clearInterval(HKT);HKT=null;d.style.display='none';b.className='s';return}
+d.style.display='';b.className='g';const tick=async()=>{if(document.getElementById('pl').style.display=='none'){clearInterval(HKT);HKT=null;d.style.display='none';b.className='s';return}d.textContent=(await api('hooks')).trim()};tick();HKT=setInterval(tick,1000)}
 function paintEl(el,t){el.textContent=t;const c=cls(t);el.style.color=c=='er'?'var(--er)':c=='ok'?'var(--ok)':c=='wr'?'var(--wr)':''}
 function tab(x){for(const k of ['n','m','l','d','f','s','t']){document.getElementById('p'+k).style.display=x==k?'':'none';document.getElementById('b'+k).className=x==k?'nav on':'nav'}
 if(x=='n'){fnl();slRefresh()}if(x=='l')libLoad();if(x=='d'&&!window.dxOnce){window.dxOnce=1;dexList()}if(x=='f'&&!window.fOnce){window.fOnce=1;findopt()}window.scrollTo(0,0)}
@@ -3267,35 +3449,31 @@ static Str route(const Str &path, const Params &q) {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex, начало функции)\n";
         return findCallers(im, (uint32_t)a, decNum(q, "max", 60));
     }
+    if (path == "sym") return symRoute(im, q);
 #ifdef MGG_HAS_DOBBY
     if (path == "hooks") return hooksList();
     if (path == "hook") {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex)\n";
-        int id = -1;
-        for (int i = 0; i < 16; i++) if (!g_slots[i].used) { id = i; break; }
-        if (id < 0) return "все 16 слотов заняты\n";
-        Slot &s = g_slots[id];
-        Str m = P(q, "m", "log");
-        s.mode = m == "ret" ? 1 : m == "set" ? 2 : 0;
-        uintptr_t v = 0; hexNum(q, "v", v); s.val = v;
-        s.off = a; s.calls = 0; s.target = (void *)(im.base + a + 1);          // +1: Thumb
-        int rc = MGG_HOOK(s.target, g_hk[id], &s.orig);
-        if (rc != 0) return "Dobby вернул ошибку " + std::to_string(rc) + "\n";
-        s.used = true;
+        uintptr_t v = 0; hexNum(q, "v", v);
+        Str msg; int id = hookInstall(im, a, hkMode(P(q, "m", "log")), (int)decNum(q, "n", 0), v, msg);
+        if (id < 0) return msg + "\n";
         return "хук #" + std::to_string(id) + " на " + hx(a) + " (Thumb)\n";
     }
+    if (path == "hooksave") return hooksSave();
+    if (path == "hookload") return hooksApply(im);
+    if (path == "hookclear") { remove(hooksFile().c_str()); return "сохранённые хуки удалены (уже стоящие остаются до перезапуска игры)\n"; }
     if (path == "hookset" || path == "unhook") {
         size_t id = decNum(q, "id", 99);
         if (id >= 16 || !g_slots[id].used) return "нет такого хука\n";
         Slot &s = g_slots[id];
         if (path == "unhook") { MGG_UNHOOK(s.target); s.used = false; return "снят\n"; }
-        Str m = P(q, "m", "log");
+        if (P(q, "reset") == "1") { s.calls = 0; s.t0 = hkNow(); for (int k = 0; k < 8; k++) { s.seen[k] = 0; s.seenN[k] = 0; } return "счётчики сброшены\n"; }
         uintptr_t v = 0; hexNum(q, "v", v);
-        s.val = v; s.mode = m == "ret" ? 1 : m == "set" ? 2 : 0;
+        s.val = v; s.mode = hkMode(P(q, "m", "log")); s.arg = (int)decNum(q, "n", 0); if (s.arg > 7) s.arg = 7;
         return "режим обновлён\n";
     }
 #else
-    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook")
+    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook" || path == "hooksave" || path == "hookload" || path == "hookclear")
         return "эта сборка без Dobby: хуки недоступны (поиск, xref, hex и патчи работают)\n";
 #endif
     return "неизвестный маршрут\n";
