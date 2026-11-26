@@ -3698,10 +3698,10 @@ const QS=new URLSearchParams(location.search),T=QS.get('t')||'',EMB=QS.get('embe
 const $=id=>document.getElementById(id);
 const LS=(k,d)=>{try{const x=JSON.parse(localStorage.getItem(k));return x==null?d:x}catch(e){return d}};
 const SV=(k,x)=>{try{localStorage.setItem(k,JSON.stringify(x))}catch(e){}};
-let UI=Object.assign({zm:1,a:.88,hd:'#c4262e',keep:0},LS('mggPcUi',{}));
+let UI=Object.assign({zm:innerWidth<520?.7:1,a:.88,hd:'#c4262e',keep:0},LS('mggPcUi',{}));
 let POS=LS('mggPcPos',{}),COL=LS('mggPcCol',{}),OPN=LS('mggPcOpen',{}),VAL=LS('mggPcVal',{});
 const S={zone:'0',place:'0',fov:'',chunk:'',pre:{},fn:[]};
-let ZM=0,FNSIG='',ROW={},NOTES=[],WINS={};
+let ZM=0,FNSIG='',ROW={},NOTES=[],WINS={},ZI=1;
 async function api(p,o){const q=new URLSearchParams(o||{});q.set('t',T);try{return await(await fetch('/api/'+p+'?'+q)).text()}catch(e){return 'ошибка связи'}}
 function log(t){$('log').textContent=String(t).trim()}
 async function call(p,o){const t=await api(p,o);log(t);return t}
@@ -3783,7 +3783,7 @@ function build(){const pl=$('pl');pl.textContent='';ROW={};NOTES=[];WINS={};cons
   const w=document.createElement('div');w.className='win';const hd=document.createElement('div');hd.className='hd';hd.innerHTML='<span></span><i></i>';hd.firstChild.textContent=c;w.appendChild(hd);
   const body=document.createElement('div');body.hidden=!!COL[c];w.appendChild(body);
   for(const m of ms){const row=document.createElement('div');row.className='mod'+(m.k=='act'?' act':'');row.innerHTML='<span class=n></span><small class=sb></small>';row.querySelector('.n').textContent=m.n;
-   row.onclick=()=>run(m);const R={el:row,sb:row.querySelector('.sb'),m};
+   row.onclick=()=>{w.style.zIndex=++ZI;run(m)};const R={el:row,sb:row.querySelector('.sb'),m};
    if(m.set&&m.set.length){const ar=document.createElement('div');ar.className='ar'+(OPN[m.id]?' o':'');ar.textContent='›';ar.onclick=e=>{e.stopPropagation();toggleOpen(m)};row.appendChild(ar);R.ar=ar;
     body.appendChild(row);R.set=mkSet(m);body.appendChild(R.set)}else body.appendChild(row);
    ROW[m.id]=R}
@@ -3794,7 +3794,7 @@ function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth
   if(!p){let k=0;for(let i=1;i<cols;i++)if(h[i]<h[k])k=i;p=[8+k*184,h[k]];h[k]+=o.w.offsetHeight+8}
   o.w.style.left=p[0]+'px';o.w.style.top=p[1]+'px'}}
 function dragInit(c){const o=WINS[c],hd=o.hd;let sx,sy,ox,oy,mv=false,on=false;
- hd.onpointerdown=e=>{on=true;mv=false;sx=e.clientX;sy=e.clientY;ox=o.w.offsetLeft;oy=o.w.offsetTop;hd.setPointerCapture(e.pointerId)};
+ hd.onpointerdown=e=>{o.w.style.zIndex=++ZI;on=true;mv=false;sx=e.clientX;sy=e.clientY;ox=o.w.offsetLeft;oy=o.w.offsetTop;hd.setPointerCapture(e.pointerId)};
  hd.onpointermove=e=>{if(!on)return;const dx=(e.clientX-sx)/UI.zm,dy=(e.clientY-sy)/UI.zm;if(Math.abs(dx)+Math.abs(dy)>4)mv=true;if(mv){o.w.style.left=Math.max(0,ox+dx)+'px';o.w.style.top=Math.max(0,oy+dy)+'px'}};
  hd.onpointerup=e=>{if(!on)return;on=false;if(mv){POS[c]=[o.w.offsetLeft,o.w.offsetTop];SV('mggPcPos',POS)}else{COL[c]=!COL[c];SV('mggPcCol',COL);o.body.hidden=!!COL[c]}}}
 function paint(){for(const c of CATS){const o=WINS[c];if(!o)continue;let on=0,tot=0;
