@@ -154,6 +154,21 @@ static size_t decNum(const Params &q, const char *k, size_t d) {
     return (size_t)strtoull(it->second.c_str(), nullptr, 10);
 }
 
+// число из панели -> 32-битное слово (float: биты IEEE, int: как есть)
+static bool numWord(const Str &s, bool isf, uint32_t &w) {
+    if (s.empty()) return false;
+    char *e = nullptr;
+    if (isf) { float f = strtof(s.c_str(), &e); memcpy(&w, &f, 4); }
+    else w = (uint32_t)strtol(s.c_str(), &e, 10);
+    return e && *e == 0;
+}
+static Str wordStr(uint32_t w, bool isf) {
+    char b[48];
+    if (isf) { float f; memcpy(&f, &w, 4); snprintf(b, sizeof b, "%g", (double)f); }
+    else snprintf(b, sizeof b, "%d", (int)w);
+    return b;
+}
+
 // "F0 B5 ?? 03AF" -> байты, -1 = маска
 static bool parseSig(const Str &p, std::vector<int> &pat, Str &err) {
     size_t i = 0;
@@ -768,6 +783,42 @@ static void loadFile() {
     fclose(f);
 }
 
+// поиск констант-лимитов: слова f1 (и f2 рядом, в пределах win байт) в неписываемых сегментах (код с литерал-пулами и rodata)
+static Str fPair(const Img &im, const Params &q) {
+    bool isf = P(q, "t", "f") != "i";
+    uint32_t w1 = 0, w2 = 0; Str s1 = P(q, "f1"), s2 = P(q, "f2");
+    if (!numWord(s1, isf, w1)) return "нужен f1 (число)\n";
+    bool two = !s2.empty();
+    if (two && !numWord(s2, isf, w2)) return "f2 не число\n";
+    size_t win = decNum(q, "win", 256); if (win < 8) win = 8; if (win > 4096) win = 4096;
+    std::vector<std::pair<uintptr_t, bool>> A, B;
+    for (const Seg &g : im.segs) {
+        if (!g.r || g.w) continue;
+        const uint8_t *p = (const uint8_t *)g.s; size_t n = g.e - g.s;
+        for (size_t i = 0; i + 4 <= n; i += 4) {
+            uint32_t w; memcpy(&w, p + i, 4);
+            if (w == w1) A.push_back({g.s + i, g.x});
+            else if (two && w == w2) B.push_back({g.s + i, g.x});
+        }
+    }
+    Str o; int shown = 0;
+    if (!two) {
+        o = "найдено " + std::to_string(A.size()) + " слов " + wordStr(w1, isf) + "\n";
+        for (auto &x : A) { if (shown++ >= 80) { o += "...\n"; break; } o += hx(x.first - im.base) + (x.second ? "  код\n" : "  данные\n"); }
+        return o;
+    }
+    o = Str("слов ") + wordStr(w1, isf) + ": " + std::to_string(A.size()) + ", слов " + wordStr(w2, isf) + ": " + std::to_string(B.size()) + "\nпары в пределах " + std::to_string(win) + " байт:\n";
+    for (auto &x : A) for (auto &y : B) {
+        size_t d = x.first > y.first ? x.first - y.first : y.first - x.first;
+        if (d > win) continue;
+        if (shown++ >= 60) { o += "...\n"; return o; }
+        o += hx(x.first - im.base) + " (" + wordStr(w1, isf) + ")  " + hx(y.first - im.base) + " (" + wordStr(w2, isf) + ")  " + (x.second ? "код" : "данные") + "\n";
+    }
+    if (!shown) o += "пар нет: попробуй окно побольше (win) или поищи по одной константе (f2 пусто)\n";
+    else o += "Дальше: fset по адресу нужной константы (литерал в коде общий для всех, кто его читает).\n";
+    return o;
+}
+
 static Str doPatch(const Img &im, uintptr_t off, const std::vector<uint8_t> &b, bool keep) {
     if (keep && g_lib != MGG_TARGET_LIB) return Str("«сохранять на запуски» только для ") + MGG_TARGET_LIB + ": выбери «только сейчас» или основную библиотеку\n";
     auto it = g_patches.find(off);
@@ -878,6 +929,23 @@ static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
             g_inArea = false;
         }
     }
+    if (s.mode == 6 && !g_inArea && (r & 0xFF) && a[1] > 0x10000 && (a[2] & 0xFF) <= 5) {   // Multiple place: после успешной постановки ставим пластину W x H на той же грани
+        int p[3];
+        if (guarded(p, (const void *)a[1], 12) && p[0] > -30000000 && p[0] < 30000000 && p[2] > -30000000 && p[2] < 30000000) {
+            int W = (int)(s.val & 0xFF), H = (int)((s.val >> 8) & 0xFF);
+            W = W < 1 ? 1 : W > 9 ? 9 : W; H = H < 1 ? 1 : H > 9 ? 9 : H;
+            int f = (int)(a[2] & 0xFF);                                // грань, по которой кликнули: 0 низ, 1 верх, 2 север, 3 юг, 4 запад, 5 восток
+            static const int PU[6][3] = {{1,0,0},{1,0,0},{1,0,0},{1,0,0},{0,0,1},{0,0,1}};
+            static const int PV[6][3] = {{0,0,1},{0,0,1},{0,1,0},{0,1,0},{0,1,0},{0,1,0}};
+            g_inArea = true;
+            for (int v = -(H - 1) / 2; v <= H / 2; v++) for (int u = -(W - 1) / 2; u <= W / 2; u++) {
+                if (!u && !v) continue;
+                int q[3] = {p[0] + u * PU[f][0] + v * PV[f][0], p[1] + u * PU[f][1] + v * PV[f][1], p[2] + u * PU[f][2] + v * PV[f][2]};
+                ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], (uintptr_t)q, a[2], a[3], a[4], a[5], a[6], a[7]);
+            }
+            g_inArea = false;
+        }
+    }
     return s.mode == 2 ? s.val : r;
 }
 template <size_t... I>
@@ -885,7 +953,7 @@ static std::array<void *, sizeof...(I)> mkHooks(std::index_sequence<I...>) { ret
 static std::array<void *, 16> g_hk = mkHooks(std::make_index_sequence<16>{});
 
 static long long hkNow() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : m == "area" ? 4 : m == "zone" ? 5 : 0; }
+static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : m == "area" ? 4 : m == "zone" ? 5 : m == "place" ? 6 : 0; }
 static Str hooksFile() { return dataDir() + "/mgg_hooks.txt"; }
 
 static Str hooksList() {
@@ -893,7 +961,7 @@ static Str hooksList() {
     for (int i = 0; i < 16; i++) {
         const Slot &s = g_slots[i];
         if (!s.used) continue;
-        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : s.mode == 4 ? "area" : "зона";
+        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : s.mode == 4 ? "area" : s.mode == 5 ? "зона" : "place";
         uint32_t c = s.calls.load(); double sec = (now - s.t0) / 1000.0; char t[64];
         snprintf(t, sizeof t, "%.1f", sec > 0.5 ? c / sec : 0.0);
         out += "#" + std::to_string(i) + " " + hx(s.off) + (s.arm ? " ARM" : " T") + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
@@ -944,7 +1012,7 @@ static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_
 }
 
 // автопоиск GameMode::destroyBlock (символы вырезаны): "8GameMode" → typeinfo → vtable (слово перед typeinfo = 0) → слот 3. Возвращает смещение (+1 = Thumb)
-static uintptr_t findDestroyBlock(const Img &im, Str &why) {
+static uintptr_t gmVtable(const Img &im, Str &why) {   // адрес слота 0 в vtable GameMode (первая запись после typeinfo)
     static const char key[] = "8GameMode";
     std::vector<uintptr_t> names;
     for (const Seg &g : im.segs) {
@@ -968,15 +1036,102 @@ static uintptr_t findDestroyBlock(const Img &im, Str &why) {
             for (uintptr_t h : vt) {
                 if (!segAt(im, h - 4, 4) || *(const uint32_t *)(h - 4) != 0) continue;       // offset_to_top = 0: это vtable самого GameMode, а не наследника
                 if (!segAt(im, h + 16, 4)) continue;
-                uint32_t fp = *(const uint32_t *)(h + 4 + 4 * 3);                              // слот 3
+                uint32_t fp = *(const uint32_t *)(h + 4 + 4 * 3);                              // проверка на слоте 3 (destroyBlock)
                 if (!segAt(im, fp & ~1u, 4)) continue;
                 const Seg *sg = segAt(im, fp & ~1u, 4); if (!sg || !sg->x) continue;
-                return (uintptr_t)(fp - im.base);
+                return h + 4;
             }
         }
     }
     why = "vtable GameMode не найден\n"; return 0;
 }
+
+// функция из слота vtable GameMode: смещение (+1 = Thumb). Слоты: 3 = destroyBlock, 7 = buildBlock, 11 = getPickRange (не везде одинаково: см. «Слоты GameMode»)
+static uintptr_t findGameModeSlot(const Img &im, int slot, Str &why) {
+    uintptr_t v = gmVtable(im, why);
+    if (!v) return 0;
+    if (slot < 0 || !segAt(im, v + 4 * slot, 4)) { why = "слот вне vtable\n"; return 0; }
+    uint32_t fp = *(const uint32_t *)(v + 4 * slot);
+    const Seg *sg = segAt(im, fp & ~1u, 4);
+    if (!sg || !sg->x) { why = "слот " + std::to_string(slot) + " не указывает на код (другая сборка или конец vtable)\n"; return 0; }
+    return (uintptr_t)(fp - im.base);
+}
+
+// диагностика: что лежит в слотах vtable GameMode (смещение и первые байты). Короткие функции (bx lr рядом с началом) — вероятные геттеры вроде getPickRange
+static Str gmSlots(const Img &im, size_t n) {
+    Str why; uintptr_t v = gmVtable(im, why);
+    if (!v) return why;
+    Str o = "vtable GameMode: " + hx(v - im.base) + " (слот 0 = деструктор)\nслот  смещение  байты\n";
+    for (size_t i = 0; i < n && i < 90; i++) {
+        if (!segAt(im, v + 4 * i, 4)) break;
+        uint32_t fp = rd32(v + 4 * i);
+        const Seg *sg = segAt(im, fp & ~1u, 8);
+        if (!sg || !sg->x) { o += std::to_string(i) + "  - не код\n"; continue; }
+        const uint8_t *b = (const uint8_t *)(uintptr_t)(fp & ~1u);
+        bool shortFn = false;
+        if (fp & 1) for (int k = 0; k < 8; k += 2) if (b[k] == 0x70 && b[k + 1] == 0x47) shortFn = true;
+        o += std::to_string(i) + "  " + hx(fp - im.base) + "  " + hexs(std::vector<uint8_t>(b, b + 8)) + (shortFn ? "  короткая" : "") + "\n";
+    }
+    return o;
+}
+
+// заготовки: готовые «хуки с названием». Слот >= 0: адрес берётся из vtable GameMode; -1: нужен адрес от тебя (заготовка)
+struct Pre { const char *id, *name; int slot; bool isf; const char *def; const char *hint; };
+static const Pre kPre[] = {
+    {"reach",      "Reach (дальность руки)",  11, true,  "7.0",    "GameMode::getPickRange: float, ваниль около 5. Слот 11 — предположение: сверь по «Слоты GameMode» (короткая функция, вызывается каждый кадр)."},
+    {"breakspd",   "Скорость слома",          -1, true,  "1000.0", "Нужен адрес функции скорости/прогресса слома. Ищи: Lib → sym по destroy, либо hook в режиме лог и ломай блок."},
+    {"viewdist",   "Лимит чанков",            -1, false, "96",     "Нужен адрес функции, что зажимает дальность прорисовки. Проще константой: карточка «Лимиты», int-пара."},
+    {"vibrant",    "Vibrant Visuals везде",   -1, false, "1",      "Нужен адрес проверки «устройство поддерживает Vibrant Visuals» (возвращает bool). Значение 1."},
+    {"timefreeze", "Заморозка времени",       -1, false, "0",      "Нужен адрес обновления времени суток (Level). Режим ret пропускает вызов. Только одиночная игра."},
+    {"weather",    "Погода: заморозка",       -1, false, "0",      "Нужен адрес обновления погоды (Weather/Level tick). Режим ret пропускает вызов."},
+    {"fly",        "Полёт",                   -1, false, "1",      "Нужен адрес проверки «может летать» (abilities игрока). Значение 1. Только одиночная игра."},
+    {"noclip",     "Noclip",                  -1, false, "1",      "Нужен адрес проверки столкновений игрока. Значение 1. Только одиночная игра."},
+};
+static std::map<Str, int> g_preSlot;                                   // id заготовки -> номер слота хука
+
+static Str preList() {
+    Str o;
+    for (const Pre &p : kPre) {
+        bool on = false; Str off = "-";
+        auto it = g_preSlot.find(p.id);
+        if (it != g_preSlot.end() && g_slots[it->second].used) { off = hx(g_slots[it->second].off); on = g_slots[it->second].mode == 1; }
+        o += Str(p.id) + "\t" + p.name + "\t" + (on ? "1" : "0") + "\t" + (p.slot >= 0 ? std::to_string(p.slot) : Str("-")) + "\t" + p.def + "\t" + off + "\t" + p.hint + "\n";
+    }
+    return o;
+}
+
+static Str preSet(const Img &im, const Params &q) {
+    Str id = P(q, "id"); const Pre *pp = nullptr;
+    for (const Pre &p : kPre) if (id == p.id) pp = &p;
+    if (!pp) return "нет такой заготовки\n";
+    Str on = P(q, "on", "1"); auto it = g_preSlot.find(id);
+    if (on == "0") {
+        if (it == g_preSlot.end() || !g_slots[it->second].used) return "не включено\n";
+        g_slots[it->second].mode = 0;                                  // хук остаётся стоять в режиме лога
+        return Str("выключено: ") + pp->name + "\n";
+    }
+    uint32_t w = 0; Str vs = P(q, "v"); if (vs.empty()) vs = pp->def;
+    if (!numWord(vs, pp->isf, w)) return "значение не число: " + vs + "\n";
+    uintptr_t off = 0;
+    if (!hexNum(q, "a", off)) {
+        Str ss = P(q, "s"); int sl = ss.empty() ? pp->slot : atoi(ss.c_str());
+        if (sl < 0) return Str("заготовка «") + pp->name + "»: впиши адрес функции (hex) или слот vtable GameMode.\n" + pp->hint + "\n";
+        Str why; off = findGameModeSlot(im, sl, why); if (!off) return why;
+    }
+    uintptr_t base = off & ~(uintptr_t)1; int use = -1;
+    if (it != g_preSlot.end() && g_slots[it->second].used) { if (g_slots[it->second].off == base) use = it->second; else g_slots[it->second].mode = 0; }
+    if (use < 0) for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == base) {
+        if (g_slots[i].mode == 5 || g_slots[i].mode == 6) return "на этом адресе уже стоит Multiple destroy/place\n";
+        use = i; break;
+    }
+    if (use >= 0) { g_slots[use].mode = 1; g_slots[use].val = w; g_preSlot[id] = use; return Str("включено: ") + pp->name + " = " + vs + " (хук #" + std::to_string(use) + ")\n"; }
+    Str msg; int n = hookInstall(im, off, 1, 0, w, msg, 0);
+    if (n < 0) return msg + "\n";
+    g_preSlot[id] = n;
+    return Str("включено: ") + pp->name + " = " + vs + " (хук #" + std::to_string(n) + " на " + hx(g_slots[n].off) + ")\n";
+}
+
+static uintptr_t findDestroyBlock(const Img &im, Str &why) { return findGameModeSlot(im, 3, why); }   // слот 3 = GameMode::destroyBlock
 
 static Str hooksSave() {
     int n = 0; Str body = "HOOKS1\n"; char t[96];
@@ -999,7 +1154,7 @@ static Str hooksApply(const Img &im) {
         if (first) { first = false; if (strncmp(line, "HOOKS1", 6) != 0) { o += "неверный формат файла хуков\n"; break; } continue; }
         unsigned long off = 0, val = 0; int mode = 0, arg = 0, isa = 1; char sg[40] = {0};
         int nf = sscanf(line, "%lx %d %d %lx %33s %d", &off, &mode, &arg, &val, sg, &isa);
-        if (nf < 5 || strlen(sg) != 16 || mode < 0 || mode > 5) continue;
+        if (nf < 5 || strlen(sg) != 16 || mode < 0 || mode > 6) continue;
         if (nf < 6 || isa < 1 || isa > 2) isa = 1;
         std::vector<uint8_t> want; if (!unhex(sg, want)) continue;
         bool already = false;
@@ -3032,12 +3187,6 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div id=fgl>
 <div id=sl></div>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Функции<span class=hr><select id=fk2 class=mini><option value=0>сейчас</option><option value=1>запомнить</option></select><button class="s ib" title="Обновить" onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg></button></span></h3><div id=fl class=fg>…</div></div>
-<details class=card><summary><svg class=ic><use href="#i-plus"/></svg>Создать функцию из патчей сессии<svg class=ic><use href="#i-plus"/></svg></summary><div>
-<input id=fnn placeholder="название (например Disable render limit)">
-<button onclick="call('fnsave',{n:v('fnn')}).then(fnl)"><svg class=ic><use href="#i-save"/></svg>Сохранить патчи сессии</button>
-<input id=fpn placeholder="профиль: название"><input id=fpl placeholder="функции через запятую">
-<button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)"><svg class=ic><use href="#i-flag"/></svg>Создать профиль (набор функций)</button>
-<small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
 </div>
 <div id=fll style="display:none">
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Multiple destroy</h3>
@@ -3045,6 +3194,24 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=zr><b>Ш</b><select id=azw><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><b>В</b><select id=azh><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><b>Г</b><select id=azd><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
 <div class="pre sm" style="margin-top:4px"><button class=s onclick="azP(1,1,1)">1x1</button><button class=s onclick="azP(3,2,1)">3x2</button><button class=s onclick="azP(3,3,1)">3x3</button><button class=s onclick="azP(5,5,1)">5x5</button><button class=s onclick="azP(3,3,3)">3x3x3</button></div>
 <small>Работает только в локальном мире. Ш × В в плоскости грани, Г вглубь. Адрес destroyBlock ищется сам.</small></div>
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Multiple place</h3>
+<div class="fn c" onclick="plGo()"><div class=nm>Multiple place<div class=sub id=pls>выключено</div></div><div class=sw id=plsw></div></div>
+<div class=zr><b>Ш</b><select id=plw><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><b>В</b><select id=plh><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select></div>
+<div class="pre sm" style="margin-top:4px"><button class=s onclick="plP(3,1)">3x1</button><button class=s onclick="plP(3,3)">3x3</button><button class=s onclick="plP(5,5)">5x5</button><button class=s onclick="plP(9,9)">9x9</button></div>
+<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--dim);font-size:11px">Если не ставит</summary>
+<div class=row><b style="align-self:center">слот</b><select id=plsl><option>6</option><option selected>7</option><option>8</option></select></div>
+<small>Слот vtable GameMode: 7 = buildBlock. Если блоки не ставятся, выключи, поменяй слот на 6 или 8 и включи снова.</small></details>
+<small>Только локальный мир. Ставит пластину Ш × В вокруг блока, на который поставил, в плоскости грани. Блоки нужны в запасе (в выживании тратятся). Глубины нет: слой ставится не раньше, чем появится опора.</small></div>
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Заготовки (хуки)</h3>
+<div id=prl><small>…</small></div>
+<div class=grid3 style="margin-top:6px"><button class=s onclick="call('gmslots',{n:40})">Слоты GameMode</button><button class=s onclick="call('hooks',{})">Список хуков</button><button class=s onclick="call('hooksave',{})">Запомнить хуки</button></div>
+<small>Включить = поставить хук в режиме «вернуть значение». Где слот известен (Reach), адрес находится сам, остальным нужен адрес функции: впиши hex и включи. Значение: float или целое, как в строке. Только одиночная игра.</small></div>
+<div class=card><h3><svg class=ic><use href="#i-search"/></svg>Лимиты (константы)</h3>
+<div class=row><input id=lf1 value=30 inputmode=decimal><input id=lf2 value=110 inputmode=decimal><select id=lt style="flex:.6"><option value=f>float</option><option value=i>int</option></select></div>
+<button onclick="call('fpair',{f1:v('lf1'),f2:v('lf2'),t:v('lt')})"><svg class=ic><use href="#i-search"/></svg>Найти пару констант</button>
+<div class=row style="margin-top:6px"><input id=la placeholder="адрес (hex)"><input id=ln placeholder="новое"></div>
+<div class=grid3><button onclick="call('fset',{a:v('la'),f:v('ln'),t:v('lt'),k:0})">Применить</button><button class=s onclick="call('fset',{a:v('la'),f:v('ln'),t:v('lt'),k:1})">+ запомнить</button><button class=d onclick="call('undo',{a:v('la')})">Откат</button></div>
+<small>По умолчанию ищет зажим FOV 30 и 110 (рядом лежащие константы). Для чанков: тип int и числа из твоих находок (например 5 и 13). Литерал в коде общий для всех мест, где он читается: смотри, что сломалось, и откатывай.</small></div>
 </div>
 </div>
 <div class=pg id=pm style="display:none">
@@ -3257,7 +3424,7 @@ try{const r=await fetch('/api/'+p+'?'+q);const t=await r.text();out.textContent=
 function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navigator.clipboard){navigator.clipboard.writeText(t)}}
 async function fnl(){const q=new URLSearchParams({t:T});let r='';try{r=await(await fetch('/api/fnlist?'+q)).text()}catch(e){r='ошибка'}
 const d=document.getElementById('fl');d.textContent='';
-if(r.startsWith('пусто')||r.indexOf('\t')<0){const m=document.createElement('div');m.style.color='var(--dim)';m.textContent=r.startsWith('пусто')?'Функций пока нет. Добавь через File → mgg_functions.txt или сохрани патчи сессии.':r;d.appendChild(m);return}
+if(r.startsWith('пусто')||r.indexOf('\t')<0){const m=document.createElement('div');m.style.color='var(--dim)';m.textContent=r.startsWith('пусто')?'Функций пока нет.':r;d.appendChild(m);return}
 for(const ln of r.trim().split('\n')){const [n,st,c]=ln.split('\t');const prof=st[0]=='P';const s=prof?st[1]:st;const on=s=='1';
 const row=document.createElement('div');row.className='fn c';
 const nm=document.createElement('div');nm.className='nm';nm.textContent=n;const sub=document.createElement('div');sub.className='sub';
@@ -3311,6 +3478,7 @@ const SL=[{s:'fov',t:'Fov changer',min:30,max:150,def:70,opt:'gfx_field_of_view'
 function slotInit(){const d=document.getElementById('sl');d.textContent='';for(const x of SL){const c=document.createElement('div');c.className='card';
 c.innerHTML=`<h3><svg class=ic><use href="#i-eye"/></svg>${x.t}</h3><div class=rg><input type=range id=r_${x.s} min=${x.min} max=${x.max} value=${x.def} oninput="document.getElementById('rv_${x.s}').textContent=this.value"><b id=rv_${x.s}>${x.def}</b></div>
 <div class=grid3><button onclick="slA('${x.s}')">Применить</button><button class=s onclick="slS('${x.s}')">Снять</button><button class=s onclick="slO('${x.s}')">options.txt</button></div>
+<button class=s style="margin-top:5px" id=zmb onclick="zoomT()">Зум: выкл</button>
 <small id=st_${x.s}>…</small>
 <details style="margin-top:6px"><summary style="cursor:pointer;color:var(--dim);font-size:11px">Адрес и привязка</summary>
 <div class=row><input id=ba_${x.s} placeholder="адрес (hex) или пусто"><button class=s onclick="slB('${x.s}')"><svg class=ic><use href="#i-link"/></svg>Привязать</button></div>
@@ -3448,8 +3616,24 @@ function azUi(t){AZ=t.startsWith('1')?1:0;const a=t.trim().split(' ');if(AZ){doc
 async function azInit(){azUi(await api('zone',{on:2}))}
 async function azSend(on){await call('zone',{on:on,w:v('azw'),h:v('azh'),d:v('azd')});azUi(await api('zone',{on:2}))}
 function azGo(){azSend(AZ?0:1)}
+function plUi(t){PL=t.startsWith('1')?1:0;const a=t.trim().split(' ');if(PL){document.getElementById('plw').value=a[1];document.getElementById('plh').value=a[2]}document.getElementById('pls').textContent=PL?'включено: '+a[1]+'x'+a[2]:'выключено';document.getElementById('plsw').className='sw '+(PL?'on':'')}
+let PL=0;
+async function plInit(){plUi(await api('place',{on:2}))}
+async function plSend(on){await call('place',{on:on,w:v('plw'),h:v('plh'),s:v('plsl')});plUi(await api('place',{on:2}))}
+function plGo(){plSend(PL?0:1)}
+let ZM=0;
+async function zoomT(){ZM=ZM?0:1;await call('csapply',{s:'fov',v:ZM?30:(v('r_fov')||70)});document.getElementById('zmb').textContent='Зум: '+(ZM?'вкл (30)':'выкл');slRefresh()}
+const PRV={};
+async function prl(){const r=await api('prelist',{});const d=document.getElementById('prl');d.textContent='';
+for(const ln of r.trim().split('\n')){const c=ln.split('\t');if(c.length<7)continue;const id=c[0],nm=c[1],on=c[2]=='1',ds=c[3],dv=c[4],off=c[5],hint=c[6],pv=PRV[id]||{};
+const w=document.createElement('div');w.style.marginBottom='8px';
+w.innerHTML='<div class="fn c" onclick="preGo(\''+id+'\','+(on?0:1)+')"><div class=nm>'+nm+'<div class=sub>'+(on?'включено · '+off:ds!='-'?'слот '+ds+' по умолчанию':'заготовка: нужен адрес')+'</div></div><div class="sw '+(on?'on':'')+'"></div></div>'
++'<div class=row><input id=pa_'+id+' placeholder="адрес hex" value="'+(pv.a||'')+'"><input id=ps_'+id+' placeholder="слот" style="flex:.4" value="'+(pv.s||'')+'"><input id=pv_'+id+' style="flex:.6" value="'+(pv.v||dv)+'"></div><small>'+hint+'</small>';
+d.appendChild(w)}}
+async function preGo(id,on){PRV[id]={a:v('pa_'+id),s:v('ps_'+id),v:v('pv_'+id)};await call('pre',{id:id,on:on,a:PRV[id].a,s:PRV[id].s,v:PRV[id].v});prl()}
+function plP(w,h){document.getElementById('plw').value=w;document.getElementById('plh').value=h;if(PL)plSend(1)}
 function azP(w,h,d){document.getElementById('azw').value=w;document.getElementById('azh').value=h;document.getElementById('azd').value=d;if(AZ)azSend(1)}
-fnl();libLoad();slotInit();zSet();azInit();
+fnl();libLoad();slotInit();zSet();azInit();plInit();prl();
 </script></body></html>)MGG";
 
 
@@ -3560,6 +3744,19 @@ static Str route(const Str &path, const Params &q) {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex, начало функции)\n";
         return findCallers(im, (uint32_t)a, decNum(q, "max", 60));
     }
+    if (path == "fpair") return fPair(im, q);
+    if (path == "fset") {                                          // записать слово-константу: a (hex, кратно 4), f (новое), t=f|i, o (ожидаемое старое, необязательно), k=1 запомнить
+        if (!hexNum(q, "a", a)) return "нужен a (hex)\n";
+        if (a & 3) return "адрес должен быть кратен 4 (литерал/слово)\n";
+        bool isf = P(q, "t", "f") != "i"; uint32_t w = 0, w0 = 0;
+        if (!numWord(P(q, "f"), isf, w)) return "нужно новое значение f\n";
+        if (!P(q, "o").empty()) {
+            if (!numWord(P(q, "o"), isf, w0)) return "o не число\n";
+            if (!segAt(im, im.base + a, 4) || rd32(im.base + a) != w0) return "по адресу сейчас другое значение: не пишу\n";
+        }
+        std::vector<uint8_t> b(4); memcpy(b.data(), &w, 4);
+        return doPatch(im, a, b, P(q, "k") == "1");
+    }
     if (path == "sym") return symRoute(im, q);
 #ifdef MGG_HAS_DOBBY
     if (path == "hooks") return hooksList();
@@ -3590,6 +3787,28 @@ static Str route(const Str &path, const Params &q) {
         if (id < 0) return msg + "\n";
         return "включено: Multiple destroy " + tag + " (хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + ")\n";
     }
+    if (path == "place") {                                         // Multiple place: ставит пластину w x h на грани; on=0 выключить, on=2 статус; s — слот vtable GameMode (7 = buildBlock)
+        int ex = -1; for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].mode == 6) ex = i;
+        Str on = P(q, "on", "1");
+        if (on == "2") return ex < 0 ? Str("0\n") : "1 " + std::to_string(g_slots[ex].val & 0xFF) + " " + std::to_string((g_slots[ex].val >> 8) & 0xFF) + "\n";
+        if (on == "0") { if (ex < 0) return "Multiple place не включён\n"; g_slots[ex].mode = 0; return "выключено: Multiple place\n"; }
+        size_t w = decNum(q, "w", 3), h = decNum(q, "h", 3), sl = decNum(q, "s", 7);
+        w = w < 1 ? 1 : w > 9 ? 9 : w; h = h < 1 ? 1 : h > 9 ? 9 : h; sl = sl < 4 ? 4 : sl > 12 ? 12 : sl;
+        uintptr_t val = w | (h << 8), off = 0;
+        if (!hexNum(q, "a", off)) { Str why; off = findGameModeSlot(im, (int)sl, why); if (!off) return why; }
+        Str tag = std::to_string(w) + "x" + std::to_string(h);
+        if (ex >= 0 && g_slots[ex].off == (off & ~(uintptr_t)1)) { g_slots[ex].val = val; return "включено: Multiple place " + tag + "\n"; }
+        if (ex >= 0) g_slots[ex].mode = 0;                         // слот vtable сменили: старый хук остаётся в режиме лога
+        for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == (off & ~(uintptr_t)1)) {
+            g_slots[i].mode = 6; g_slots[i].val = val; return "включено: Multiple place " + tag + " (хук #" + std::to_string(i) + ")\n";
+        }
+        Str msg; int id = hookInstall(im, off, 6, 0, val, msg, 0);
+        if (id < 0) return msg + "\n";
+        return "включено: Multiple place " + tag + " (слот " + std::to_string(sl) + ", хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + ")\n";
+    }
+    if (path == "gmslots") return gmSlots(im, decNum(q, "n", 40));
+    if (path == "prelist") return preList();
+    if (path == "pre") return preSet(im, q);
     if (path == "hooksave") return hooksSave();
     if (path == "hookload") return hooksApply(im);
     if (path == "hookclear") { remove(hooksFile().c_str()); return "сохранённые хуки удалены (уже стоящие остаются до перезапуска игры)\n"; }
@@ -3604,7 +3823,7 @@ static Str route(const Str &path, const Params &q) {
         return "режим обновлён\n";
     }
 #else
-    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook" || path == "hooksave" || path == "hookload" || path == "hookclear" || path == "zone")
+    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook" || path == "hooksave" || path == "hookload" || path == "hookclear" || path == "zone" || path == "place" || path == "gmslots" || path == "prelist" || path == "pre")
         return "эта сборка без Dobby: хуки недоступны (поиск, xref, hex и патчи работают)\n";
 #endif
     return "неизвестный маршрут\n";
