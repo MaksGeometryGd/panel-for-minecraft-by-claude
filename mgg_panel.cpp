@@ -2962,6 +2962,12 @@ button.d{background:#8a3a40}button.g{background:#3f7a63}
 .sw.on{background:var(--hl)}.sw.on::after{transform:translateX(17px);background:#22240f}
 .sw.bad{background:#8a3a40}.sw.bad::after{background:#ffd9db}
 .sw.mid{background:#6b6450}.sw.mid::after{background:#fff3cf}
+.hr{margin-left:auto;display:flex;gap:4px;align-items:center;text-transform:none}.mini{width:auto;padding:3px 6px;margin:0;font-size:11px}.ib{width:28px;height:26px;padding:0;margin:0;border-radius:8px}
+.fg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}.fg>div{grid-column:1/-1}
+.fn.c{padding:5px 8px;margin:0;gap:6px;font-size:12px;border-radius:8px}.fn.c .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.2}.fn.c .sub{font-size:9px;overflow:hidden;text-overflow:ellipsis}
+.fn.c .sw{width:28px;height:16px}.fn.c .sw::after{width:12px;height:12px;top:2px;left:2px}.fn.c .sw.on::after{transform:translateX(12px)}
+.fg>.fn.c{grid-column:auto}
+.zr{display:flex;gap:4px;align-items:center;margin-top:4px}.zr b{font-size:10px;color:var(--dim);font-weight:600}.zr select{flex:1;padding:4px 6px;margin:0;min-width:0}
 .tag{font-size:9px;background:rgba(0,0,0,.3);border-radius:5px;padding:1px 5px;margin-left:6px}
 small{color:var(--dim);display:block;margin-top:4px}
 .pre{display:flex;gap:5px;flex-wrap:wrap}.pre button{width:auto;flex:1 1 30%;min-width:0}
@@ -3022,15 +3028,10 @@ small{color:var(--dim);display:block;margin-top:4px}
 <div class=tb><button class=s title="Копировать" onclick="cp()"><svg class=ic><use href="#i-copy"/></svg></button><button class=s title="Размер" onclick="document.getElementById('out').classList.toggle('big')"><svg class=ic><use href="#i-expand"/></svg></button></div></div>
 
 <div class=pg id=pn>
-<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Готовые функции</h3><div id=fl>…</div>
-<select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
-<button class=s onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg>Обновить список</button></div>
+<div class=seg id=fseg><button class=on onclick="fnTab('g')">Global</button><button onclick="fnTab('l')">Local world</button></div>
+<div id=fgl>
 <div id=sl></div>
-<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Слом области</h3>
-<div class="pre sm"><button class=s onclick="azP(1,1,1)">1x1</button><button class=s onclick="azP(3,2,1)">3x2</button><button class=s onclick="azP(3,3,1)">3x3</button><button class=s onclick="azP(5,5,1)">5x5</button><button class=s onclick="azP(3,3,3)">3x3x3</button></div>
-<div class=row><select id=azw><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><select id=azh><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><select id=azd><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
-<div class=fn onclick="azGo()"><div class=nm>Слом области<div class=sub id=azs>выключено</div></div><div class=sw id=azsw></div></div>
-<small>Ширина x высота x глубина. Плоскость и направление берутся от грани, по которой бьёшь. Работает на destroyBlock (ищется сам). 1x1 = обычный слом.</small></div>
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Функции<span class=hr><select id=fk2 class=mini><option value=0>сейчас</option><option value=1>запомнить</option></select><button class="s ib" title="Обновить" onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg></button></span></h3><div id=fl class=fg>…</div></div>
 <details class=card><summary><svg class=ic><use href="#i-plus"/></svg>Создать функцию из патчей сессии<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=fnn placeholder="название (например Disable render limit)">
 <button onclick="call('fnsave',{n:v('fnn')}).then(fnl)"><svg class=ic><use href="#i-save"/></svg>Сохранить патчи сессии</button>
@@ -3038,7 +3039,14 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button onclick="call('fnprof',{n:v('fpn'),l:v('fpl')}).then(fnl)"><svg class=ic><use href="#i-flag"/></svg>Создать профиль (набор функций)</button>
 <small>Ручная правка: вкладка File → mgg_functions.txt. Формат: Название|смещение|оригинал|новое. Профиль: @Название|функция1,функция2</small></div></details>
 </div>
-
+<div id=fll style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Multiple destroy</h3>
+<div class="fn c" onclick="azGo()"><div class=nm>Multiple destroy<div class=sub id=azs>выключено</div></div><div class=sw id=azsw></div></div>
+<div class=zr><b>Ш</b><select id=azw><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><b>В</b><select id=azh><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><b>Г</b><select id=azd><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
+<div class="pre sm" style="margin-top:4px"><button class=s onclick="azP(1,1,1)">1x1</button><button class=s onclick="azP(3,2,1)">3x2</button><button class=s onclick="azP(3,3,1)">3x3</button><button class=s onclick="azP(5,5,1)">5x5</button><button class=s onclick="azP(3,3,3)">3x3x3</button></div>
+<small>Работает только в локальном мире. Ш × В в плоскости грани, Г вглубь. Адрес destroyBlock ищется сам.</small></div>
+</div>
+</div>
 <div class=pg id=pm style="display:none">
 <div class=card><h3><svg class=ic><use href="#i-search"/></svg>Найти оффсет</h3>
 <div class=row><input id=ov placeholder="значение сейчас (например 20)" inputmode=decimal><select id=ot style="flex:.6"><option value=f>float</option><option value=i>int</option></select></div>
@@ -3165,7 +3173,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 <input id=op placeholder="путь к options.txt (заполнится сам)">
 <div class=grid2><input id=ok1 placeholder="ключ" value="gfx_viewdistance"><input id=ov1 placeholder="значение" value="32"></div>
 <button onclick="call('setkey',{p:v('op'),k:v('ok1'),v:v('ov1')})"><svg class=ic><use href="#i-save"/></svg>Задать</button>
-<div class=grid3><button class=s onclick="q('gfx_viewdistance',v('ov1'))">дальность</button><button class=s onclick="q('gfx_field_of_view',v('ov1'))">FOV</button><button class=s onclick="q('gfx_gamma',v('ov1'))">яркость</button></div>
+<div class=grid3><button class=s onclick="q('gfx_gamma',v('ov1'))">яркость</button></div>
 <small>Игра может перезаписать файл при выходе и ограничить значение.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-file"/></svg>Файлы игры</h3><input id=fp placeholder="путь (пусто = папки игры)">
 <div class=grid2><button class=s onclick="call('ls',{p:v('fp')})"><svg class=ic><use href="#i-list"/></svg>Список</button><button class=s onclick="call('cat',{p:v('fp')})"><svg class=ic><use href="#i-eye"/></svg>Показать</button></div>
@@ -3249,11 +3257,11 @@ try{const r=await fetch('/api/'+p+'?'+q);const t=await r.text();out.textContent=
 function cp(){const t=out.textContent;if(window.MGGJ){MGGJ.copy(t)}else if(navigator.clipboard){navigator.clipboard.writeText(t)}}
 async function fnl(){const q=new URLSearchParams({t:T});let r='';try{r=await(await fetch('/api/fnlist?'+q)).text()}catch(e){r='ошибка'}
 const d=document.getElementById('fl');d.textContent='';
-if(r.startsWith('пусто')||r.indexOf('\t')<0){d.textContent=r.startsWith('пусто')?'Функций пока нет. Добавь их через File → mgg_functions.txt или сохрани патчи сессии.':r;return}
+if(r.startsWith('пусто')||r.indexOf('\t')<0){const m=document.createElement('div');m.style.color='var(--dim)';m.textContent=r.startsWith('пусто')?'Функций пока нет. Добавь через File → mgg_functions.txt или сохрани патчи сессии.':r;d.appendChild(m);return}
 for(const ln of r.trim().split('\n')){const [n,st,c]=ln.split('\t');const prof=st[0]=='P';const s=prof?st[1]:st;const on=s=='1';
-const row=document.createElement('div');row.className='fn';
+const row=document.createElement('div');row.className='fn c';
 const nm=document.createElement('div');nm.className='nm';nm.textContent=n;const sub=document.createElement('div');sub.className='sub';
-sub.textContent=(prof?'набор функций: ':'патчей: ')+c+(s=='3'?' · другая версия игры':s=='2'?' · частично':'');nm.appendChild(sub);if(prof){const t=document.createElement('span');t.className='tag';t.textContent='профиль';nm.firstChild.after(t)}
+sub.textContent=(prof?'набор ':'')+c+(prof?'':' п.')+(s=='3'?' · др. версия':s=='2'?' · частично':'');nm.appendChild(sub);
 const sw=document.createElement('div');sw.className='sw '+(on?'on':s=='3'?'bad':s=='2'?'mid':'');
 row.onclick=async()=>{if(s=='3'){out.textContent='байты не совпали: функция для другой версии игры';return}
 await call(on?'fnoff':'fnon',{n:n,k:v('fk2')});fnl()};row.appendChild(nm);row.appendChild(sw);d.appendChild(row)}}
@@ -3299,8 +3307,7 @@ if(save)try{localStorage.setItem('mggTheme',JSON.stringify([ac,bg,cd,hl,r]))}cat
 function preset(ac,bg,cd,hl){document.getElementById('c_ac').value=ac;document.getElementById('c_bg').value=bg;document.getElementById('c_card').value=cd;document.getElementById('c_hl').value=hl;applyTheme()}
 (function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme'))}catch(e){}t=t||['#85775a','#12141c','#1a1d29','#f0b429',10];
 document.getElementById('c_ac').value=t[0];document.getElementById('c_bg').value=t[1];document.getElementById('c_card').value=t[2];document.getElementById('c_hl').value=t[3];document.getElementById('c_r').value=t[4];applyTheme(false)})();
-const SL=[{s:'chunk',t:'Дальность прорисовки (чанки)',min:2,max:96,def:24,opt:'gfx_viewdistance',h:'Mem: найди текущую дальность (int), смени её в настройках игры, сузь поиск до одного адреса → «Привязать».'},
-{s:'fov',t:'FOV (угол обзора)',min:30,max:150,def:70,opt:'gfx_field_of_view',h:'Mem: найди текущий FOV как float (например 70), смени в настройках, сузь → «Привязать».'}];
+const SL=[{s:'fov',t:'Fov changer',min:30,max:150,def:70,opt:'gfx_field_of_view',h:'Mem: найди текущий FOV как float (например 70), смени в настройках, сузь → «Привязать».'}];
 function slotInit(){const d=document.getElementById('sl');d.textContent='';for(const x of SL){const c=document.createElement('div');c.className='card';
 c.innerHTML=`<h3><svg class=ic><use href="#i-eye"/></svg>${x.t}</h3><div class=rg><input type=range id=r_${x.s} min=${x.min} max=${x.max} value=${x.def} oninput="document.getElementById('rv_${x.s}').textContent=this.value"><b id=rv_${x.s}>${x.def}</b></div>
 <div class=grid3><button onclick="slA('${x.s}')">Применить</button><button class=s onclick="slS('${x.s}')">Снять</button><button class=s onclick="slO('${x.s}')">options.txt</button></div>
@@ -3435,6 +3442,7 @@ const x=acFmt(c);const now=new Date().toLocaleTimeString();
 if(AC.prev!==null&&x!==AC.prev){AC.log.unshift(now+'  '+AC.prev+' → '+x);AC.log.length=Math.min(AC.log.length,8)}
 AC.prev=x;box.textContent=a+' = '+x+'   ('+now+')';document.getElementById('aclog').textContent=AC.log.join('\n')}}
 AC.timer=setTimeout(()=>acTick(g),AC.sec*1000)}
+function fnTab(x){document.getElementById('fgl').style.display=x=='g'?'':'none';document.getElementById('fll').style.display=x=='l'?'':'none';document.querySelectorAll('#fseg button').forEach((b,i)=>b.className=(i==0)==(x=='g')?'on':'')}
 let AZ=0;
 function azUi(t){AZ=t.startsWith('1')?1:0;const a=t.trim().split(' ');if(AZ){document.getElementById('azw').value=a[1];document.getElementById('azh').value=a[2];document.getElementById('azd').value=a[3]}document.getElementById('azs').textContent=AZ?'включено: '+a[1]+'x'+a[2]+'x'+a[3]:'выключено';document.getElementById('azsw').className='sw '+(AZ?'on':'')}
 async function azInit(){azUi(await api('zone',{on:2}))}
@@ -3567,20 +3575,20 @@ static Str route(const Str &path, const Params &q) {
         int ex = -1; for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].mode == 5) ex = i;
         Str on = P(q, "on", "1");
         if (on == "2") return ex < 0 ? Str("0\n") : "1 " + std::to_string(g_slots[ex].val & 0xFF) + " " + std::to_string((g_slots[ex].val >> 8) & 0xFF) + " " + std::to_string((g_slots[ex].val >> 16) & 0xFF) + "\n";
-        if (on == "0") { if (ex < 0) return "зона не включена\n"; g_slots[ex].mode = 0; return "выключено: слом области\n"; }   // хук остаётся стоять в режиме лога (снимать Dobby-хук на горячую не нужно)
+        if (on == "0") { if (ex < 0) return "зона не включена\n"; g_slots[ex].mode = 0; return "выключено: Multiple destroy\n"; }   // хук остаётся стоять в режиме лога (снимать Dobby-хук на горячую не нужно)
         size_t w = decNum(q, "w", 3), h = decNum(q, "h", 3), d = decNum(q, "d", 1);
         w = w < 1 ? 1 : w > 9 ? 9 : w; h = h < 1 ? 1 : h > 9 ? 9 : h; d = d < 1 ? 1 : d > 5 ? 5 : d;
         if (w * h * d > 200) return "слишком много блоков (макс. 200)\n";
         uintptr_t val = w | (h << 8) | (d << 16), off = 0;
         if (!hexNum(q, "a", off)) { Str why; off = findDestroyBlock(im, why); if (!off) return why; }
         Str tag = std::to_string(w) + "x" + std::to_string(h) + "x" + std::to_string(d);
-        if (ex >= 0) { g_slots[ex].val = val; return "включено: слом области " + tag + "\n"; }
+        if (ex >= 0) { g_slots[ex].val = val; return "включено: Multiple destroy " + tag + "\n"; }
         for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == (off & ~(uintptr_t)1)) {   // на destroyBlock уже стоит хук (например старый «слом вокруг»): переиспользуем
-            g_slots[i].mode = 5; g_slots[i].val = val; return "включено: слом области " + tag + " (хук #" + std::to_string(i) + ")\n";
+            g_slots[i].mode = 5; g_slots[i].val = val; return "включено: Multiple destroy " + tag + " (хук #" + std::to_string(i) + ")\n";
         }
         Str msg; int id = hookInstall(im, off, 5, 0, val, msg, 0);
         if (id < 0) return msg + "\n";
-        return "включено: слом области " + tag + " (хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + ")\n";
+        return "включено: Multiple destroy " + tag + " (хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + ")\n";
     }
     if (path == "hooksave") return hooksSave();
     if (path == "hookload") return hooksApply(im);
