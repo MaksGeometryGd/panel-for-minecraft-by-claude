@@ -1,23 +1,13 @@
-// Оверлей-кнопка F и окно PC-меню (страница http://127.0.0.1:PORT/pc).
-// НЕ ПРОВЕРЕНО на устройстве: Overlay.java я не видел, поэтому класс самодостаточный.
-//
-// Подключение: там, где у тебя создаётся кнопка MGG (есть Activity игры), добавь одну строку:
-//     FMenu.install(activity, 8765, "mgg");     // порт и токен как в сборке (MGG_PORT, MGG_TOKEN)
-// Поменяй package на свой.
-//
-// Как работает:
-//  - раз в 2 секунды спрашивает /api/uimode. Режим pc (Settings → Тема → Functions second menu) = кнопка F видна, OFF = скрыта;
-//  - кнопку F можно таскать пальцем, короткий тап открывает/закрывает окно меню;
-//  - окно двигается за красную верхнюю полосу, размер меняется уголком справа внизу, ✕ закрывает;
-//  - внутри окна страница /pc: категории-окна, их тоже можно двигать.
-package com.mgg.panel;
+// Отдельное окно PC-меню (страница /pc) со своей кнопкой F. Живёт рядом с Overlay в overlay.jar.
+// Подключение: Overlay.ensure() вызывает FMenu.ensure(activity) каждые 3 с (см. патч Overlay.java).
+// Кнопка F видна, когда в Settings включён режим pc (/api/uimode). Окно: тянуть за красную полосу, размер уголком ◢, ✕ закрывает.
+package mgg;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
@@ -25,6 +15,8 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -32,30 +24,38 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
 
 public final class FMenu {
-    private static boolean started;
+    private static Activity cur;
+    private static FrameLayout rootView;
     private static WebView web;
+    private static volatile boolean pollOn;
+    private static Runnable toggleAction;     // тап по F, вызывается и из Overlay.Bridge.openF()
 
     private FMenu() {}
 
-    public static void install(final Activity act, final int port, final String token) {
-        act.runOnUiThread(new Runnable() {
-            @Override public void run() {
-                if (started) return;
-                started = true;
-                build(act, port, token);
-            }
-        });
+    /** Вызывается из Overlay каждые 3 с: создаёт окно один раз, возвращает его, если игра пересоздала Activity. */
+    public static void ensure(final Activity act) {
+        if (cur != act) {
+            if (rootView != null && rootView.getParent() instanceof ViewGroup) ((ViewGroup) rootView.getParent()).removeView(rootView);
+            try { if (web != null) web.destroy(); } catch (Throwable ignored) {}
+            web = null; rootView = null; toggleAction = null;
+            cur = act;
+            build(act);
+        } else if (rootView != null && !rootView.isAttachedToWindow()) {
+            if (rootView.getParent() instanceof ViewGroup) ((ViewGroup) rootView.getParent()).removeView(rootView);
+            act.addContentView(rootView, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+    }
+
+    /** Открыть/закрыть окно (кнопка PC в панели вызывает это через MGGJ.openF). */
+    public static void toggle() {
+        final Runnable r = toggleAction;
+        if (r != null && cur != null) cur.runOnUiThread(r);
     }
 
     @SuppressLint({"SetJavaScriptEnabled", "ClickableViewAccessibility"})
-    private static void build(final Activity act, final int port, final String token) {
+    private static void build(final Activity act) {
         final DisplayMetrics dm = act.getResources().getDisplayMetrics();
         final float d = dm.density;
         final int accent = 0xFFC4262E;
@@ -63,6 +63,7 @@ public final class FMenu {
         // контейнер на весь экран: сам касания не забирает (нет фона и обработчиков), всё, что вне наших окон, идёт в игру
         final FrameLayout root = new FrameLayout(act);
         act.addContentView(root, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        rootView = root;
 
         // ---- кнопка F
         final TextView fb = new TextView(act);
@@ -115,7 +116,7 @@ public final class FMenu {
         strip.addView(close, new LinearLayout.LayoutParams((int) (44 * d), ViewGroup.LayoutParams.MATCH_PARENT));
         menu.addView(strip, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (30 * d)));
 
-        final String url = "http://127.0.0.1:" + port + "/pc?t=" + Uri.encode(token);
+        final String url = "https://" + Overlay.HOST + "/pc?t=" + Overlay.TOKEN;
 
         // ---- уголок изменения размера
         final TextView grip = new TextView(act);
@@ -160,6 +161,30 @@ public final class FMenu {
             }
         });
 
+        toggleAction = new Runnable() {
+            @Override public void run() {
+                            if (menu.getVisibility() == View.VISIBLE) { menu.setVisibility(View.GONE); }
+                            else {
+                                if (web == null) {                       // WebView создаём при первом открытии
+                                    web = new WebView(act);
+                                    WebSettings ws = web.getSettings();
+                                    ws.setJavaScriptEnabled(true);
+                                    ws.setDomStorageEnabled(true);
+                                    web.setBackgroundColor(0xFF0D0F14);
+                                    web.setWebViewClient(new WebViewClient() {
+                                        @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) { return Overlay.handle(r); }
+                                    });
+                                    FrameLayout.LayoutParams wp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+                                    wp.topMargin = (int) (30 * d);
+                                    menu.addView(web, 0, wp);            // под полосой и уголком
+                                    web.loadUrl(url);
+                                }
+                                menu.setVisibility(View.VISIBLE);
+                                menu.bringToFront();
+                            }
+            }
+        };
+
         // перетаскивание и тап по кнопке F
         fb.setOnTouchListener(new View.OnTouchListener() {
             float dx, dy, sx, sy; boolean moved;
@@ -172,25 +197,7 @@ public final class FMenu {
                         if (moved) { fb.setX(e.getRawX() + dx); fb.setY(e.getRawY() + dy); }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (!moved) {
-                            if (menu.getVisibility() == View.VISIBLE) { menu.setVisibility(View.GONE); }
-                            else {
-                                if (web == null) {                       // WebView создаём при первом открытии
-                                    web = new WebView(act);
-                                    WebSettings ws = web.getSettings();
-                                    ws.setJavaScriptEnabled(true);
-                                    ws.setDomStorageEnabled(true);
-                                    web.setBackgroundColor(0xFF0D0F14);
-                                    web.setWebViewClient(new WebViewClient());
-                                    FrameLayout.LayoutParams wp = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-                                    wp.topMargin = (int) (30 * d);
-                                    menu.addView(web, 0, wp);            // под полосой и уголком
-                                    web.loadUrl(url);
-                                }
-                                menu.setVisibility(View.VISIBLE);
-                                menu.bringToFront();
-                            }
-                        }
+                        if (!moved) toggleAction.run();
                         return true;
                 }
                 return true;
@@ -201,18 +208,8 @@ public final class FMenu {
         final Handler ui = new Handler(Looper.getMainLooper());
         Thread th = new Thread(new Runnable() {
             @Override public void run() {
-                while (true) {
-                    boolean pc = false;
-                    try {
-                        HttpURLConnection c = (HttpURLConnection) new URL("http://127.0.0.1:" + port + "/api/uimode?t=" + URLEncoder.encode(token, "UTF-8")).openConnection();
-                        c.setConnectTimeout(1500);
-                        c.setReadTimeout(1500);
-                        BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream()));
-                        String l = r.readLine();
-                        r.close();
-                        pc = l != null && "pc".equals(l.trim());
-                    } catch (Exception ignored) {}
-                    final boolean show = pc;
+                while (cur == act) {
+                    final boolean show = "pc".equals(Overlay.getText("/api/uimode?t=" + Overlay.TOKEN));
                     ui.post(new Runnable() {
                         @Override public void run() {
                             fb.setVisibility(show ? View.VISIBLE : View.GONE);
@@ -222,7 +219,7 @@ public final class FMenu {
                     try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
                 }
             }
-        });
+        }, "mgg-fmenu-poll");
         th.setDaemon(true);
         th.start();
     }

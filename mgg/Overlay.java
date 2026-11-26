@@ -47,9 +47,9 @@ import java.net.Socket;
  *     invoke-static {v7}, Lmgg/Overlay;->start(Landroid/app/Activity;)V
  */
 public final class Overlay {
-    private static final String TOKEN = "__MGG_TOKEN__";   // подставляется при сборке
+    static final String TOKEN = "__MGG_TOKEN__";   // подставляется при сборке
     private static final int PORT = 8765;
-    private static final String HOST = "mgg.local";
+    static final String HOST = "mgg.local";
     private static final String TAG = "MGG";
     private static final float[] ALPHAS = {1f, 0.8f, 0.6f, 0.4f};
 
@@ -75,6 +75,7 @@ public final class Overlay {
                 if (a.isFinishing() || a.isDestroyed()) return;
                 try {
                     ensure(a);
+                    FMenu.ensure(a);
                 } catch (Throwable t) {
                     Log.e(TAG, "overlay: " + t);
                 }
@@ -359,6 +360,11 @@ public final class Overlay {
         }
 
         @JavascriptInterface
+        public void openF() {
+            FMenu.toggle();
+        }
+
+        @JavascriptInterface
         public void copy(final String text) {
             a.runOnUiThread(new Runnable() {
                 public void run() {
@@ -375,7 +381,22 @@ public final class Overlay {
 
     // ------------------------------------------------------------ локальный "прокси" на сокете
 
-    private static WebResourceResponse handle(WebResourceRequest r) {
+    /** Текст ответа панели на путь вроде "/api/uimode?t=..." (для FMenu). Вызывать не из UI-потока. */
+    static String getText(String pathAndQuery) {
+        try {
+            WebResourceResponse r = fetch(pathAndQuery);
+            InputStream in = r.getData();
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] b = new byte[256];
+            int n;
+            while ((n = in.read(b)) > 0 && bo.size() < 4096) bo.write(b, 0, n);
+            return bo.toString("UTF-8").trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    static WebResourceResponse handle(WebResourceRequest r) {
         Uri u = r.getUrl();
         if (u == null || !HOST.equals(u.getHost())) return reply("text/plain", "");
         String pq = u.getEncodedPath();
@@ -438,5 +459,4 @@ public final class Overlay {
             }
         }
     }
-    }
-            
+}
