@@ -63,6 +63,8 @@ public final class FMenu {
         // контейнер на весь экран: сам касания не забирает (нет фона и обработчиков), всё, что вне наших окон, идёт в игру
         final FrameLayout root = new FrameLayout(act);
         act.addContentView(root, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        root.setClipChildren(false);
+        root.setClipToPadding(false);
         rootView = root;
 
         // ---- кнопка F
@@ -126,15 +128,17 @@ public final class FMenu {
         FrameLayout.LayoutParams gp = new FrameLayout.LayoutParams((int) (30 * d), (int) (30 * d), Gravity.BOTTOM | Gravity.END);
         menu.addView(grip, gp);
 
+        final int[] mloc = new int[2];
         // перетаскивание полосы
         strip.setOnTouchListener(new View.OnTouchListener() {
             float dx, dy;
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN: dx = menu.getX() - e.getRawX(); dy = menu.getY() - e.getRawY(); return true;
+                    case MotionEvent.ACTION_DOWN: root.getLocationOnScreen(mloc); dx = menu.getX() - (e.getRawX() - mloc[0]); dy = menu.getY() - (e.getRawY() - mloc[1]); return true;
                     case MotionEvent.ACTION_MOVE:
-                        menu.setX(Math.max(-menu.getWidth() * 0.7f, Math.min(dm.widthPixels - menu.getWidth() * 0.3f, e.getRawX() + dx)));
-                        menu.setY(Math.max(0, Math.min(dm.heightPixels - 30 * d, e.getRawY() + dy)));
+                        root.getLocationOnScreen(mloc);
+                        menu.setX(Math.max(-menu.getWidth() * 0.7f, Math.min(root.getWidth() - menu.getWidth() * 0.3f, e.getRawX() - mloc[0] + dx)));
+                        menu.setY(Math.max(0, Math.min(root.getHeight() - 30 * d, e.getRawY() - mloc[1] + dy)));
                         return true;
                 }
                 return true;
@@ -185,16 +189,22 @@ public final class FMenu {
             }
         };
 
+        final int[] loc = new int[2];
         // перетаскивание и тап по кнопке F
         fb.setOnTouchListener(new View.OnTouchListener() {
             float dx, dy, sx, sy; boolean moved;
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        dx = fb.getX() - e.getRawX(); dy = fb.getY() - e.getRawY(); sx = e.getRawX(); sy = e.getRawY(); moved = false; return true;
+                        root.getLocationOnScreen(loc); dx = fb.getX() - (e.getRawX() - loc[0]); dy = fb.getY() - (e.getRawY() - loc[1]); sx = e.getRawX(); sy = e.getRawY(); moved = false; return true;
                     case MotionEvent.ACTION_MOVE:
                         if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 10 * d) moved = true;
-                        if (moved) { fb.setX(e.getRawX() + dx); fb.setY(e.getRawY() + dy); }
+                        if (moved) {                              // границы берём у самого root, а не у экрана: иначе кнопка уезжает за край и обрезается
+                            root.getLocationOnScreen(loc);
+                            float nx = e.getRawX() - loc[0] + dx, ny = e.getRawY() - loc[1] + dy;
+                            fb.setX(Math.max(0, Math.min(root.getWidth() - fb.getWidth(), nx)));
+                            fb.setY(Math.max(0, Math.min(root.getHeight() - fb.getHeight(), ny)));
+                        }
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!moved) toggleAction.run();
@@ -209,11 +219,13 @@ public final class FMenu {
         Thread th = new Thread(new Runnable() {
             @Override public void run() {
                 while (cur == act) {
-                    final boolean show = "pc".equals(Overlay.getText("/api/uimode?t=" + Overlay.TOKEN));
-                    ui.post(new Runnable() {
+                    final String r = Overlay.getText("/api/uimode?t=" + Overlay.TOKEN);
+                    // не смогли дозвониться до панели (занята/ошибка) -> оставляем как есть, прячем только по явному "off"
+                    final int state = "pc".equals(r) ? 1 : "off".equals(r) ? 0 : -1;
+                    if (state >= 0) ui.post(new Runnable() {
                         @Override public void run() {
-                            fb.setVisibility(show ? View.VISIBLE : View.GONE);
-                            if (!show) menu.setVisibility(View.GONE);
+                            fb.setVisibility(state == 1 ? View.VISIBLE : View.GONE);
+                            if (state == 0) menu.setVisibility(View.GONE);
                         }
                     });
                     try { Thread.sleep(2000); } catch (InterruptedException e) { return; }
