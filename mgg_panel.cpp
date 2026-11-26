@@ -858,6 +858,26 @@ static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
             g_inArea = false;
         }
     }
+    if (s.mode == 5 && !g_inArea && (r & 0xFF) && a[1] > 0x10000) {   // зона: пластина W x H (в плоскости грани) на D блоков вглубь
+        int p[3];
+        if (guarded(p, (const void *)a[1], 12) && p[0] > -30000000 && p[0] < 30000000 && p[2] > -30000000 && p[2] < 30000000) {
+            int W = (int)(s.val & 0xFF), H = (int)((s.val >> 8) & 0xFF), D = (int)((s.val >> 16) & 0xFF);
+            W = W < 1 ? 1 : W > 9 ? 9 : W; H = H < 1 ? 1 : H > 9 ? 9 : H; D = D < 1 ? 1 : D > 5 ? 5 : D;
+            int f = (int)(a[2] & 0xFF); if (f > 5) f = 1;              // грань: 0 низ, 1 верх, 2 север(-z), 3 юг(+z), 4 запад(-x), 5 восток(+x)
+            static const int U[6][3] = {{1,0,0},{1,0,0},{1,0,0},{1,0,0},{0,0,1},{0,0,1}};      // ось ширины
+            static const int V[6][3] = {{0,0,1},{0,0,1},{0,1,0},{0,1,0},{0,1,0},{0,1,0}};      // ось высоты
+            static const int Nn[6][3] = {{0,1,0},{0,-1,0},{0,0,1},{0,0,-1},{1,0,0},{-1,0,0}};  // внутрь блока (против нормали грани)
+            g_inArea = true;
+            for (int n = 0; n < D; n++) for (int v = -(H - 1) / 2; v <= H / 2; v++) for (int u = -(W - 1) / 2; u <= W / 2; u++) {
+                if (!u && !v && !n) continue;
+                int q[3] = {p[0] + u * U[f][0] + v * V[f][0] + n * Nn[f][0],
+                            p[1] + u * U[f][1] + v * V[f][1] + n * Nn[f][1],
+                            p[2] + u * U[f][2] + v * V[f][2] + n * Nn[f][2]};
+                ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], (uintptr_t)q, a[2], a[3], a[4], a[5], a[6], a[7]);
+            }
+            g_inArea = false;
+        }
+    }
     return s.mode == 2 ? s.val : r;
 }
 template <size_t... I>
@@ -865,7 +885,7 @@ static std::array<void *, sizeof...(I)> mkHooks(std::index_sequence<I...>) { ret
 static std::array<void *, 16> g_hk = mkHooks(std::make_index_sequence<16>{});
 
 static long long hkNow() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
-static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : m == "area" ? 4 : 0; }
+static int hkMode(const Str &m) { return m == "ret" ? 1 : m == "set" ? 2 : m == "arg" ? 3 : m == "area" ? 4 : m == "zone" ? 5 : 0; }
 static Str hooksFile() { return dataDir() + "/mgg_hooks.txt"; }
 
 static Str hooksList() {
@@ -873,7 +893,7 @@ static Str hooksList() {
     for (int i = 0; i < 16; i++) {
         const Slot &s = g_slots[i];
         if (!s.used) continue;
-        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : "area";
+        const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : s.mode == 4 ? "area" : "зона";
         uint32_t c = s.calls.load(); double sec = (now - s.t0) / 1000.0; char t[64];
         snprintf(t, sizeof t, "%.1f", sec > 0.5 ? c / sec : 0.0);
         out += "#" + std::to_string(i) + " " + hx(s.off) + (s.arm ? " ARM" : " T") + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
@@ -923,6 +943,41 @@ static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_
     s.used = true; return id;
 }
 
+// автопоиск GameMode::destroyBlock (символы вырезаны): "8GameMode" → typeinfo → vtable (слово перед typeinfo = 0) → слот 3. Возвращает смещение (+1 = Thumb)
+static uintptr_t findDestroyBlock(const Img &im, Str &why) {
+    static const char key[] = "8GameMode";
+    std::vector<uintptr_t> names;
+    for (const Seg &g : im.segs) {
+        if (!g.r) continue;
+        const uint8_t *p = (const uint8_t *)g.s; size_t n = g.e - g.s;
+        for (size_t i = 1; i + sizeof key <= n; i++)
+            if (p[i] == '8' && p[i - 1] == 0 && memcmp(p + i, key, sizeof key) == 0) names.push_back(g.s + i);
+    }
+    if (names.empty()) { why = "не найдена строка 8GameMode (другая сборка?)\n"; return 0; }
+    auto findWord = [&](uintptr_t val, std::vector<uintptr_t> &out) {
+        for (const Seg &g : im.segs) {
+            if (!g.r || g.x) continue;
+            const uint32_t *w = (const uint32_t *)g.s; size_t n = (g.e - g.s) / 4;
+            for (size_t i = 0; i < n; i++) if (w[i] == (uint32_t)val) out.push_back(g.s + i * 4);
+        }
+    };
+    for (uintptr_t nm : names) {
+        std::vector<uintptr_t> ti; findWord(nm, ti);
+        for (uintptr_t t : ti) {
+            uintptr_t info = t - 4; std::vector<uintptr_t> vt; findWord(info, vt);
+            for (uintptr_t h : vt) {
+                if (!segAt(im, h - 4, 4) || *(const uint32_t *)(h - 4) != 0) continue;       // offset_to_top = 0: это vtable самого GameMode, а не наследника
+                if (!segAt(im, h + 16, 4)) continue;
+                uint32_t fp = *(const uint32_t *)(h + 4 + 4 * 3);                              // слот 3
+                if (!segAt(im, fp & ~1u, 4)) continue;
+                const Seg *sg = segAt(im, fp & ~1u, 4); if (!sg || !sg->x) continue;
+                return (uintptr_t)(fp - im.base);
+            }
+        }
+    }
+    why = "vtable GameMode не найден\n"; return 0;
+}
+
 static Str hooksSave() {
     int n = 0; Str body = "HOOKS1\n"; char t[96];
     for (const Slot &s : g_slots) {
@@ -944,7 +999,7 @@ static Str hooksApply(const Img &im) {
         if (first) { first = false; if (strncmp(line, "HOOKS1", 6) != 0) { o += "неверный формат файла хуков\n"; break; } continue; }
         unsigned long off = 0, val = 0; int mode = 0, arg = 0, isa = 1; char sg[40] = {0};
         int nf = sscanf(line, "%lx %d %d %lx %33s %d", &off, &mode, &arg, &val, sg, &isa);
-        if (nf < 5 || strlen(sg) != 16 || mode < 0 || mode > 4) continue;
+        if (nf < 5 || strlen(sg) != 16 || mode < 0 || mode > 5) continue;
         if (nf < 6 || isa < 1 || isa > 2) isa = 1;
         std::vector<uint8_t> want; if (!unhex(sg, want)) continue;
         bool already = false;
@@ -2971,6 +3026,11 @@ small{color:var(--dim);display:block;margin-top:4px}
 <select id=fk2><option value=0>только сейчас</option><option value=1>запоминать (автоприменение при запуске)</option></select>
 <button class=s onclick="fnl()"><svg class=ic><use href="#i-reset"/></svg>Обновить список</button></div>
 <div id=sl></div>
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Слом области</h3>
+<div class="pre sm"><button class=s onclick="azP(1,1,1)">1x1</button><button class=s onclick="azP(3,2,1)">3x2</button><button class=s onclick="azP(3,3,1)">3x3</button><button class=s onclick="azP(5,5,1)">5x5</button><button class=s onclick="azP(3,3,3)">3x3x3</button></div>
+<div class=row><select id=azw><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><select id=azh><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select><select id=azd><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></div>
+<div class=fn onclick="azGo()"><div class=nm>Слом области<div class=sub id=azs>выключено</div></div><div class=sw id=azsw></div></div>
+<small>Ширина x высота x глубина. Плоскость и направление берутся от грани, по которой бьёшь. Работает на destroyBlock (ищется сам). 1x1 = обычный слом.</small></div>
 <details class=card><summary><svg class=ic><use href="#i-plus"/></svg>Создать функцию из патчей сессии<svg class=ic><use href="#i-plus"/></svg></summary><div>
 <input id=fnn placeholder="название (например Disable render limit)">
 <button onclick="call('fnsave',{n:v('fnn')}).then(fnl)"><svg class=ic><use href="#i-save"/></svg>Сохранить патчи сессии</button>
@@ -3375,7 +3435,13 @@ const x=acFmt(c);const now=new Date().toLocaleTimeString();
 if(AC.prev!==null&&x!==AC.prev){AC.log.unshift(now+'  '+AC.prev+' → '+x);AC.log.length=Math.min(AC.log.length,8)}
 AC.prev=x;box.textContent=a+' = '+x+'   ('+now+')';document.getElementById('aclog').textContent=AC.log.join('\n')}}
 AC.timer=setTimeout(()=>acTick(g),AC.sec*1000)}
-fnl();libLoad();slotInit();zSet();
+let AZ=0;
+function azUi(t){AZ=t.startsWith('1')?1:0;const a=t.trim().split(' ');if(AZ){document.getElementById('azw').value=a[1];document.getElementById('azh').value=a[2];document.getElementById('azd').value=a[3]}document.getElementById('azs').textContent=AZ?'включено: '+a[1]+'x'+a[2]+'x'+a[3]:'выключено';document.getElementById('azsw').className='sw '+(AZ?'on':'')}
+async function azInit(){azUi(await api('zone',{on:2}))}
+async function azSend(on){await call('zone',{on:on,w:v('azw'),h:v('azh'),d:v('azd')});azUi(await api('zone',{on:2}))}
+function azGo(){azSend(AZ?0:1)}
+function azP(w,h,d){document.getElementById('azw').value=w;document.getElementById('azh').value=h;document.getElementById('azd').value=d;if(AZ)azSend(1)}
+fnl();libLoad();slotInit();zSet();azInit();
 </script></body></html>)MGG";
 
 
@@ -3497,6 +3563,25 @@ static Str route(const Str &path, const Params &q) {
         if (id < 0) return msg + "\n";
         return "хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + (g_slots[id].arm ? " (ARM)" : " (Thumb)") + "\n";
     }
+    if (path == "zone") {                                          // слом области: w x h (в плоскости грани), d вглубь; on=0 выключить, on=2 статус
+        int ex = -1; for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].mode == 5) ex = i;
+        Str on = P(q, "on", "1");
+        if (on == "2") return ex < 0 ? Str("0\n") : "1 " + std::to_string(g_slots[ex].val & 0xFF) + " " + std::to_string((g_slots[ex].val >> 8) & 0xFF) + " " + std::to_string((g_slots[ex].val >> 16) & 0xFF) + "\n";
+        if (on == "0") { if (ex < 0) return "зона не включена\n"; g_slots[ex].mode = 0; return "выключено: слом области\n"; }   // хук остаётся стоять в режиме лога (снимать Dobby-хук на горячую не нужно)
+        size_t w = decNum(q, "w", 3), h = decNum(q, "h", 3), d = decNum(q, "d", 1);
+        w = w < 1 ? 1 : w > 9 ? 9 : w; h = h < 1 ? 1 : h > 9 ? 9 : h; d = d < 1 ? 1 : d > 5 ? 5 : d;
+        if (w * h * d > 200) return "слишком много блоков (макс. 200)\n";
+        uintptr_t val = w | (h << 8) | (d << 16), off = 0;
+        if (!hexNum(q, "a", off)) { Str why; off = findDestroyBlock(im, why); if (!off) return why; }
+        Str tag = std::to_string(w) + "x" + std::to_string(h) + "x" + std::to_string(d);
+        if (ex >= 0) { g_slots[ex].val = val; return "включено: слом области " + tag + "\n"; }
+        for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == (off & ~(uintptr_t)1)) {   // на destroyBlock уже стоит хук (например старый «слом вокруг»): переиспользуем
+            g_slots[i].mode = 5; g_slots[i].val = val; return "включено: слом области " + tag + " (хук #" + std::to_string(i) + ")\n";
+        }
+        Str msg; int id = hookInstall(im, off, 5, 0, val, msg, 0);
+        if (id < 0) return msg + "\n";
+        return "включено: слом области " + tag + " (хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + ")\n";
+    }
     if (path == "hooksave") return hooksSave();
     if (path == "hookload") return hooksApply(im);
     if (path == "hookclear") { remove(hooksFile().c_str()); return "сохранённые хуки удалены (уже стоящие остаются до перезапуска игры)\n"; }
@@ -3511,7 +3596,7 @@ static Str route(const Str &path, const Params &q) {
         return "режим обновлён\n";
     }
 #else
-    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook" || path == "hooksave" || path == "hookload" || path == "hookclear")
+    if (path == "hooks" || path == "hook" || path == "hookset" || path == "unhook" || path == "hooksave" || path == "hookload" || path == "hookclear" || path == "zone")
         return "эта сборка без Dobby: хуки недоступны (поиск, xref, hex и патчи работают)\n";
 #endif
     return "неизвестный маршрут\n";
