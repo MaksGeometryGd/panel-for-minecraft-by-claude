@@ -24,61 +24,78 @@ jobs:
           [[ "$TOKEN" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "MGG_TOKEN: только буквы, цифры, _ и -"; exit 1; }
 
           # 0) Dobby (хуки). Его последняя версия не собирается под 32-бит, поэтому идём назад по истории
-          #    (на 1, 10, 30... коммитов назад) и берём первую версию, которая собралась
-          NDK=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}
+          #    (на 1, 30, 60... коммитов назад) и берём первую версию, которая собралась.
+          # Что чиним (по логам прошлых запусков):
+          #   - R7: сборка в ARM-режиме (ANDROID_ARM_MODE=arm) + -fomit-frame-pointer. Это уже работает, правка исходников не нужна;
+          #   - android/log.h "function definition is not allowed here": в logging.c этот include стоит внутри функции,
+          #     новый NDK кладёт в заголовок inline-функции. Переносим include в начало файла;
+          #   - mach-o/loader.h: плагин SymbolResolver лез в macOS-код. Плагины выключаем, для хуков они не нужны;
+          #   - core/arch/Cpu.h не найден: добавляем -I на папку, где этот файл реально лежит;
+          #   - собираем только цель dobby, а не всё подряд (примеры, тесты);
+          #   - пробуем старый NDK r25 (с ним Dobby 2022-2023 годов дружит лучше), потом новый.
+          SDKROOT=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
+          if ! ls "$SDKROOT"/ndk 2>/dev/null | grep -q '^25\.'; then
+            SM="$SDKROOT/cmdline-tools/latest/bin/sdkmanager"; [ -x "$SM" ] || SM=$(command -v sdkmanager || true)
+            [ -n "$SM" ] && { yes | "$SM" --install "ndk;25.2.9519653" > /dev/null 2>&1 || echo "=== NDK r25 не поставился, идём дальше без него"; }
+          fi
+          NDK_LIST=""
+          for D in "$SDKROOT"/ndk/25.* "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_LATEST_HOME:-}" "${ANDROID_NDK_ROOT:-}"; do
+            [ -d "$D" ] || continue
+            case " $NDK_LIST " in *" $D "*) ;; *) NDK_LIST="$NDK_LIST $D" ;; esac
+          done
+          echo "=== NDK для проб:$NDK_LIST"
+
           git clone https://github.com/jmpews/Dobby.git
           MAIN=$(git -C Dobby rev-parse HEAD)
           echo "=== Dobby: коммитов в истории: $(git -C Dobby rev-list --count "$MAIN"), теги: $(git -C Dobby tag | tail -n 5 | tr '\n' ' ')"
-          DOBBY_LIBS=""
-          # Ошибка "write to reserved register 'R7'": в Thumb-режиме clang держит r7 как frame pointer, а Dobby
-          # (cpu.cc, cacheflush через svc) пишет в r7. Лечим двумя способами:
-          #   вариант A — собираем Dobby в ARM-режиме (там frame pointer = r11) и без frame pointer;
-          #   вариант B — A + правим исходник: asm-вызов cacheflush заменяется на __builtin___clear_cache.
-          patch_r7() {
+
+          fix_logging() {
             python3 - <<'PY'
           import re, pathlib
-          for f in pathlib.Path("Dobby").rglob("*.cc"):
+          for f in pathlib.Path("Dobby").rglob("logging.c*"):
               t = f.read_text(errors="ignore")
-              if not re.search(r'asm\s*\(\s*"r7"\s*\)', t): continue
-              lines = t.split("\n")
-              k = next(i for i, l in enumerate(lines) if re.search(r'asm\s*\(\s*"r7"\s*\)', l))
-              st = k
-              while st > 0 and not re.match(r'^[A-Za-z_].*\)\s*\{?\s*$', lines[st]): st -= 1   # заголовок функции
-              depth, en, seen = 0, st, False
-              for i in range(st, len(lines)):
-                  depth += lines[i].count("{") - lines[i].count("}")
-                  if "{" in lines[i]: seen = True
-                  if seen and depth == 0: en = i; break
-              m = re.search(r'\(([^)]*)\)', lines[st])
-              ps = [re.split(r'[\s*&]+', p.strip())[-1] for p in m.group(1).split(",")] if m else []
-              if len(ps) < 2: continue
-              s2 = f"(char*){ps[0]}, (char*)" + (ps[1] if "end" in ps[1].lower() else f"((char*){ps[0]} + {ps[1]})")
-              head = lines[st].rstrip().rstrip("{").rstrip()
-              lines[st:en + 1] = [head + " {", f"  __builtin___clear_cache({s2});", "}"]
-              f.write_text("\n".join(lines)); print("patched", f)
+              if "android/log.h" not in t: continue
+              t = re.sub(r'^[ \t]*#[ \t]*include[ \t]*<android/log\.h>[ \t]*\n', '', t, flags=re.M)
+              f.write_text("#include <android/log.h>\n" + t); print("log.h перенесён наверх:", f)
           PY
           }
-          for N in 1 10 30 60 100 200 400; do
+
+          NDK=""; DOBBY_LIBS=""
+          for N in 1 30 60 100 200 400; do
             C=$(git -C Dobby rev-list --first-parent "$MAIN" | sed -n "${N}p")
             [ -n "$C" ] || { echo "=== Dobby: на глубине $N коммитов нет"; continue; }
             echo "=== Dobby: пробую $(git -C Dobby log -1 --format='%h %ad %s' --date=short "$C") (на $N назад)"
-            for VAR in A B; do
+            for CAND in $NDK_LIST; do
               git -C Dobby checkout -q -f "$C"
-              [ "$VAR" = B ] && patch_r7
+              fix_logging
+              CPU_H=$(find Dobby -path '*core/arch/Cpu.h' | head -n 1)
+              INC=""; [ -n "$CPU_H" ] && INC="-I$(pwd)/${CPU_H%/core/arch/Cpu.h}"
               rm -rf Dobby/build
               if cmake -S Dobby -B Dobby/build \
-                   -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+                   -DCMAKE_TOOLCHAIN_FILE=$CAND/build/cmake/android.toolchain.cmake \
                    -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=android-21 -DANDROID_STL=c++_static \
                    -DANDROID_ARM_MODE=arm \
-                   -DCMAKE_C_FLAGS="-fomit-frame-pointer" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer" \
+                   -DCMAKE_C_FLAGS="-fomit-frame-pointer $INC" -DCMAKE_CXX_FLAGS="-fomit-frame-pointer $INC" \
                    -DCMAKE_BUILD_TYPE=Release -DDOBBY_GENERATE_SHARED=OFF -DDOBBY_DEBUG=OFF \
+                   -DPlugin.SymbolResolver=OFF -DPlugin.ImportTableReplace=OFF -DPlugin.Android.BionicLinkerUtil=OFF \
+                   -DPlugin.ApplicationEventMonitor=OFF -DDOBBY_BUILD_EXAMPLE=OFF -DDOBBY_BUILD_TEST=OFF \
                    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 > dobby_try.log 2>&1 \
-                 && cmake --build Dobby/build -j4 >> dobby_try.log 2>&1; then
-                DOBBY_LIBS=$(find Dobby/build -name '*.a' | tr '\n' ' ')
-                [ -n "$DOBBY_LIBS" ] && { echo "=== Dobby собран ($N назад, вариант $VAR): $DOBBY_LIBS"; break 2; }
+                 && { cmake --build Dobby/build --target dobby -j4 >> dobby_try.log 2>&1 \
+                      || cmake --build Dobby/build -j4 >> dobby_try.log 2>&1; }; then
+                LIBS=$(find Dobby/build -name '*.a' | tr '\n' ' ')
+                NM=$CAND/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm
+                HAS=0; for L in $LIBS; do "$NM" "$L" 2>/dev/null | grep -qE ' T _?DobbyHook$' && HAS=1; done
+                if [ -n "$LIBS" ] && [ "$HAS" = 1 ]; then
+                  NDK=$CAND; DOBBY_LIBS=$LIBS
+                  echo "=== Dobby собран ($N назад, $(basename "$CAND")): $DOBBY_LIBS"; break 2
+                fi
+                echo "=== Собралось, но символа DobbyHook в .a нет ($N назад, $(basename "$CAND")): $LIBS"
+                continue
               fi
-              echo "=== Dobby не собрался ($N назад, вариант $VAR), ошибки:"
-              grep -E "error|Error" dobby_try.log | head -n 8 || true
+              echo "=== Dobby не собрался ($N назад, $(basename "$CAND")), ошибки:"
+              # повторный проход в один поток, чтобы строки ошибок не перемешивались
+              cmake --build Dobby/build -j1 -- -k > dobby_err.log 2>&1 || true
+              cat dobby_try.log dobby_err.log | grep -E ' error:|fatal error:|\*\*\*|CMake Error|No such file|not found' | grep -v 'Werror' | sort -u | head -n 8 || true
             done
           done
           [ -n "$DOBBY_LIBS" ] || { echo "=== Dobby не собрался ни на одной глубине"; exit 1; }
