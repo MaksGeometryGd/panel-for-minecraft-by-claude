@@ -1,6 +1,6 @@
 // MGG panel — поиск функций внутри процесса игры (libminecraftpe.so, 32-bit ARM / Thumb-2).
 // Подгружается через System.loadLibrary("mggpanel"), поднимает панель на http://127.0.0.1:8765/?t=<токен>
-// ллл
+//
 // Возможности: поиск по сигнатуре байтов, поиск строк, xref строки -> код (Thumb literal pool),
 // старт функции (эвристика), hex-просмотр, патч байтов с откатом, хуки (если собрано с Dobby).
 // Все адреса в панели — смещения от базы библиотеки (как в radare2/Ghidra), в hex.
@@ -3667,16 +3667,17 @@ body.lb{--lh:40%}
 #hdc{width:28px;height:28px;padding:0;border:0;background:none;flex:none}
 #cv{position:absolute;left:0;right:0;top:38px;bottom:var(--lh);overflow:auto}
 #pl{position:relative;width:2400px;height:1600px;zoom:var(--zm)}
-.win{position:absolute;width:176px;background:rgba(23,26,34,var(--a));border-radius:6px;overflow:hidden;box-shadow:0 4px 14px #0008}
-.hd{height:32px;background:var(--hd);display:flex;align-items:center;justify-content:space-between;padding:0 9px;font-weight:700;touch-action:none;user-select:none;color:#fff}
-.hd i{font-style:normal;opacity:.85;font-size:11px;font-weight:400}
-.mod{display:flex;align-items:center;min-height:30px;padding:0 3px 0 9px;color:#cfd3e0;border-top:1px solid #ffffff0a;user-select:none}
-.mod .n{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mod .sb{color:inherit;opacity:.6;font-size:10px;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:2px}
+.win{position:absolute;width:150px;background:rgba(18,24,38,var(--a));border-radius:3px;overflow:hidden;box-shadow:0 2px 8px #0009}
+.hd{position:relative;height:26px;background:var(--hd);display:flex;align-items:center;justify-content:center;padding:0 22px;font-weight:700;font-size:12.5px;letter-spacing:.3px;touch-action:none;user-select:none;color:#fff}
+.hd i{position:absolute;right:6px;font-style:normal;opacity:.8;font-size:10px;font-weight:400}
+.mod{position:relative;display:flex;align-items:center;justify-content:center;min-height:26px;padding:0 22px;color:#e6e9f2;font-size:12px;border-top:1px solid #ffffff0d;user-select:none}
+.mod:active{background:#ffffff14}
+.mod .n{flex:0 1 auto;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mod .sb{color:inherit;opacity:.6;font-size:9px;max-width:40px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-left:4px}
 .mod.on{background:var(--hd);color:#fff}
 .mod.mid{background:linear-gradient(90deg,#8a6a1f,#3a2f12);color:#fff}
 .mod.act .n::before{content:"▸ ";opacity:.6}
-.ar{width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;opacity:.8;font-size:16px;transition:transform .12s}
+.ar{position:absolute;right:0;top:0;width:24px;height:100%;display:flex;align-items:center;justify-content:center;opacity:.7;font-size:14px;transition:transform .12s}
 .ar.o{transform:rotate(90deg)}
 .set{background:rgba(0,0,0,.3);padding:6px 7px 8px;border-top:1px solid #ffffff12}
 .set label{display:flex;align-items:center;gap:5px;margin:3px 0;color:var(--dim);font-size:11px}
@@ -3789,9 +3790,9 @@ function build(){const pl=$('pl');pl.textContent='';ROW={};NOTES=[];WINS={};cons
    ROW[m.id]=R}
   WINS[c]={w,hd,body,cnt:hd.querySelector('i'),ms};pl.appendChild(w);dragInit(c)}
  autoPlace();applySearch();paint()}
-function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth/UI.zm-8)/184)),h=new Array(cols).fill(8);
+function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth/UI.zm-8)/158)),h=new Array(cols).fill(8);
  for(const c of CATS){const o=WINS[c];if(!o)continue;let p=POS[c];
-  if(!p){let k=0;for(let i=1;i<cols;i++)if(h[i]<h[k])k=i;p=[8+k*184,h[k]];h[k]+=o.w.offsetHeight+8}
+  if(!p){let k=0;for(let i=1;i<cols;i++)if(h[i]<h[k])k=i;p=[8+k*158,h[k]];h[k]+=o.w.offsetHeight+8}
   o.w.style.left=p[0]+'px';o.w.style.top=p[1]+'px'}}
 function dragInit(c){const o=WINS[c],hd=o.hd;let sx,sy,ox,oy,mv=false,on=false;
  hd.onpointerdown=e=>{o.w.style.zIndex=++ZI;on=true;mv=false;sx=e.clientX;sy=e.clientY;ox=o.w.offsetLeft;oy=o.w.offsetTop;hd.setPointerCapture(e.pointerId)};
