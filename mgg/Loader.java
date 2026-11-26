@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.widget.Toast;
 
 import dalvik.system.DexClassLoader;
 
@@ -47,6 +48,7 @@ public final class Loader {
                             work(a);
                         } catch (Throwable t) {
                             Log.e(TAG, "loader: " + t);
+                            toast(a, "ошибка: " + t, true);
                         }
                     }
                 }, "mgg-loader").start();
@@ -72,8 +74,10 @@ public final class Loader {
             want = fetchText(BASE + "version.txt");
         } catch (Throwable t) {
             Log.w(TAG, "нет связи с GitHub, беру сохранённую сборку: " + t);
+            toast(a, "нет связи с GitHub (" + t + "), беру сохранённую сборку", true);
         }
         if (want != null && (!want.equals(have) || !so.exists() || !jar.exists())) {
+            toast(a, "качаю обновление…", false);
             File so2 = new File(dir, "libmggpanel.so.tmp");
             File jar2 = new File(dir, "overlay.jar.tmp");
             download(BASE + "libmggpanel.so", so2);
@@ -84,7 +88,7 @@ public final class Loader {
             writeText(ver, want);
             Log.i(TAG, "обновлено до " + want);
         }
-        if (!so.exists() || !jar.exists()) { Log.w(TAG, "нечего загружать (нет сети и нет сохранённой сборки)"); return; }
+        if (!so.exists() || !jar.exists()) { Log.w(TAG, "нечего загружать (нет сети и нет сохранённой сборки)"); toast(a, "нечего загружать: нет сети и нет сохранённой сборки", true); return; }
         so.setReadOnly();
         jar.setReadOnly();          // Android 14+: загружаемый код должен быть только для чтения
 
@@ -92,13 +96,28 @@ public final class Loader {
         ClassLoader cl = new DexClassLoader(jar.getAbsolutePath(), a.getCodeCacheDir().getAbsolutePath(), null, a.getClassLoader());
         Class<?> c = cl.loadClass("mgg.Overlay");
         final Method m = c.getMethod("start", Activity.class);
+        String v = want != null ? want : have;
+        final String v7 = v == null ? "?" : v.length() > 7 ? v.substring(0, 7) : v;
         a.runOnUiThread(new Runnable() {
             public void run() {
                 try {
                     m.invoke(null, a);
+                    toast(a, "ok " + v7, false);
                 } catch (Throwable t) {
                     Log.e(TAG, "overlay: " + t);
+                    toast(a, "overlay: " + t, true);
                 }
+            }
+        });
+    }
+
+    private static void toast(final Activity a, final String s, final boolean lng) {
+        Log.i(TAG, s);
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            public void run() {
+                try {
+                    Toast.makeText(a, "MGG: " + s, lng ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+                } catch (Throwable ignore) {}
             }
         });
     }
