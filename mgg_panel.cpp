@@ -3641,7 +3641,7 @@ let PCM='off';
 function pcUi(m){PCM=m;document.getElementById('bF').style.display=m=='pc'?'':'none';document.querySelectorAll('#pcseg button').forEach((b,i)=>b.className=(i==1)==(m=='pc')?'on':'')}
 async function pcSet(m){await call('uimode',{m:m});pcUi(m)}
 async function pcInit(){pcUi((await api('uimode',{})).trim()=='pc'?'pc':'off')}
-function pcOpen(){const f=document.getElementById('pcf');if(!f.getAttribute('src'))f.src='/pc?t='+encodeURIComponent(T)+'&embed=1';f.style.display='block'}
+function pcOpen(){if(window.MGGJ&&MGGJ.openF){MGGJ.openF();return}const f=document.getElementById('pcf');if(!f.getAttribute('src'))f.src='/pc?t='+encodeURIComponent(T)+'&embed=1';f.style.display='block'}
 function pcClose(){document.getElementById('pcf').style.display='none'}
 window.addEventListener('message',e=>{if(e.data==='pcclose')pcClose()});
 function plP(w,h){document.getElementById('plw').value=w;document.getElementById('plh').value=h;if(PL)plSend(1)}
