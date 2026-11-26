@@ -825,7 +825,7 @@ static void autoApply() {
 struct Slot {
     bool used; void *target; void *orig; int mode; uintptr_t val;     // mode: 0 лог, 1 вернуть val без вызова, 2 вызвать и подменить результат, 3 вызвать, подставив val вместо аргумента arg, 4 после успешного вызова сломать блоки вокруг (val = радиус 1–2)
     uintptr_t off; std::atomic<uint32_t> calls; uintptr_t last[8];
-    int arg; uint8_t sig[8]; long long t0;                           // arg — какой аргумент подменять (режим 3); sig — первые байты функции до хука (для сохранения и проверки версии); t0 — время постановки, мс
+    int arg; bool arm; uint8_t sig[8]; long long t0;                           // arg — какой аргумент подменять (режим 3); sig — первые байты функции до хука (для сохранения и проверки версии); t0 — время постановки, мс
     uintptr_t seen[8]; uint32_t seenN[8]; uint32_t rr;               // разные a0 (this), которые видели при вызовах: так находятся адреса объектов (моб, игрок)
 };
 static Slot g_slots[16];
@@ -876,7 +876,7 @@ static Str hooksList() {
         const char *m = s.mode == 0 ? "лог" : s.mode == 1 ? "ret" : s.mode == 2 ? "set" : s.mode == 3 ? "арг" : "area";
         uint32_t c = s.calls.load(); double sec = (now - s.t0) / 1000.0; char t[64];
         snprintf(t, sizeof t, "%.1f", sec > 0.5 ? c / sec : 0.0);
-        out += "#" + std::to_string(i) + " " + hx(s.off) + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
+        out += "#" + std::to_string(i) + " " + hx(s.off) + (s.arm ? " ARM" : " T") + " режим=" + m + (s.mode == 3 ? " арг=" + std::to_string(s.arg) : Str()) + " val=" + hx(s.val) + " вызовов=" + std::to_string(c) + " (" + t + "/с)\n   арги:";
         for (int k = 0; k < 8; k++) out += " " + hx(s.last[k]);
         std::vector<std::pair<uint32_t, uintptr_t>> th;
         for (int k = 0; k < 8; k++) if (s.seenN[k]) th.push_back({s.seenN[k], s.seen[k]});
@@ -887,21 +887,39 @@ static Str hooksList() {
     return out.empty() ? "хуков нет\n" : out;
 }
 
-// единая постановка хука (из панели и из автозагрузки): off — смещение функции без +1 (Thumb)
-static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_t val, Str &msg) {
+// Thumb или ARM? isa: 0 авто, 1 Thumb, 2 ARM. Авто: адрес не кратен 4 = Thumb (ARM всегда выровнен по 4);
+// иначе смотрим первые 4 слова: в ARM-коде почти у всех условие "всегда" (старший полубайт 0xE) и привычные начала функций.
+static bool hookIsArm(uintptr_t a, int isa) {
+    if (isa == 1) return false;
+    if (isa == 2) return true;
+    if (a & 3) return false;
+    uint32_t w[4]; if (!guarded(w, (const void *)a, 16)) return false;
+    int al = 0; for (int i = 0; i < 4; i++) if ((w[i] >> 28) == 0xE) al++;
+    uint32_t f = w[0];
+    bool strong = (f & 0xFFFF0000u) == 0xE92D0000u || f == 0xE52DE004u || (f & 0xFFFFF000u) == 0xE24DD000u || f == 0xE12FFF1Eu ||
+                  (f & 0xFFFF0FFFu) == 0xE1A00000u || (f & 0xFFFFF000u) == 0xE59F0000u || (f & 0xFFF00000u) == 0xE3000000u ||
+                  (f & 0xFFF00000u) == 0xE3A00000u || (f & 0xFF000000u) == 0xEA000000u || (f & 0xFFF0F000u) == 0xE5900000u;
+    return al == 4 || (al == 3 && strong);
+}
+
+// единая постановка хука (из панели и из автозагрузки): off — смещение функции; нечётное = Thumb (как в таблице символов), isa задаёт Thumb/ARM
+static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_t val, Str &msg, int isa = 0) {
+    if (off & 1) { isa = 1; off &= ~(uintptr_t)1; }
     for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == off) { msg = "на этом смещении уже есть хук #" + std::to_string(i); return -1; }
     int id = -1;
     for (int i = 0; i < 16; i++) if (!g_slots[i].used) { id = i; break; }
     if (id < 0) { msg = "все 16 слотов заняты"; return -1; }
     uintptr_t a = im.base + off;
     if (!segAt(im, a, 8)) { msg = "смещение вне сегмента библиотеки"; return -1; }
+    bool arm = hookIsArm(a, isa);
+    if (arm && (a & 3)) { msg = "ARM-функция должна быть выровнена по 4 (смещение кратно 4)"; return -1; }
     Slot &s = g_slots[id];
-    s.mode = mode; s.val = val; s.arg = arg > 7 ? 7 : arg < 0 ? 0 : arg; s.off = off; s.calls = 0; s.t0 = hkNow(); s.rr = 0;
+    s.mode = mode; s.val = val; s.arg = arg > 7 ? 7 : arg < 0 ? 0 : arg; s.off = off; s.arm = arm; s.calls = 0; s.t0 = hkNow(); s.rr = 0;
     for (int k = 0; k < 8; k++) { s.seen[k] = 0; s.seenN[k] = 0; s.last[k] = 0; }
     memcpy(s.sig, (const void *)a, 8);                                 // до хука: потом тут будет прыжок Dobby
-    s.target = (void *)(a + 1);                                        // +1: Thumb
+    s.target = (void *)(arm ? a : a + 1);                              // +1 только для Thumb: Dobby по младшему биту выбирает режим
     int rc = MGG_HOOK(s.target, g_hk[id], &s.orig);
-    if (rc != 0) { msg = "Dobby вернул ошибку " + std::to_string(rc); return -1; }
+    if (rc != 0) { msg = "Dobby вернул ошибку " + std::to_string(rc) + (arm ? " (ARM)" : " (Thumb)"); return -1; }
     s.used = true; return id;
 }
 
@@ -911,6 +929,7 @@ static Str hooksSave() {
         if (!s.used) continue;
         snprintf(t, sizeof t, "%lX %d %d %lX ", (unsigned long)s.off, s.mode, s.arg, (unsigned long)s.val); body += t;
         for (int k = 0; k < 8; k++) { snprintf(t, sizeof t, "%02X", s.sig[k]); body += t; }
+        body += s.arm ? " 2" : " 1";                                   // ISA: 1 Thumb, 2 ARM (старые файлы без поля = Thumb)
         body += "\n"; n++;
     }
     if (!n) return "нет хуков для сохранения\n";
@@ -923,8 +942,10 @@ static Str hooksApply(const Img &im) {
     Str o; char line[256]; bool first = true;
     while (fgets(line, sizeof line, f)) {
         if (first) { first = false; if (strncmp(line, "HOOKS1", 6) != 0) { o += "неверный формат файла хуков\n"; break; } continue; }
-        unsigned long off = 0, val = 0; int mode = 0, arg = 0; char sg[40] = {0};
-        if (sscanf(line, "%lx %d %d %lx %33s", &off, &mode, &arg, &val, sg) != 5 || strlen(sg) != 16 || mode < 0 || mode > 4) continue;
+        unsigned long off = 0, val = 0; int mode = 0, arg = 0, isa = 1; char sg[40] = {0};
+        int nf = sscanf(line, "%lx %d %d %lx %33s %d", &off, &mode, &arg, &val, sg, &isa);
+        if (nf < 5 || strlen(sg) != 16 || mode < 0 || mode > 4) continue;
+        if (nf < 6 || isa < 1 || isa > 2) isa = 1;
         std::vector<uint8_t> want; if (!unhex(sg, want)) continue;
         bool already = false;
         for (const Slot &s : g_slots) if (s.used && s.off == off) already = true;
@@ -932,7 +953,7 @@ static Str hooksApply(const Img &im) {
         uintptr_t a = im.base + off;
         if (!segAt(im, a, 8)) { o += hx(off) + ": вне сегмента, пропущен\n"; continue; }
         if (memcmp((const void *)a, want.data(), 8) != 0) { o += hx(off) + ": пропущен, байты функции другие (другая версия игры?)\n"; continue; }
-        Str msg; int id = hookInstall(im, off, mode, arg, val, msg);
+        Str msg; int id = hookInstall(im, off, mode, arg, val, msg, isa);
         o += id >= 0 ? "хук #" + std::to_string(id) + " на " + hx(off) + " поставлен\n" : hx(off) + ": " + msg + "\n";
     }
     fclose(f); return o.empty() ? "файл хуков пуст\n" : o;
@@ -3066,11 +3087,11 @@ small{color:var(--dim);display:block;margin-top:4px}
 <input id=sq placeholder="часть имени, например destroyBlock или attack">
 <div class=row><select id=sk><option value=0>только функции</option><option value=1>и переменные</option></select><button onclick="symFind()"><svg class=ic><use href="#i-search"/></svg>Найти</button></div>
 <small id=sys></small><div id=syr></div>
-<small>Работает, если библиотека экспортирует имена функций. Нажми на результат: смещение подставится в поля хука, патча и дизассемблера. T — Thumb (хукается), A — ARM (панель не хукает), D — переменная.</small></div></details>
+<small>Работает, если библиотека экспортирует имена функций. Нажми на результат: смещение подставится в поля хука, патча и дизассемблера. T — Thumb, A — ARM (хукаются оба, режим выбирается в блоке «Хуки»), D — переменная.</small></div></details>
 <details class=card><summary><svg class=ic><use href="#i-plug"/></svg>Хуки (нужен Dobby)<svg class=ic><use href="#i-plus"/></svg></summary><div>
-<input id=ka placeholder="смещение функции, hex"><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option><option value=arg>подменить аргумент</option><option value=area>слом вокруг (на destroyBlock)</option></select>
+<input id=ka placeholder="смещение функции, hex"><select id=kt><option value=auto>Thumb/ARM: авто</option><option value=thumb>Thumb</option><option value=arm>ARM</option></select><select id=km><option value=log>лог вызовов</option><option value=ret>вернуть значение</option><option value=set>подменить результат</option><option value=arg>подменить аргумент</option><option value=area>слом вокруг (на destroyBlock)</option></select>
 <div class=row><input id=kv placeholder="значение, hex"><input id=kn placeholder="№ аргумента 0–7" inputmode=numeric></div>
-<button onclick="call('hook',{a:v('ka'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
+<button onclick="call('hook',{a:v('ka'),t:v('kt'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-plug"/></svg>Поставить</button>
 <input id=ki placeholder="номер хука"><div class=grid3><button class=s onclick="call('hookset',{id:v('ki'),m:v('km'),v:v('kv'),n:v('kn')||0})"><svg class=ic><use href="#i-reset"/></svg>Режим</button><button class=s onclick="call('unhook',{id:v('ki')})"><svg class=ic><use href="#i-stop"/></svg>Снять</button><button class=s onclick="call('hooks',{})"><svg class=ic><use href="#i-list"/></svg>Список</button></div>
 <div class=grid2><button class=s onclick="hkLive(this)"><svg class=ic><use href="#i-look"/></svg>Живой список</button><button class=s onclick="call('hookset',{id:v('ki'),reset:1})"><svg class=ic><use href="#i-reset"/></svg>Сбросить счётчики</button></div>
 <div id=hkl class=lv style="white-space:pre-wrap;display:none;color:var(--dim)"></div>
@@ -3471,9 +3492,10 @@ static Str route(const Str &path, const Params &q) {
     if (path == "hook") {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex)\n";
         uintptr_t v = 0; hexNum(q, "v", v);
-        Str msg; int id = hookInstall(im, a, hkMode(P(q, "m", "log")), (int)decNum(q, "n", 0), v, msg);
+        Str t = P(q, "t", "auto"); int isa = t == "thumb" ? 1 : t == "arm" ? 2 : 0;
+        Str msg; int id = hookInstall(im, a, hkMode(P(q, "m", "log")), (int)decNum(q, "n", 0), v, msg, isa);
         if (id < 0) return msg + "\n";
-        return "хук #" + std::to_string(id) + " на " + hx(a) + " (Thumb)\n";
+        return "хук #" + std::to_string(id) + " на " + hx(g_slots[id].off) + (g_slots[id].arm ? " (ARM)" : " (Thumb)") + "\n";
     }
     if (path == "hooksave") return hooksSave();
     if (path == "hookload") return hooksApply(im);
