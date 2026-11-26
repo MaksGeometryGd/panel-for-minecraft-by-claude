@@ -3494,7 +3494,7 @@ static Str route(const Str &path, const Params &q) {
     return "неизвестный маршрут\n";
 }
 
-// ---------------------------------------------------------------- HTTP (только 127.0.0.1)
+// ---------------------------------------------------------------- HTTP (только 127.0.0.1)ш
 static void sendAll(int c, const Str &s) {
     size_t o = 0;
     while (o < s.size()) {
