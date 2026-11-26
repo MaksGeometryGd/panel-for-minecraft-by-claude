@@ -3143,6 +3143,7 @@ small{color:var(--dim);display:block;margin-top:4px}
 .kv b.no{color:var(--dim);font-weight:400}
 .kv.wrap{flex-wrap:wrap}.lv{flex-basis:100%;font:11px/1.3 ui-monospace,monospace;color:var(--ok);padding:0 2px 2px}
 .kv button{width:28px;height:28px;padding:0;margin:0;flex:none;border-radius:8px}
+#pcf{position:fixed;left:0;top:0;width:100%;height:100%;border:0;z-index:50;display:none;background:#0d0f14}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
 <symbol id="i-bolt" viewBox="0 0 24 24"><path class="fi" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
@@ -3360,6 +3361,9 @@ small{color:var(--dim);display:block;margin-top:4px}
 </div>
 
 <div class=pg id=pt style="display:none">
+<div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Functions second menu</h3>
+<div class=seg id=pcseg><button class=on onclick="pcSet('off')">OFF</button><button onclick="pcSet('pc')">pc</button></div>
+<small>OFF: только обычная вкладка «Функции» (Classic). pc: отдельное меню в стиле читклиента. Категории — красные окна, которые можно двигать, клик по функции включает её, стрелка справа открывает настройки. В левой колонке появится вкладка F; оверлей-кнопка F поверх игры включается через FMenu.java.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-palette"/></svg>Пресеты</h3><div class=pre>
 <button onclick="preset('#85775a','#12141c','#1a1d29','#f0b429')">Asteria</button>
 <button onclick="preset('#4f6bff','#0b0d12','#151922','#7dd3fc')">Neon</button>
@@ -3380,7 +3384,9 @@ small{color:var(--dim);display:block;margin-top:4px}
 <button id=bd class=nav onclick="tab('d')"><span class=bx><svg class=ic><use href="#i-dex"/></svg></span>Dex</button>
 <button id=bf class=nav onclick="tab('f')"><span class=bx><svg class=ic><use href="#i-file"/></svg></span>File</button>
 <button id=bs class=nav onclick="tab('s')"><span class=bx><svg class=ic><use href="#i-safe"/></svg></span>Safe</button>
-<button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button></aside>
+<button id=bt class=nav onclick="tab('t')"><span class=bx><svg class=ic><use href="#i-palette"/></svg></span>Тема</button>
+<button id=bF class=nav style="display:none" onclick="pcOpen()"><span class=bx><b style="font-size:15px">F</b></span>PC</button></aside>
+<iframe id=pcf></iframe>
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';const out=document.getElementById('out');
 const ERR=/не найден|не найдено|не найдена|ошибк|не удал|не читается|не могу|нужен |нужно |нужны |неверн|неизвестн|вне читаем|вне сегмент|не подход|слишком|нет такого|не совпал|не нашёл|ненадёжна|не привязано|не запускался|список пуст|нет привязки|нет ответа|ссылок не найдено|вызовов не найдено|заморозок нет|хуков нет|нет в процессе|патчей в этой сессии нет|сохранённых патчей нет|отключённых патчей нет|нет доступа|не папка|путь вне|не обычный|заморозка снята|запись не удалась|занят|сначала|нет описания|найдено: 0\b|осталось: 0\b|совпадений: 0\b|кандидатов: 0\b|только GET|bad request|mprotect|остановлено: |неправиль/i;
@@ -3631,10 +3637,197 @@ w.innerHTML='<div class="fn c" onclick="preGo(\''+id+'\','+(on?0:1)+')"><div cla
 +'<div class=row><input id=pa_'+id+' placeholder="адрес hex" value="'+(pv.a||'')+'"><input id=ps_'+id+' placeholder="слот" style="flex:.4" value="'+(pv.s||'')+'"><input id=pv_'+id+' style="flex:.6" value="'+(pv.v||dv)+'"></div><small>'+hint+'</small>';
 d.appendChild(w)}}
 async function preGo(id,on){PRV[id]={a:v('pa_'+id),s:v('ps_'+id),v:v('pv_'+id)};await call('pre',{id:id,on:on,a:PRV[id].a,s:PRV[id].s,v:PRV[id].v});prl()}
+let PCM='off';
+function pcUi(m){PCM=m;document.getElementById('bF').style.display=m=='pc'?'':'none';document.querySelectorAll('#pcseg button').forEach((b,i)=>b.className=(i==1)==(m=='pc')?'on':'')}
+async function pcSet(m){await call('uimode',{m:m});pcUi(m)}
+async function pcInit(){pcUi((await api('uimode',{})).trim()=='pc'?'pc':'off')}
+function pcOpen(){const f=document.getElementById('pcf');if(!f.getAttribute('src'))f.src='/pc?t='+encodeURIComponent(T)+'&embed=1';f.style.display='block'}
+function pcClose(){document.getElementById('pcf').style.display='none'}
+window.addEventListener('message',e=>{if(e.data==='pcclose')pcClose()});
 function plP(w,h){document.getElementById('plw').value=w;document.getElementById('plh').value=h;if(PL)plSend(1)}
 function azP(w,h,d){document.getElementById('azw').value=w;document.getElementById('azh').value=h;document.getElementById('azd').value=d;if(AZ)azSend(1)}
-fnl();libLoad();slotInit();zSet();azInit();plInit();prl();
+fnl();libLoad();slotInit();zSet();azInit();plInit();prl();pcInit();
 </script></body></html>)MGG";
+
+// PC-меню функций: отдельная страница /pc (открывается из панели во вкладке F и из оверлей-кнопки F)
+static const char *kPcPage = R"MGP(<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><title>MGG PC</title>
+<style>
+:root{--hd:#c4262e;--bg:#0d0f14;--w2:#20242f;--tx:#eceef4;--dim:#8d93a6;--a:.88;--zm:1;--lh:26px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+[hidden]{display:none!important}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:13px/1.25 system-ui,sans-serif;overflow:hidden}
+body.lb{--lh:40%}
+#bar{height:38px;display:flex;align-items:center;gap:5px;padding:0 6px;background:#12141b;border-bottom:1px solid #262a37;overflow-x:auto;white-space:nowrap}
+#bar b{font-size:13px;letter-spacing:.4px;color:#fff;background:var(--hd);border-radius:6px;padding:3px 8px}
+#bar button,#bar input[type=search]{height:28px;border-radius:7px;border:1px solid #2b3040;background:var(--w2);color:var(--tx);font:12px system-ui;flex:none}
+#bar button{min-width:30px;padding:0 7px}
+#q{width:110px;padding:0 8px}
+#bar label{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:3px;flex:none}
+#hdc{width:28px;height:28px;padding:0;border:0;background:none;flex:none}
+#cv{position:absolute;left:0;right:0;top:38px;bottom:var(--lh);overflow:auto}
+#pl{position:relative;width:2400px;height:1600px;zoom:var(--zm)}
+.win{position:absolute;width:176px;background:rgba(23,26,34,var(--a));border-radius:6px;overflow:hidden;box-shadow:0 4px 14px #0008}
+.hd{height:32px;background:var(--hd);display:flex;align-items:center;justify-content:space-between;padding:0 9px;font-weight:700;touch-action:none;user-select:none;color:#fff}
+.hd i{font-style:normal;opacity:.85;font-size:11px;font-weight:400}
+.mod{display:flex;align-items:center;min-height:30px;padding:0 3px 0 9px;color:#cfd3e0;border-top:1px solid #ffffff0a;user-select:none}
+.mod .n{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mod .sb{color:inherit;opacity:.6;font-size:10px;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:2px}
+.mod.on{background:var(--hd);color:#fff}
+.mod.mid{background:linear-gradient(90deg,#8a6a1f,#3a2f12);color:#fff}
+.mod.act .n::before{content:"▸ ";opacity:.6}
+.ar{width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:6px;opacity:.8;font-size:16px;transition:transform .12s}
+.ar.o{transform:rotate(90deg)}
+.set{background:rgba(0,0,0,.3);padding:6px 7px 8px;border-top:1px solid #ffffff12}
+.set label{display:flex;align-items:center;gap:5px;margin:3px 0;color:var(--dim);font-size:11px}
+.set label span{width:46px;flex:none}
+.set input,.set select{flex:1;min-width:0;height:26px;background:#10121a;border:1px solid #2d3242;border-radius:5px;color:var(--tx);padding:0 5px;font:12px system-ui}
+.set .bt{display:flex;flex-wrap:wrap;gap:4px;margin:5px 0}
+.set button{flex:1 1 auto;min-width:0;height:26px;border:0;border-radius:5px;background:#2a2f3f;color:var(--tx);font:11px system-ui;padding:0 7px}
+.set button:active{background:var(--hd)}
+.set small{display:block;color:var(--dim);font-size:10.5px;margin-top:4px;line-height:1.3}
+#log{position:absolute;left:0;right:0;bottom:0;height:var(--lh);background:#0a0b0f;border-top:1px solid #262a37;font:11px/1.35 ui-monospace,monospace;color:#9fe3b9;white-space:pre-wrap;word-break:break-all;padding:4px 8px;overflow:auto}
+</style></head><body>
+<div id=bar><b>F</b><input id=q type=search placeholder="поиск">
+<button id=zm1>A−</button><button id=zm2>A+</button><button id=op title="прозрачность">◐</button><input type=color id=hdc title="цвет вкладок">
+<label><input type=checkbox id=keep>запом.</label><button id=rst title="сбросить окна">⟲</button><button id=cpy title="копировать журнал">⎘</button><button id=lg title="журнал">▤</button><button id=cls hidden>✕</button></div>
+<div id=cv><div id=pl></div></div>
+<pre id=log>MGG PC готов</pre>
+<script>
+const QS=new URLSearchParams(location.search),T=QS.get('t')||'',EMB=QS.get('embed')=='1';
+const $=id=>document.getElementById(id);
+const LS=(k,d)=>{try{const x=JSON.parse(localStorage.getItem(k));return x==null?d:x}catch(e){return d}};
+const SV=(k,x)=>{try{localStorage.setItem(k,JSON.stringify(x))}catch(e){}};
+let UI=Object.assign({zm:1,a:.88,hd:'#c4262e',keep:0},LS('mggPcUi',{}));
+let POS=LS('mggPcPos',{}),COL=LS('mggPcCol',{}),OPN=LS('mggPcOpen',{}),VAL=LS('mggPcVal',{});
+const S={zone:'0',place:'0',fov:'',chunk:'',pre:{},fn:[]};
+let ZM=0,FNSIG='',ROW={},NOTES=[],WINS={};
+async function api(p,o){const q=new URLSearchParams(o||{});q.set('t',T);try{return await(await fetch('/api/'+p+'?'+q)).text()}catch(e){return 'ошибка связи'}}
+function log(t){$('log').textContent=String(t).trim()}
+async function call(p,o){const t=await api(p,o);log(t);return t}
+const gv=(m,f)=>{const v=(VAL[m]||{})[f];return v==null?(DEF[m]||{})[f]:v};
+const N19=[1,2,3,4,5,6,7,8,9];
+function preMod(c,id,n,def){return{c,id,n,
+ st:()=>S.pre[id]&&S.pre[id].on?1:0,
+ sub:()=>{const p=S.pre[id];return p&&p.on?'вкл':p&&p.ds=='-'?'нужен адрес':''},
+ tg:on=>call('pre',{id,on:on?1:0,a:gv(id,'a'),s:gv(id,'s'),v:gv(id,'v')}),live:1,
+ set:[{id:'a',l:'адрес',t:'in',d:'',ph:'hex функции'},{id:'s',l:'слот',t:'in',d:'',ph:'vtable GameMode'},{id:'v',l:'значение',t:'in',d:def},{t:'note',f:()=>(S.pre[id]||{}).hint||''}]}}
+const MODS=[
+{c:'Мир',id:'md',n:'Multiple destroy',st:()=>S.zone.startsWith('1')?1:0,sub:()=>S.zone.startsWith('1')?S.zone.trim().split(' ').slice(1).join('x'):'',
+ tg:on=>call('zone',on?{on:1,w:gv('md','w'),h:gv('md','h'),d:gv('md','d')}:{on:0}),live:1,
+ set:[{id:'w',l:'Ш',t:'sel',o:N19,d:3},{id:'h',l:'В',t:'sel',o:N19,d:3},{id:'d',l:'Г',t:'sel',o:[1,2,3,4,5],d:1},
+ {t:'btns',b:[['1x1',{w:1,h:1,d:1}],['3x2',{w:3,h:2,d:1}],['3x3',{w:3,h:3,d:1}],['5x5',{w:5,h:5,d:1}],['3x3x3',{w:3,h:3,d:3}]]},
+ {t:'note',x:'Только локальный мир. Ш × В в плоскости грани, Г вглубь. Адрес destroyBlock ищется сам.'}]},
+{c:'Мир',id:'mp',n:'Multiple place',st:()=>S.place.startsWith('1')?1:0,sub:()=>S.place.startsWith('1')?S.place.trim().split(' ').slice(1).join('x'):'',
+ tg:on=>call('place',on?{on:1,w:gv('mp','w'),h:gv('mp','h'),s:gv('mp','s')}:{on:0}),live:1,
+ set:[{id:'w',l:'Ш',t:'sel',o:N19,d:3},{id:'h',l:'В',t:'sel',o:N19,d:3},{id:'s',l:'слот',t:'sel',o:[6,7,8],d:7},
+ {t:'btns',b:[['3x1',{w:3,h:1}],['3x3',{w:3,h:3}],['5x5',{w:5,h:5}],['9x9',{w:9,h:9}]]},
+ {t:'note',x:'Ставит пластину вокруг блока. Если не ставит: слот 6 или 8. Глубины нет.'}]},
+preMod('Мир','timefreeze','Заморозка времени','0'),
+preMod('Мир','weather','Погода: заморозка','0'),
+preMod('Игрок','reach','Reach','7.0'),
+preMod('Игрок','breakspd','Скорость слома','1000.0'),
+preMod('Игрок','fly','Полёт','1'),
+preMod('Игрок','noclip','Noclip','1'),
+{c:'Камера',id:'fov',n:'FOV changer',st:()=>S.fov.includes('заморожено')&&!ZM?1:0,sub:()=>S.fov.startsWith('не привязано')?'не привязано':'',
+ tg:on=>call(on?'csapply':'csstop',{s:'fov',v:gv('fov','v')}),live:1,
+ set:[{id:'v',l:'FOV',t:'in',d:'70'},{id:'a',l:'адрес',t:'in',d:'',ph:'hex для привязки'},
+ {t:'btns',b:[['Привязать',()=>call('csbind',{s:'fov',a:gv('fov','a')})],['Статус',()=>call('csinfo',{s:'fov'})]]},
+ {t:'note',x:'Mem: найди FOV как float, смени в настройках, сузь, впиши адрес и «Привязать». Зажим 30–110 снимается в «Лимиты».'}]},
+{c:'Камера',id:'zoom',n:'Зум',st:()=>ZM?1:0,sub:()=>ZM?gv('zoom','v'):'',
+ tg:async on=>{ZM=on?1:0;return call('csapply',{s:'fov',v:on?gv('zoom','v'):gv('fov','v')})},live:1,
+ set:[{id:'v',l:'FOV зума',t:'in',d:'30'},{t:'note',x:'Игра зажимает FOV снизу на 30. Ниже получится после снятия лимита. Нужна привязка FOV.'}]},
+{c:'Камера',id:'chunk',n:'Чанки',st:()=>S.chunk.includes('заморожено')?1:0,sub:()=>S.chunk.startsWith('не привязано')?'не привязано':'',
+ tg:on=>call(on?'csapply':'csstop',{s:'chunk',v:gv('chunk','v')}),live:1,
+ set:[{id:'v',l:'чанков',t:'in',d:'16'},{id:'a',l:'адрес',t:'in',d:'',ph:'hex для привязки'},
+ {t:'btns',b:[['Привязать',()=>call('csbind',{s:'chunk',a:gv('chunk','a')})],['Статус',()=>call('csinfo',{s:'chunk'})]]},
+ {t:'note',x:'1–96. В настройках UI может показывать другое число, а в игре дальность будет такой.'}]},
+preMod('Камера','vibrant','Vibrant Visuals','1'),
+preMod('Камера','viewdist','Лимит чанков (хук)','96'),
+{c:'Система',id:'lim',n:'Лимиты (константы)',k:'set',
+ set:[{id:'f1',l:'число 1',t:'in',d:'30'},{id:'f2',l:'число 2',t:'in',d:'110'},{id:'t',l:'тип',t:'sel',o:[['f','float'],['i','int']],d:'f'},
+ {t:'btns',b:[['Найти пару',()=>call('fpair',{f1:gv('lim','f1'),f2:gv('lim','f2'),t:gv('lim','t')})],['Только число 1',()=>call('fpair',{f1:gv('lim','f1'),t:gv('lim','t')})]]},
+ {id:'a',l:'адрес',t:'in',d:'',ph:'hex из списка'},{id:'n',l:'новое',t:'in',d:''},
+ {t:'btns',b:[['Применить',()=>call('fset',{a:gv('lim','a'),f:gv('lim','n'),t:gv('lim','t'),k:0})],['Запомнить',()=>call('fset',{a:gv('lim','a'),f:gv('lim','n'),t:gv('lim','t'),k:1})],['Откат',()=>call('undo',{a:gv('lim','a')})]]},
+ {t:'note',x:'По умолчанию ищет зажим FOV (30 и 110 рядом). Для чанков тип int и числа из своих находок. Литерал общий для всех мест, где он читается.'}]},
+{c:'Система',id:'gms',n:'Слоты GameMode',k:'act',run:()=>call('gmslots',{n:40})},
+{c:'Система',id:'hk',n:'Хуки и патчи',k:'set',
+ set:[{t:'btns',b:[['Список хуков',()=>call('hooks',{})],['Запомнить',()=>call('hooksave',{})],['Загрузить',()=>call('hookload',{})]]},
+ {t:'btns',b:[['Удалить сохранённые',()=>call('hookclear',{})],['Патчи сессии',()=>call('patches',{})],['Сохранённые патчи',()=>call('saved',{})]]},
+ {t:'note',x:'Запомненные хуки ставятся сами при старте игры, если байты функции те же.'}]}
+];
+const CATS=['Мир','Игрок','Камера','Global','Система'];
+const DEF={};for(const m of MODS){DEF[m.id]={};for(const f of m.set||[])if(f.id)DEF[m.id][f.id]=f.d==null?'':f.d}
+function GL(){return S.fn.map(r=>{const prof=r.st[0]=='P',s=prof?r.st[1]:r.st;return{c:'Global',id:'fn:'+r.n,n:r.n,
+ st:()=>s=='1'?1:s=='2'?.5:0,sub:()=>(prof?'набор ':'')+(s=='3'?'др. версия':s=='2'?'частично':''),
+ tg:async on=>{if(s=='3'){log('байты не совпали: функция для другой версии игры');return}return call(on?'fnon':'fnoff',{n:r.n,k:UI.keep?1:0})}}})}
+const ALL=()=>MODS.concat(GL());
+async function run(m){if(m.k=='act'){m.run();return}if(m.k=='set'){toggleOpen(m);return}const on=m.st()!==1;await m.tg(on);await refresh()}
+function liveSend(m){if(m.live&&m.st&&m.st()===1)m.tg(true).then(refresh)}
+function toggleOpen(m){OPN[m.id]=!OPN[m.id];SV('mggPcOpen',OPN);const r=ROW[m.id];if(r&&r.set){r.set.hidden=!OPN[m.id];if(r.ar)r.ar.classList.toggle('o',!!OPN[m.id])}}
+function syncInputs(m){const r=ROW[m.id];if(!r||!r.set)return;r.set.querySelectorAll('[data-f]').forEach(e=>{e.value=gv(m.id,e.dataset.f)})}
+function mkSet(m){const box=document.createElement('div');box.className='set';box.hidden=!OPN[m.id];
+ for(const f of m.set||[]){
+  if(f.t=='note'){const s=document.createElement('small');s.textContent=f.x||'';if(f.f)NOTES.push([s,f.f]);box.appendChild(s);continue}
+  if(f.t=='btns'){const d=document.createElement('div');d.className='bt';for(const b of f.b){const e=document.createElement('button');e.textContent=b[0];
+   e.onclick=()=>{if(typeof b[1]=='function'){b[1]()}else{VAL[m.id]=Object.assign(VAL[m.id]||{},b[1]);SV('mggPcVal',VAL);syncInputs(m);liveSend(m)}};d.appendChild(e)}box.appendChild(d);continue}
+  const lb=document.createElement('label'),sp=document.createElement('span');sp.textContent=f.l;lb.appendChild(sp);let el;
+  if(f.t=='sel'){el=document.createElement('select');for(const o of f.o){const op=document.createElement('option');op.value=Array.isArray(o)?o[0]:o;op.textContent=Array.isArray(o)?o[1]:o;el.appendChild(op)}}
+  else{el=document.createElement('input');el.placeholder=f.ph||''}
+  el.dataset.f=f.id;el.value=gv(m.id,f.id);
+  el.onchange=()=>{(VAL[m.id]=VAL[m.id]||{})[f.id]=el.value.trim();SV('mggPcVal',VAL);liveSend(m)};
+  lb.appendChild(el);box.appendChild(lb)}
+ return box}
+function build(){const pl=$('pl');pl.textContent='';ROW={};NOTES=[];WINS={};const mods=ALL();
+ for(const c of CATS){const ms=mods.filter(m=>m.c==c);if(!ms.length)continue;
+  const w=document.createElement('div');w.className='win';const hd=document.createElement('div');hd.className='hd';hd.innerHTML='<span></span><i></i>';hd.firstChild.textContent=c;w.appendChild(hd);
+  const body=document.createElement('div');body.hidden=!!COL[c];w.appendChild(body);
+  for(const m of ms){const row=document.createElement('div');row.className='mod'+(m.k=='act'?' act':'');row.innerHTML='<span class=n></span><small class=sb></small>';row.querySelector('.n').textContent=m.n;
+   row.onclick=()=>run(m);const R={el:row,sb:row.querySelector('.sb'),m};
+   if(m.set&&m.set.length){const ar=document.createElement('div');ar.className='ar'+(OPN[m.id]?' o':'');ar.textContent='›';ar.onclick=e=>{e.stopPropagation();toggleOpen(m)};row.appendChild(ar);R.ar=ar;
+    body.appendChild(row);R.set=mkSet(m);body.appendChild(R.set)}else body.appendChild(row);
+   ROW[m.id]=R}
+  WINS[c]={w,hd,body,cnt:hd.querySelector('i'),ms};pl.appendChild(w);dragInit(c)}
+ autoPlace();applySearch();paint()}
+function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth/UI.zm-8)/184)),h=new Array(cols).fill(8);
+ for(const c of CATS){const o=WINS[c];if(!o)continue;let p=POS[c];
+  if(!p){let k=0;for(let i=1;i<cols;i++)if(h[i]<h[k])k=i;p=[8+k*184,h[k]];h[k]+=o.w.offsetHeight+8}
+  o.w.style.left=p[0]+'px';o.w.style.top=p[1]+'px'}}
+function dragInit(c){const o=WINS[c],hd=o.hd;let sx,sy,ox,oy,mv=false,on=false;
+ hd.onpointerdown=e=>{on=true;mv=false;sx=e.clientX;sy=e.clientY;ox=o.w.offsetLeft;oy=o.w.offsetTop;hd.setPointerCapture(e.pointerId)};
+ hd.onpointermove=e=>{if(!on)return;const dx=(e.clientX-sx)/UI.zm,dy=(e.clientY-sy)/UI.zm;if(Math.abs(dx)+Math.abs(dy)>4)mv=true;if(mv){o.w.style.left=Math.max(0,ox+dx)+'px';o.w.style.top=Math.max(0,oy+dy)+'px'}};
+ hd.onpointerup=e=>{if(!on)return;on=false;if(mv){POS[c]=[o.w.offsetLeft,o.w.offsetTop];SV('mggPcPos',POS)}else{COL[c]=!COL[c];SV('mggPcCol',COL);o.body.hidden=!!COL[c]}}}
+function paint(){for(const c of CATS){const o=WINS[c];if(!o)continue;let on=0,tot=0;
+  for(const m of o.ms){const r=ROW[m.id];if(!r)continue;const s=m.st?m.st():0;
+   if(m.st){tot++;if(s===1)on++}
+   r.el.classList.toggle('on',s===1);r.el.classList.toggle('mid',s===.5);r.sb.textContent=m.sub?m.sub():''}
+  o.cnt.textContent=tot?on+'/'+tot:''}
+ for(const n of NOTES)n[0].textContent=n[1]()}
+function applySearch(){const q=$('q').value.trim().toLowerCase();
+ for(const c of CATS){const o=WINS[c];if(!o)continue;let any=false;
+  for(const m of o.ms){const r=ROW[m.id],ok=!q||m.n.toLowerCase().includes(q);r.el.style.display=ok?'':'none';if(r.set)r.set.style.display=ok?'':'none';if(ok)any=true}
+  o.w.style.display=any?'':'none';if(q&&any)o.body.hidden=false;else if(!q)o.body.hidden=!!COL[c]}}
+async function refresh(){
+ const [z,p,pl,f,ch,fl]=await Promise.all([api('zone',{on:2}),api('place',{on:2}),api('prelist'),api('csst',{s:'fov'}),api('csst',{s:'chunk'}),api('fnlist')]);
+ S.zone=z.trim()||'0';S.place=p.trim()||'0';S.fov=f;S.chunk=ch;S.pre={};
+ for(const ln of pl.trim().split('\n')){const c=ln.split('\t');if(c.length>=7)S.pre[c[0]]={on:c[2]=='1',ds:c[3],dv:c[4],off:c[5],hint:c[6]}}
+ const rows=[];if(!fl.startsWith('пусто')&&fl.indexOf('\t')>=0)for(const ln of fl.trim().split('\n')){const c=ln.split('\t');if(c.length>=3)rows.push({n:c[0],st:c[1],c:c[2]})}
+ const sig=JSON.stringify(rows.map(r=>r.n+r.st));S.fn=rows;if(sig!==FNSIG||!Object.keys(WINS).length){FNSIG=sig;build()}else paint()}
+function ui(){const R=document.documentElement.style;R.setProperty('--zm',UI.zm);R.setProperty('--a',UI.a);R.setProperty('--hd',UI.hd);$('hdc').value=UI.hd;$('keep').checked=!!UI.keep;SV('mggPcUi',UI)}
+$('zm1').onclick=()=>{UI.zm=Math.max(.6,+(UI.zm-.1).toFixed(2));ui()};
+$('zm2').onclick=()=>{UI.zm=Math.min(1.8,+(UI.zm+.1).toFixed(2));ui()};
+$('op').onclick=()=>{const a=[.5,.7,.88,1];UI.a=a[(a.indexOf(UI.a)+1)%a.length]||.88;ui()};
+$('hdc').oninput=e=>{UI.hd=e.target.value;ui()};
+$('keep').onchange=e=>{UI.keep=e.target.checked?1:0;ui()};
+$('rst').onclick=()=>{POS={};SV('mggPcPos',POS);autoPlace()};
+$('lg').onclick=()=>document.body.classList.toggle('lb');
+$('log').onclick=()=>document.body.classList.toggle('lb');
+$('cpy').onclick=()=>{const t=$('log').textContent;if(window.MGGJ&&MGGJ.copy)MGGJ.copy(t);else if(navigator.clipboard)navigator.clipboard.writeText(t)};
+$('q').oninput=applySearch;
+if(EMB){$('cls').hidden=false;$('cls').onclick=()=>parent.postMessage('pcclose','*')}
+ui();refresh();setInterval(()=>{if(!document.hidden)refresh()},5000);
+</script></body></html>
+)MGP";
 
 
 static Str route(const Str &path, const Params &q) {
@@ -3743,6 +3936,18 @@ static Str route(const Str &path, const Params &q) {
     if (path == "callers") {
         if (!hexNum(q, "a", a)) return "нужен параметр a (hex, начало функции)\n";
         return findCallers(im, (uint32_t)a, decNum(q, "max", 60));
+    }
+    if (path == "uimode") {                                        // Functions second menu: off | pc (файл mgg_ui.txt, его читает и оверлей-кнопка F)
+        Str f = dataDir() + "/mgg_ui.txt", m = P(q, "m");
+        if (!m.empty()) {
+            m = m == "pc" ? "pc" : "off";
+            FILE *fp = fopen(f.c_str(), "w"); if (!fp) return "не могу писать " + f + "\n";
+            fputs(m.c_str(), fp); fclose(fp);
+            return m + "\n";
+        }
+        char b[16] = {0}; FILE *fp = fopen(f.c_str(), "r");
+        if (fp) { size_t n = fread(b, 1, sizeof b - 1, fp); b[n] = 0; fclose(fp); }
+        return strncmp(b, "pc", 2) == 0 ? "pc\n" : "off\n";
     }
     if (path == "fpair") return fPair(im, q);
     if (path == "fset") {                                          // записать слово-константу: a (hex, кратно 4), f (новое), t=f|i, o (ожидаемое старое, необязательно), k=1 запомнить
@@ -3858,6 +4063,7 @@ static void handle(int c) {
     size_t qm = target.find('?');
     if (qm != Str::npos) { path = target.substr(0, qm); qs = target.substr(qm + 1); }
     if (path == "/") { reply(c, 200, "text/html", kPage); return; }
+    if (path == "/pc") { reply(c, 200, "text/html", kPcPage); return; }
     if (path.compare(0, 5, "/api/") != 0) { reply(c, 404, "text/plain", "нет такой страницы\n"); return; }
     Params q = parseQuery(qs);
     if (P(q, "t") != MGG_TOKEN) { reply(c, 403, "text/plain", "неверный токен: открой /?t=<токен>\n"); return; }
