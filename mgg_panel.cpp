@@ -3666,7 +3666,7 @@ body.lb{--lh:40%}
 #bar label{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:3px;flex:none}
 #hdc{width:28px;height:28px;padding:0;border:0;background:none;flex:none}
 #cv{position:absolute;left:0;right:0;top:38px;bottom:var(--lh);overflow:auto}
-#pl{position:relative;width:2400px;height:1600px;zoom:var(--zm)}
+#pl{position:relative;width:2400px;height:1600px;transform:scale(var(--zm));transform-origin:0 0}
 .win{position:absolute;width:150px;background:rgba(18,24,38,var(--a));border-radius:3px;overflow:hidden;box-shadow:0 2px 8px #0009}
 .hd{position:relative;height:26px;background:var(--hd);display:flex;align-items:center;justify-content:center;padding:0 22px;font-weight:700;font-size:12.5px;letter-spacing:.3px;touch-action:none;user-select:none;color:#fff}
 .hd i{position:absolute;right:6px;font-style:normal;opacity:.8;font-size:10px;font-weight:400}
@@ -3688,14 +3688,26 @@ body.lb{--lh:40%}
 .set button:active{background:var(--hd)}
 .set small{display:block;color:var(--dim);font-size:10.5px;margin-top:4px;line-height:1.3}
 #log{position:absolute;left:0;right:0;bottom:0;height:var(--lh);background:#0a0b0f;border-top:1px solid #262a37;font:11px/1.35 ui-monospace,monospace;color:#9fe3b9;white-space:pre-wrap;word-break:break-all;padding:4px 8px;overflow:auto}
+#gear{display:none}
+html.fm,html.fm body{background:transparent}
+html.fm #log,html.fm #bar{display:none}
+html.fm.tb #bar{display:flex}
+html.fm #cv{top:0;bottom:0;overflow:hidden}
+html.fm.tb #cv{top:38px}
+html.fm #gear{display:flex;position:fixed;right:8px;top:8px;width:32px;height:32px;border-radius:50%;background:var(--hd);color:#fff;align-items:center;justify-content:center;font-size:17px;opacity:.85;z-index:99999}
+html.fm.tb #gear{top:44px}
 </style></head><body>
+<div id=gear>⚙</div>
 <div id=bar><b>F</b><input id=q type=search placeholder="поиск">
 <button id=zm1>A−</button><button id=zm2>A+</button><button id=op title="прозрачность">◐</button><input type=color id=hdc title="цвет вкладок">
 <label><input type=checkbox id=keep>запом.</label><button id=rst title="сбросить окна">⟲</button><button id=cpy title="копировать журнал">⎘</button><button id=lg title="журнал">▤</button><button id=cls hidden>✕</button></div>
 <div id=cv><div id=pl></div></div>
 <pre id=log>MGG PC готов</pre>
 <script>
-const QS=new URLSearchParams(location.search),T=QS.get('t')||'',EMB=QS.get('embed')=='1';
+const QS=new URLSearchParams(location.search),T=QS.get('t')||'',EMB=QS.get('embed')=='1',FM=QS.get('fm')=='1';
+if(FM)document.documentElement.classList.add('fm');
+function rep(){if(!(FM&&window.MGGJ&&MGGJ.rects))return;const r=[],k=window.devicePixelRatio||1,add=el=>{if(!el)return;const b=el.getBoundingClientRect();if(b.width>0&&b.height>0)r.push((b.left*k).toFixed(1),(b.top*k).toFixed(1),(b.width*k).toFixed(1),(b.height*k).toFixed(1))};
+ for(const c in WINS)add(WINS[c].w);add($('gear'));if(document.documentElement.classList.contains('tb'))add($('bar'));MGGJ.rects(r.join(','))}
 const $=id=>document.getElementById(id);
 const LS=(k,d)=>{try{const x=JSON.parse(localStorage.getItem(k));return x==null?d:x}catch(e){return d}};
 const SV=(k,x)=>{try{localStorage.setItem(k,JSON.stringify(x))}catch(e){}};
@@ -3765,7 +3777,7 @@ function GL(){return S.fn.map(r=>{const prof=r.st[0]=='P',s=prof?r.st[1]:r.st;re
 const ALL=()=>MODS.concat(GL());
 async function run(m){if(m.k=='act'){m.run();return}if(m.k=='set'){toggleOpen(m);return}const on=m.st()!==1;await m.tg(on);await refresh()}
 function liveSend(m){if(m.live&&m.st&&m.st()===1)m.tg(true).then(refresh)}
-function toggleOpen(m){OPN[m.id]=!OPN[m.id];SV('mggPcOpen',OPN);const r=ROW[m.id];if(r&&r.set){r.set.hidden=!OPN[m.id];if(r.ar)r.ar.classList.toggle('o',!!OPN[m.id])}}
+function toggleOpen(m){OPN[m.id]=!OPN[m.id];SV('mggPcOpen',OPN);const r=ROW[m.id];if(r&&r.set){r.set.hidden=!OPN[m.id];if(r.ar)r.ar.classList.toggle('o',!!OPN[m.id])}rep()}
 function syncInputs(m){const r=ROW[m.id];if(!r||!r.set)return;r.set.querySelectorAll('[data-f]').forEach(e=>{e.value=gv(m.id,e.dataset.f)})}
 function mkSet(m){const box=document.createElement('div');box.className='set';box.hidden=!OPN[m.id];
  for(const f of m.set||[]){
@@ -3789,7 +3801,7 @@ function build(){const pl=$('pl');pl.textContent='';ROW={};NOTES=[];WINS={};cons
     body.appendChild(row);R.set=mkSet(m);body.appendChild(R.set)}else body.appendChild(row);
    ROW[m.id]=R}
   WINS[c]={w,hd,body,cnt:hd.querySelector('i'),ms};pl.appendChild(w);dragInit(c)}
- autoPlace();applySearch();paint()}
+ autoPlace();applySearch();paint();rep()}
 function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth/UI.zm-8)/158)),h=new Array(cols).fill(8);
  for(const c of CATS){const o=WINS[c];if(!o)continue;let p=POS[c];
   if(!p){let k=0;for(let i=1;i<cols;i++)if(h[i]<h[k])k=i;p=[8+k*158,h[k]];h[k]+=o.w.offsetHeight+8}
@@ -3797,7 +3809,7 @@ function autoPlace(){const cv=$('cv'),cols=Math.max(1,Math.floor((cv.clientWidth
 function dragInit(c){const o=WINS[c],hd=o.hd;let sx,sy,ox,oy,mv=false,on=false;
  hd.onpointerdown=e=>{o.w.style.zIndex=++ZI;on=true;mv=false;sx=e.clientX;sy=e.clientY;ox=o.w.offsetLeft;oy=o.w.offsetTop;hd.setPointerCapture(e.pointerId)};
  hd.onpointermove=e=>{if(!on)return;const dx=(e.clientX-sx)/UI.zm,dy=(e.clientY-sy)/UI.zm;if(Math.abs(dx)+Math.abs(dy)>4)mv=true;if(mv){o.w.style.left=Math.max(0,ox+dx)+'px';o.w.style.top=Math.max(0,oy+dy)+'px'}};
- hd.onpointerup=e=>{if(!on)return;on=false;if(mv){POS[c]=[o.w.offsetLeft,o.w.offsetTop];SV('mggPcPos',POS)}else{COL[c]=!COL[c];SV('mggPcCol',COL);o.body.hidden=!!COL[c]}}}
+ hd.onpointerup=e=>{if(!on)return;on=false;if(mv){POS[c]=[o.w.offsetLeft,o.w.offsetTop];SV('mggPcPos',POS)}else{COL[c]=!COL[c];SV('mggPcCol',COL);o.body.hidden=!!COL[c]}rep()}}
 function paint(){for(const c of CATS){const o=WINS[c];if(!o)continue;let on=0,tot=0;
   for(const m of o.ms){const r=ROW[m.id];if(!r)continue;const s=m.st?m.st():0;
    if(m.st){tot++;if(s===1)on++}
@@ -3824,7 +3836,9 @@ $('rst').onclick=()=>{POS={};SV('mggPcPos',POS);autoPlace()};
 $('lg').onclick=()=>document.body.classList.toggle('lb');
 $('log').onclick=()=>document.body.classList.toggle('lb');
 $('cpy').onclick=()=>{const t=$('log').textContent;if(window.MGGJ&&MGGJ.copy)MGGJ.copy(t);else if(navigator.clipboard)navigator.clipboard.writeText(t)};
-$('q').oninput=applySearch;
+$('q').oninput=()=>{applySearch();rep()};
+$('gear').onclick=()=>{document.documentElement.classList.toggle('tb');rep()};
+addEventListener('resize',()=>{autoPlace();rep()});setInterval(rep,500);
 if(EMB){$('cls').hidden=false;$('cls').onclick=()=>parent.postMessage('pcclose','*')}
 ui();refresh();setInterval(()=>{if(!document.hidden)refresh()},5000);
 </script></body></html>
