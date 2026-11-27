@@ -901,6 +901,9 @@ struct Vein {
     std::deque<P3> q;                   // очередь Global
     uintptr_t qblk = 0, lastReg = 0;    // qblk: тип для режима any; lastReg: BlockSource, для которого собрана очередь (смена мира = сброс)
     uintptr_t face = 1;
+    std::map<uintptr_t, bool> autoT;    // кэш: Block* -> «бревно» по имени блока
+    std::map<uintptr_t, Str> autoN;     // кэш имён (для статуса)
+    uint32_t calls = 0, regOk = 0, blkOk = 0; uintptr_t lastBlk = 0; Str lastName;   // диагностика
 };
 static Vein g_vein;
 
@@ -917,10 +920,53 @@ static uintptr_t veinBlockAt(uintptr_t reg, const int *p) {
     b = ((uintptr_t(*)(uintptr_t, const int *))fn)(reg, p);
     return (b > 0x10000 && guarded(&t, (const void *)b, 4)) ? b : 0;
 }
-static bool veinTarget(uintptr_t b) { return g_vein.any ? b == g_vein.qblk : g_vein.trees.count(b) > 0; }   // вызывать под g_vein.m
+// std::string libc++ (32 бита) по адресу a: короткая (флаг 0, длина в первом байте) или длинная (cap|1, size, ptr)
+static bool veinRdStr(uintptr_t a, Str &out) {
+    uint8_t h[12]; if (!guarded(h, (const void *)a, 12)) return false;
+    if (!(h[0] & 1)) { size_t n = h[0] >> 1; if (n < 3 || n > 11) return false; out.assign((const char *)h + 1, n); }
+    else { uint32_t n, p; memcpy(&n, h + 4, 4); memcpy(&p, h + 8, 4); char t[64]; if (n < 3 || n > 48 || p < 0x10000 || !guarded(t, (const void *)p, n)) return false; out.assign(t, n); }
+    for (char c : out) if (c < 32 || c > 126) return false;
+    return true;
+}
+static bool veinLogName(const Str &s) {         // бревно ли по имени: токены log, log2, stem, hyphae, <порода>_wood (но не стебли тыквы/арбуза)
+    std::vector<Str> t; Str cur;
+    for (char c : s) { if (c == '.' || c == '_' || c == ':') { if (!cur.empty()) t.push_back(cur); cur.clear(); } else cur += (char)tolower((unsigned char)c); }
+    if (!cur.empty()) t.push_back(cur);
+    bool hit = false;
+    for (size_t i = 0; i < t.size(); i++) {
+        const Str &w = t[i];
+        if (w == "pumpkin" || w == "melon" || w == "attached" || w == "planks" || w == "slab" || w == "stairs" || w == "fence" || w == "door") return false;
+        if (w == "log" || w == "log2" || w == "stem" || w == "hyphae") hit = true;
+        if (w == "wood" && i > 0 && t[i - 1] != "tile" && t[i - 1] != "minecraft") hit = true;
+    }
+    return hit;
+}
+// имя блока: Block -> указатель на BlockLegacy (смещение ищем сами) -> строки с именем
+static bool veinScanName(uintptr_t b, Str &name) {
+    for (int i = 0; i < 0x80; i += 4) {
+        uintptr_t p = 0; uint8_t pr[4];
+        if (!guarded(&p, (const void *)(b + i), 4) || p < 0x10000 || p == b || !guarded(pr, (const void *)p, 4)) continue;
+        for (int j = 0; j < 0x300; j += 4) {
+            Str s; if (!veinRdStr(p + j, s)) continue;
+            if (name.empty()) name = s;
+            if (veinLogName(s)) { name = s; return true; }
+        }
+    }
+    return false;
+}
+static bool veinTarget(uintptr_t b) {            // без g_vein.m
+    std::lock_guard<std::mutex> lk(g_vein.m);
+    if (g_vein.any) return b == g_vein.qblk;
+    if (g_vein.trees.count(b)) return true;
+    auto it = g_vein.autoT.find(b);
+    if (it != g_vein.autoT.end()) return it->second;
+    Str nm; bool r = veinScanName(b, nm);
+    g_vein.autoT[b] = r; g_vein.autoN[b] = nm;
+    return r;
+}
 
-// найти связные блоки того же типа (26 соседей) в кубе радиуса R вокруг o
-static void veinFlood(uintptr_t reg, const int *o, uintptr_t blk, int R, size_t cap, std::vector<P3> &out) {
+// найти связные блоки-деревья (26 соседей) в кубе радиуса R вокруг o
+static void veinFlood(uintptr_t reg, const int *o, int R, size_t cap, std::vector<P3> &out) {
     std::set<P3> seen; std::deque<P3> bq; P3 s = {o[0], o[1], o[2]}; seen.insert(s); bq.push_back(s);
     while (!bq.empty() && out.size() < cap) {
         P3 c = bq.front(); bq.pop_front();
@@ -929,22 +975,26 @@ static void veinFlood(uintptr_t reg, const int *o, uintptr_t blk, int R, size_t 
             P3 n = {c[0] + dx, c[1] + dy, c[2] + dz};
             if (abs(n[0] - o[0]) > R || abs(n[1] - o[1]) > R || abs(n[2] - o[2]) > R) continue;
             if (!seen.insert(n).second) continue;
-            if (veinBlockAt(reg, n.data()) != blk) continue;
+            uintptr_t b = veinBlockAt(reg, n.data());
+            if (!b || !veinTarget(b)) continue;
             out.push_back(n); bq.push_back(n);
             if (out.size() >= cap) return;
         }
     }
 }
-// до слома: какой тип у блока и дерево ли это (0 = не трогать)
+// до слома: дерево ли это (0 = не трогать)
 static uintptr_t veinPre(uintptr_t gm, uintptr_t pp) {
     if (g_vein.mode == 0 || !g_vein.getRegion) return 0;
+    { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.calls++; }
     int p[3]; if (!guarded(p, (const void *)pp, 12)) return 0;
     uintptr_t reg = veinRegion(gm); if (!reg) return 0;
     uintptr_t b = veinBlockAt(reg, p); if (!b) return 0;
-    std::lock_guard<std::mutex> lk(g_vein.m);
-    if (g_vein.learn) { g_vein.trees.insert(b); return 0; }
-    g_vein.qblk = b;
-    return veinTarget(b) ? b : 0;
+    { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.regOk++; g_vein.blkOk++; g_vein.lastBlk = b;
+      if (g_vein.learn) { g_vein.trees.insert(b); return 0; }
+      g_vein.qblk = b; }
+    bool t = veinTarget(b);
+    { std::lock_guard<std::mutex> lk(g_vein.m); auto it = g_vein.autoN.find(b); g_vein.lastName = it != g_vein.autoN.end() ? it->second : Str(); }
+    return t ? b : 0;
 }
 // после успешного слома первого блока
 static void veinPost(void *orig, uintptr_t *a, uintptr_t blk) {
@@ -952,7 +1002,7 @@ static void veinPost(void *orig, uintptr_t *a, uintptr_t blk) {
     uintptr_t reg = veinRegion(a[0]); if (!reg) return;
     int mode, R; { std::lock_guard<std::mutex> lk(g_vein.m); mode = g_vein.mode; R = g_vein.R; }
     std::vector<P3> v;
-    veinFlood(reg, p, blk, mode == 1 ? R : 64, mode == 1 ? 256 : 1500, v);
+    veinFlood(reg, p, mode == 1 ? R : 64, mode == 1 ? 256 : 1500, v);
     if (mode == 1) {
         g_inArea = true;
         for (P3 &c : v) ((Fn8)orig)(a[0], (uintptr_t)c.data(), a[2], a[3], a[4], a[5], a[6], a[7]);
@@ -973,8 +1023,8 @@ static void veinTick(uintptr_t gm) {
         { std::lock_guard<std::mutex> lk(g_vein.m);
           if (g_vein.q.empty()) return;
           if (g_vein.lastReg != reg) { g_vein.q.clear(); return; }      // другой мир/измерение: очередь устарела
-          c = g_vein.q.front(); g_vein.q.pop_front(); face = g_vein.face;
-          uintptr_t b = veinBlockAt(reg, c.data()); ok = b && veinTarget(b); }
+          c = g_vein.q.front(); g_vein.q.pop_front(); face = g_vein.face; }
+        uintptr_t b = veinBlockAt(reg, c.data()); ok = b && veinTarget(b);
         if (!ok) continue;                                               // блока уже нет или это не дерево: берём следующий
         g_inArea = true;
         ((Fn8)g_slots[g_vein.dslot].orig)(gm, (uintptr_t)c.data(), face, 0, 0, 0, 0, 0);
@@ -3319,10 +3369,10 @@ aside .lg{color:#fff}
 <small>Слот vtable GameMode: 7 = buildBlock. Если блоки не ставятся, выключи, поменяй слот на 6 или 8 и включи снова.</small></details>
 <small>Только локальный мир. Ставит пластину Ш × В вокруг блока, на который поставил, в плоскости грани. Блоки нужны в запасе (в выживании тратятся). Глубины нет: слой ставится не раньше, чем появится опора.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Vein miner (дерево)</h3>
-<div class="fn c" onclick="vmGo()"><div class=nm>Vein miner<div class=sub id=vms>выключено</div></div><div class=sw id=vmsw></div></div>
+<div class="fn c" onclick="vmGo()"><div class=nm>Vein miner<div class=sub id=vms style="white-space:pre-wrap">выключено</div></div><div class=sw id=vmsw></div></div>
 <div class=zr><b>Режим</b><select id=vmm onchange="if(VM)vmSend(1)"><option value=l>Local world</option><option value=g>Global</option></select><b>R</b><select id=vmr onchange="if(VM)vmSend(1)"><option>2</option><option>4</option><option selected>6</option><option>8</option><option>12</option><option>16</option></select></div>
 <div class=row><button class=s id=vml onclick="vmLearn()">Запомнить дерево: выкл</button><button class=s onclick="vmClear()">Сбросить</button></div>
-<small>Local: за одну вскопку ломает связанные брёвна в радиусе R. Global: после первого бревна остальное дерево ломается само, по блоку за тик, в любом мире. Сначала включи «Запомнить дерево», сломай по одному бревну каждой породы (стоя вертикально), выключи. Только локальный мир; Multiple destroy при включении отключается.</small></div>
+<small>Local: за одну вскопку ломает связанные брёвна в радиусе R. Global: после первого бревна остальное дерево ломается само, по блоку за тик, в любом мире. Деревья определяются сами по имени блока. Если после слома бревна в строке статуса имя «-» или дерево не берётся: включи «Запомнить дерево», сломай по бревну каждой породы, выключи. Только локальный мир; Multiple destroy при включении отключается.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Заготовки (хуки)</h3>
 <div id=prl><small>…</small></div>
 <div class=grid3 style="margin-top:6px"><button class=s onclick="call('gmslots',{n:40})">Слоты GameMode</button><button class=s onclick="call('hooks',{})">Список хуков</button><button class=s onclick="call('hooksave',{})">Запомнить хуки</button></div>
@@ -3748,7 +3798,7 @@ async function plInit(){plUi(await api('place',{on:2}))}
 async function plSend(on){await call('place',{on:on,w:v('plw'),h:v('plh'),s:v('plsl')});plUi(await api('place',{on:2}))}
 function plGo(){plSend(PL?0:1)}
 let VM=0;
-function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(a[5]!='0'?' · очередь '+a[5]:'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
+function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(a[5]!='0'?' · очередь '+a[5]:'')+(VM||a[3]=='1'?'\nслом: '+a[6]+' · блок: '+a[7]+' · '+a[8]+' · '+a[9]:'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
 async function vmInit(){vmUi(await api('vein',{on:2}))}
 async function vmSend(on){await call('vein',{on:on,m:v('vmm'),r:v('vmr')});vmUi(await api('vein',{on:2}))}
 function vmGo(){vmSend(VM?0:1)}
@@ -3773,7 +3823,7 @@ function pcClose(){document.getElementById('pcf').style.display='none'}
 window.addEventListener('message',e=>{if(e.data==='pcclose')pcClose()});
 function plP(w,h){document.getElementById('plw').value=w;document.getElementById('plh').value=h;if(PL)plSend(1)}
 function azP(w,h,d){document.getElementById('azw').value=w;document.getElementById('azh').value=h;document.getElementById('azd').value=d;if(AZ)azSend(1)}
-fnl();libLoad();slotInit();zSet();azInit();plInit();vmInit();prl();pcInit();
+setInterval(()=>{if(VM||document.getElementById('vml').textContent.endsWith('вкл'))vmInit()},2000);fnl();libLoad();slotInit();zSet();azInit();plInit();vmInit();prl();pcInit();
 </script></body></html>)MGG";
 
 // PC-меню функций: отдельная страница /pc (открывается из панели во вкладке F и из оверлей-кнопки F)
@@ -4169,7 +4219,7 @@ static Str route(const Str &path, const Params &q) {
         auto status = [&]() -> Str {
             std::lock_guard<std::mutex> lk(g_vein.m);
             bool live = g_vein.mode && g_vein.dslot >= 0 && g_slots[g_vein.dslot].used && g_slots[g_vein.dslot].mode == 7;
-            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size()) + " " + std::to_string(g_vein.q.size()) + "\n";
+            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size() + std::count_if(g_vein.autoT.begin(), g_vein.autoT.end(), [](const std::pair<const uintptr_t, bool> &e) { return e.second; })) + " " + std::to_string(g_vein.q.size()) + " " + std::to_string(g_vein.calls) + " " + std::to_string(g_vein.blkOk) + " " + (g_vein.lastBlk ? hx(g_vein.lastBlk) : Str("-")) + " " + (g_vein.lastName.empty() ? Str("-") : g_vein.lastName) + "\n";
         };
         if (P(q, "clear") == "1") { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.trees.clear(); g_vein.q.clear(); return "типы деревьев забыты, очередь пуста\n"; }
         if (!P(q, "learn").empty()) { g_vein.learn = P(q, "learn") == "1"; return g_vein.learn ? "запоминаю: сломай по одному бревну каждой породы, затем выключи\n" : "запоминание выключено, типов: " + std::to_string(g_vein.trees.size()) + "\n"; }
@@ -4196,7 +4246,7 @@ static Str route(const Str &path, const Params &q) {
         g_vein.dslot = ds;
         { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.R = (int)std::min<size_t>(16, std::max<size_t>(1, decNum(q, "r", 6))); g_vein.q.clear(); }
         g_vein.mode = P(q, "m", "l") == "g" ? 2 : 1;
-        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global" : "Local R" + std::to_string(g_vein.R)) + " (destroyBlock #" + std::to_string(ds) + ", tick #" + std::to_string(ts) + "). Типов дерева: " + std::to_string(g_vein.trees.size()) + (g_vein.trees.empty() && !g_vein.any ? " — сначала «Запомнить дерево»\n" : "\n");
+        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global" : "Local R" + std::to_string(g_vein.R)) + " (destroyBlock #" + std::to_string(ds) + ", tick #" + std::to_string(ts) + ")" + ". Деревья определяются по имени блока; «Запомнить дерево» нужно, только если имя не распозналось\n";
     }
     if (path == "gmslots") return gmSlots(im, decNum(q, "n", 40));
     if (path == "prelist") return preList();
