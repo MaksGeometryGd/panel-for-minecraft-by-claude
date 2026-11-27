@@ -3066,7 +3066,7 @@ static Str dexRoute(const Str &path, const Params &q) {
 static const char *kPage = R"MGG(<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1"><title>MGG</title>
 <style>
-:root{--bg:#12141c;--card:#1a1d29;--card2:#232736;--line:#2b3043;--tx:#e9eaf0;--dim:#8d92a6;--ac:#85775a;--acTx:#fff;--hl:#f0b429;--ok:#4cc38a;--er:#ff6b6b;--wr:#f0c040;--cf:#f0c040;--ci:#6cb6ff;--cl:#c792ea;--cp:#4dd0e1;--cs:#ffab70;--cz:#6b7088;--r:10px}
+:root{--bg:#0f0f11;--card:#18181b;--card2:#202024;--line:#2e2e34;--tx:#f2f2f4;--dim:#8e8e98;--ac:#34343a;--acTx:#fff;--hl:#7be08a;--ok:#4cc38a;--er:#ff6b6b;--wr:#f0c040;--cf:#f0c040;--ci:#6cb6ff;--cl:#c792ea;--cp:#4dd0e1;--cs:#ffab70;--cz:#6b7088;--r:7px}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{font:13px/1.35 system-ui,sans-serif;background:var(--bg);color:var(--tx);margin:0;padding:0 0 10px 64px}
 .ic{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px;flex:none}
@@ -3144,6 +3144,17 @@ small{color:var(--dim);display:block;margin-top:4px}
 .kv.wrap{flex-wrap:wrap}.lv{flex-basis:100%;font:11px/1.3 ui-monospace,monospace;color:var(--ok);padding:0 2px 2px}
 .kv button{width:28px;height:28px;padding:0;margin:0;flex:none;border-radius:8px}
 #pcf{position:fixed;left:0;top:0;width:100%;height:100%;border:0;z-index:50;display:none;background:#0d0f14}
+/* дефолтный вид: тёмные строки, белая активная вкладка, зелёные переключатели */
+.seg button.on,.nav.on .bx{background:#fff;color:#111}
+.fn{background:var(--card2);color:var(--tx);border:1px solid var(--line)}
+.fn .sub{opacity:.55}
+.sw{background:#3c3c43}.sw::after{background:#fff}
+.sw.on{background:var(--hl)}.sw.on::after{background:#fff}
+.sw.bad{background:#b04a50}.sw.bad::after{background:#fff}
+.sw.mid{background:#8b8460}.sw.mid::after{background:#fff}
+.fn.c{padding:7px 9px;border-radius:var(--r)}
+.card{border-radius:var(--r)}
+aside .lg{color:#fff}
 </style></head><body>
 <svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
 <symbol id="i-bolt" viewBox="0 0 24 24"><path class="fi" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
@@ -3476,9 +3487,9 @@ function lum(h){const n=parseInt(h.slice(1),16);return (0.299*(n>>16)+0.587*((n>
 function applyTheme(save=true){const ac=v('c_ac'),hl=v('c_hl'),bg=v('c_bg'),cd=v('c_card'),r=v('c_r');const R=document.documentElement.style;
 const light=lum(bg)>.6;R.setProperty('--ac',ac);R.setProperty('--hl',hl);R.setProperty('--bg',bg);R.setProperty('--card',cd);R.setProperty('--card2',mix(cd,light?-0.06:0.08));R.setProperty('--line',mix(cd,light?-0.14:0.14));
 R.setProperty('--tx',light?'#161a24':'#e9eaf0');R.setProperty('--dim',light?'#5d6578':'#8d92a6');R.setProperty('--acTx',lum(ac)>.65?'#111':'#fff');R.setProperty('--r',r+'px');
-if(save)try{localStorage.setItem('mggTheme',JSON.stringify([ac,bg,cd,hl,r]))}catch(e){}}
+if(save)try{localStorage.setItem('mggTheme2',JSON.stringify([ac,bg,cd,hl,r]))}catch(e){}}
 function preset(ac,bg,cd,hl){document.getElementById('c_ac').value=ac;document.getElementById('c_bg').value=bg;document.getElementById('c_card').value=cd;document.getElementById('c_hl').value=hl;applyTheme()}
-(function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme'))}catch(e){}t=t||['#85775a','#12141c','#1a1d29','#f0b429',10];
+(function(){let t=null;try{t=JSON.parse(localStorage.getItem('mggTheme2'))}catch(e){}t=t||['#34343a','#0f0f11','#18181b','#7be08a',7];
 document.getElementById('c_ac').value=t[0];document.getElementById('c_bg').value=t[1];document.getElementById('c_card').value=t[2];document.getElementById('c_hl').value=t[3];document.getElementById('c_r').value=t[4];applyTheme(false)})();
 const SL=[{s:'fov',t:'Fov changer',min:30,max:150,def:70,opt:'gfx_field_of_view',h:'Mem: найди текущий FOV как float (например 70), смени в настройках, сузь → «Привязать».'}];
 function slotInit(){const d=document.getElementById('sl');d.textContent='';for(const x of SL){const c=document.createElement('div');c.className='card';
