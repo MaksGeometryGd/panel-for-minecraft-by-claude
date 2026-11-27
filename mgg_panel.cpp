@@ -986,6 +986,16 @@ static void veinFlood(uintptr_t reg, const int *o, int R, size_t cap, std::vecto
     }
 }
 static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_t val, Str &msg, int isa);
+// getPickRange (слот 11) начинается с IT-блока и ПК-относительной загрузки float: inline-хук (Dobby) её ломает. Вместо хука подменяем указатель в vtable GameMode и подклассов.
+static void veinTick(uintptr_t gm);
+struct Pick { uintptr_t orig = 0, val = 0, fp = 0; bool on = false, done = false; uint32_t calls = 0; };
+static Pick g_pick;
+static uintptr_t pickRep(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7) {
+    uintptr_t r = ((Fn8)g_pick.orig)(a0, a1, a2, a3, a4, a5, a6, a7);
+    g_pick.calls++;
+    if (g_vein.mode == 2 && !g_inArea) veinTick(a0);                  // Global: getPickRange зовётся каждый кадр, tick-хук не обязателен
+    return g_pick.on ? g_pick.val : r;                                // Reach: возвращаем свою дальность (float как биты)
+}
 // tick у живого объекта: SurvivalMode/CreativeMode могут переопределять GameMode::tick, и тогда хук на базовую функцию не вызывается.
 // Берём слот 10 из настоящей vtable объекта и вешаем хук на ту функцию, что реально вызывается каждый тик.
 static void veinEnsureTick(uintptr_t gm) {
@@ -1038,7 +1048,7 @@ static void veinTick(uintptr_t gm) {
     { std::lock_guard<std::mutex> lk(g_vein.m);
       if (g_vein.q.empty()) return;
       if (g_vein.lastGm != gm) { g_vein.q.clear(); g_vein.lastGm = gm; return; }    // другой мир/сервер: очередь устарела
-      if (now - g_vein.lastDrain < 30) return;
+      if (now - g_vein.lastDrain < 45) return;
       g_vein.lastDrain = now; }            // хук мог встать и на базовый tick, и на tick подкласса: не чаще раза за тик
     uintptr_t reg = veinRegion(gm); if (!reg) return;
     for (int tries = 0; tries < 64; tries++) {
@@ -1178,6 +1188,13 @@ static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_
     if (!segAt(im, a, 8)) { msg = "смещение вне сегмента библиотеки"; return -1; }
     bool arm = hookIsArm(a, isa);
     if (arm && (a & 3)) { msg = "ARM-функция должна быть выровнена по 4 (смещение кратно 4)"; return -1; }
+    if (!arm) {                                                        // Thumb: IT-блок (it/ite/itt...) в первых байтах Dobby переносит неверно, игра падает
+        for (size_t k = 0; k < 10 && segAt(im, a + k, 4); ) {
+            uint16_t h = *(const uint16_t *)(a + k);
+            if ((h & 0xFF00) == 0xBF00 && (h & 0xF)) { msg = "функция начинается с IT-блока (Thumb): обычный хук её ломает, ставь другим способом (vtable)"; return -1; }
+            k += (h >> 11) >= 0x1D ? 4 : 2;
+        }
+    }
     Slot &s = g_slots[id];
     s.mode = mode; s.val = val; s.arg = arg > 7 ? 7 : arg < 0 ? 0 : arg; s.off = off; s.arm = arm; s.calls = 0; s.t0 = hkNow(); s.rr = 0;
     for (int k = 0; k < 8; k++) { s.seen[k] = 0; s.seenN[k] = 0; s.last[k] = 0; }
@@ -1264,6 +1281,7 @@ static const Pre kPre[] = {
     {"fly",        "Полёт",                   -1, false, "1",      "Нужен адрес проверки «может летать» (abilities игрока). Значение 1. Только одиночная игра."},
     {"noclip",     "Noclip",                  -1, false, "1",      "Нужен адрес проверки столкновений игрока. Значение 1. Только одиночная игра."},
 };
+static Str pickInstall(const Img &im);
 static std::map<Str, int> g_preSlot;                                   // id заготовки -> номер слота хука
 
 static Str preList() {
@@ -1272,6 +1290,7 @@ static Str preList() {
         bool on = false; Str off = "-";
         auto it = g_preSlot.find(p.id);
         if (it != g_preSlot.end() && g_slots[it->second].used) { off = hx(g_slots[it->second].off); on = g_slots[it->second].mode == 1; }
+        if (!strcmp(p.id, "reach")) { on = g_pick.on; off = g_pick.done ? hx(g_pick.fp) : Str("-"); }
         o += Str(p.id) + "\t" + p.name + "\t" + (on ? "1" : "0") + "\t" + (p.slot >= 0 ? std::to_string(p.slot) : Str("-")) + "\t" + p.def + "\t" + off + "\t" + p.hint + "\n";
     }
     return o;
@@ -1281,6 +1300,14 @@ static Str preSet(const Img &im, const Params &q) {
     Str id = P(q, "id"); const Pre *pp = nullptr;
     for (const Pre &p : kPre) if (id == p.id) pp = &p;
     if (!pp) return "нет такой заготовки\n";
+    if (id == "reach") {                                               // Reach: без inline-хука (слот 11 с IT-блоком роняет Dobby)
+        Str on = P(q, "on", "1"), vs = P(q, "v"); if (vs.empty()) vs = pp->def;
+        if (on == "0") { g_pick.on = false; return "выключено: Reach\n"; }
+        uint32_t w = 0; if (!numWord(vs, true, w)) return "значение не число: " + vs + "\n";
+        Str m = pickInstall(im); if (!g_pick.done) return m;
+        g_pick.val = w; g_pick.on = true;
+        return "включено: Reach = " + vs + "\n" + m;
+    }
     Str on = P(q, "on", "1"); auto it = g_preSlot.find(id);
     if (on == "0") {
         if (it == g_preSlot.end() || !g_slots[it->second].used) return "не включено\n";
@@ -1309,6 +1336,29 @@ static Str preSet(const Img &im, const Params &q) {
 }
 
 static uintptr_t findDestroyBlock(const Img &im, Str &why) { return findGameModeSlot(im, 3, why); }   // слот 3 = GameMode::destroyBlock
+
+// подмена указателя getPickRange во всех vtable (GameMode, SurvivalMode, CreativeMode: у подклассов своя копия записи)
+static Str pickInstall(const Img &im) {
+    if (g_pick.done) return "";
+    Str why; uintptr_t off = findGameModeSlot(im, 11, why); if (!off) return why;
+    uintptr_t fp = im.base + off, rep = (uintptr_t)&pickRep;
+    long pg = sysconf(_SC_PAGESIZE); int n = 0;
+    g_pick.orig = fp; g_pick.fp = off;
+    for (const Seg &g : im.segs) {
+        if (!g.r || g.x) continue;
+        for (uintptr_t a = (g.s + 3) & ~(uintptr_t)3; a + 4 <= g.e; a += 4) {
+            if (*(const uint32_t *)a != (uint32_t)fp) continue;
+            uintptr_t page = a & ~(uintptr_t)(pg - 1);
+            if (!g.w) mprotect((void *)page, pg, PROT_READ | PROT_WRITE);
+            *(volatile uint32_t *)a = (uint32_t)rep;
+            if (!g.w) mprotect((void *)page, pg, PROT_READ);
+            n++;
+        }
+    }
+    if (!n) return "getPickRange: указатель в vtable не найден (другая сборка?)\n";
+    g_pick.done = true;
+    return "getPickRange: подменено записей vtable: " + std::to_string(n) + "\n";
+}
 
 static Str hooksSave() {
     int n = 0; Str body = "HOOKS1\n"; char t[96];
@@ -3821,7 +3871,7 @@ async function plInit(){plUi(await api('place',{on:2}))}
 async function plSend(on){await call('place',{on:on,w:v('plw'),h:v('plh'),s:v('plsl')});plUi(await api('place',{on:2}))}
 function plGo(){plSend(PL?0:1)}
 let VM=0;
-function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(a[5]!='0'?' · очередь '+a[5]:'')+(VM||a[3]=='1'?'\nслом: '+a[6]+' · блок: '+a[7]+' · тик: '+a[9]+' · снято: '+a[10]+'\nпоследний блок: '+a.slice(11).join(' '):'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
+function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(a[5]!='0'?' · очередь '+a[5]:'')+(VM||a[3]=='1'?'\nслом: '+a[6]+' · блок: '+a[7]+' · тик/кадр: '+a[9]+' · снято: '+a[10]+'\nпоследний блок: '+a.slice(11).join(' '):'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
 async function vmInit(){vmUi(await api('vein',{on:2}))}
 async function vmSend(on){await call('vein',{on:on,m:v('vmm'),r:v('vmr')});vmUi(await api('vein',{on:2}))}
 function vmGo(){vmSend(VM?0:1)}
@@ -4242,7 +4292,7 @@ static Str route(const Str &path, const Params &q) {
         auto status = [&]() -> Str {
             std::lock_guard<std::mutex> lk(g_vein.m);
             bool live = g_vein.mode && g_vein.dslot >= 0 && g_slots[g_vein.dslot].used && g_slots[g_vein.dslot].mode == 7;
-            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size() + std::count_if(g_vein.autoT.begin(), g_vein.autoT.end(), [](const std::pair<const uintptr_t, bool> &e) { return e.second; })) + " " + std::to_string(g_vein.q.size()) + " " + std::to_string(g_vein.calls) + " " + std::to_string(g_vein.blkOk) + " " + (g_vein.lastBlk ? hx(g_vein.lastBlk) : Str("-")) + " " + std::to_string(g_vein.tickCalls) + " " + std::to_string(g_vein.drained) + " " + (g_vein.lastName.empty() ? Str("-") : g_vein.lastName) + "\n";
+            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size() + std::count_if(g_vein.autoT.begin(), g_vein.autoT.end(), [](const std::pair<const uintptr_t, bool> &e) { return e.second; })) + " " + std::to_string(g_vein.q.size()) + " " + std::to_string(g_vein.calls) + " " + std::to_string(g_vein.blkOk) + " " + (g_vein.lastBlk ? hx(g_vein.lastBlk) : Str("-")) + " " + std::to_string(g_vein.tickCalls) + "/" + std::to_string(g_pick.calls) + " " + std::to_string(g_vein.drained) + " " + (g_vein.lastName.empty() ? Str("-") : g_vein.lastName) + "\n";
         };
         if (P(q, "clear") == "1") { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.trees.clear(); g_vein.q.clear(); return "типы деревьев забыты, очередь пуста\n"; }
         if (!P(q, "learn").empty()) { g_vein.learn = P(q, "learn") == "1"; return g_vein.learn ? "запоминаю: сломай по одному бревну каждой породы, затем выключи\n" : "запоминание выключено, типов: " + std::to_string(g_vein.trees.size()) + "\n"; }
@@ -4264,13 +4314,14 @@ static Str route(const Str &path, const Params &q) {
             return hookInstall(im, o, mode, 0, 0, msg, 0);
         };
         Str msg; int ds = place(off, 7, msg); if (ds < 0) return msg + "\n";
-        int ts = place(toff, 8, msg); if (ts < 0) { g_slots[ds].mode = 0; return msg + "\n"; }
+        int ts = place(toff, 8, msg); Str tmsg = ts < 0 ? "tick-хук не встал (" + msg + "), Global пойдёт от getPickRange. " : Str();
         g_vein.im = im; g_vein.base = im.base; g_vein.lastVt = 0; g_vein.lastGm = 0;
         g_vein.getRegion = (im.base + (gr & ~(uintptr_t)1)) | 1;
         g_vein.dslot = ds;
         { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.R = (int)std::min<size_t>(16, std::max<size_t>(1, decNum(q, "r", 6))); g_vein.q.clear(); }
         g_vein.mode = P(q, "m", "l") == "g" ? 2 : 1;
-        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global" : "Local R" + std::to_string(g_vein.R)) + " (destroyBlock #" + std::to_string(ds) + ", tick #" + std::to_string(ts) + ")" + ". Деревья определяются по имени блока; «Запомнить дерево» нужно, только если имя не распозналось\n";
+        Str pmsg; if (g_vein.mode == 2) { pmsg = pickInstall(im); if (!g_pick.done) tmsg += pmsg; }
+        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global" : "Local R" + std::to_string(g_vein.R)) + " (destroyBlock #" + std::to_string(ds) + ", tick " + (ts >= 0 ? "#" + std::to_string(ts) : Str("нет")) + ")" + ". " + tmsg + "Деревья определяются по имени блока; «Запомнить дерево» нужно, только если имя не распозналось\n";
     }
     if (path == "gmslots") return gmSlots(im, decNum(q, "n", 40));
     if (path == "prelist") return preList();
