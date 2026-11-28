@@ -886,8 +886,9 @@ static bool guarded(void *dst, const void *src, size_t n);          // опре�
 static thread_local bool g_inArea = false;                         // защита от повторного входа в режиме 4
 
 // ---------------------------------------------------------------- Vein miner (деревья)
-// Режим 7 на GameMode::destroyBlock: Local ломает за один раз блоки того же типа в радиусе, Global кладёт всё дерево в очередь.
-// Режим 8 на GameMode::tick (слот 10): раз в тик игры ломает один блок из очереди. Тип дерева = указатель Block* (учится при сломе в режиме «запомнить»).
+// Режим 7 на GameMode::destroyBlock (тот же путь, что у Multiple destroy): сломал одно бревно — следом ломаются остальные блоки дерева.
+// Local: связные брёвна в радиусе R. Global: всё связанное дерево целиком (радиус 40, до 1500 блоков). Никаких очередей и tick-хуков.
+// Дерево определяется по имени блока (Block -> BlockLegacy -> строка); вручную можно запомнить тип кнопкой.
 typedef uintptr_t (*Fn8)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
 typedef std::array<int, 3> P3;
 struct Vein {
@@ -898,15 +899,10 @@ struct Vein {
     uintptr_t getRegion = 0;            // Actor::getRegion (Thumb: младший бит 1)
     int dslot = -1;                     // слот хука destroyBlock
     std::set<uintptr_t> trees;          // Block* деревьев
-    std::deque<P3> q;                   // очередь Global
     uintptr_t qblk = 0;                 // qblk: тип для режима any
-    uintptr_t face = 1;
     std::map<uintptr_t, bool> autoT;    // кэш: Block* -> «бревно» по имени блока
     std::map<uintptr_t, Str> autoN;     // кэш имён (для статуса)
-    uint32_t calls = 0, regOk = 0, blkOk = 0, tickCalls = 0, drained = 0; uintptr_t lastBlk = 0; Str lastName;   // диагностика
-    Img im; uintptr_t base = 0;         // копия образа библиотеки (для постановки хука на живую таблицу)
-    uintptr_t lastGm = 0, lastVt = 0;   // GameMode и его vtable, для которых всё настроено
-    long long lastDrain = 0;
+    uint32_t calls = 0, regOk = 0, blkOk = 0, broken = 0; uintptr_t lastBlk = 0; Str lastName;   // диагностика
 };
 static Vein g_vein;
 
@@ -987,31 +983,17 @@ static void veinFlood(uintptr_t reg, const int *o, int R, size_t cap, std::vecto
 }
 static int hookInstall(const Img &im, uintptr_t off, int mode, int arg, uintptr_t val, Str &msg, int isa);
 // getPickRange (слот 11) начинается с IT-блока и ПК-относительной загрузки float: inline-хук (Dobby) её ломает. Вместо хука подменяем указатель в vtable GameMode и подклассов.
-static void veinTick(uintptr_t gm);
 struct Pick { uintptr_t orig = 0, val = 0, fp = 0; bool on = false, done = false; uint32_t calls = 0; };
 static Pick g_pick;
 static uintptr_t pickRep(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7) {
     uintptr_t r = ((Fn8)g_pick.orig)(a0, a1, a2, a3, a4, a5, a6, a7);
     g_pick.calls++;
-    if (g_vein.mode == 2 && !g_inArea) veinTick(a0);                  // Global: getPickRange зовётся каждый кадр, tick-хук не обязателен
     return g_pick.on ? g_pick.val : r;                                // Reach: возвращаем свою дальность (float как биты)
-}
-// tick у живого объекта: SurvivalMode/CreativeMode могут переопределять GameMode::tick, и тогда хук на базовую функцию не вызывается.
-// Берём слот 10 из настоящей vtable объекта и вешаем хук на ту функцию, что реально вызывается каждый тик.
-static void veinEnsureTick(uintptr_t gm) {
-    uintptr_t vt = 0, fn = 0;
-    if (!g_vein.base || !guarded(&vt, (const void *)gm, 4) || vt < 0x10000 || vt == g_vein.lastVt) return;
-    g_vein.lastVt = vt;
-    if (!guarded(&fn, (const void *)(vt + 40), 4) || fn < g_vein.base) return;
-    uintptr_t off = fn - g_vein.base;
-    for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == (off & ~(uintptr_t)1)) { if (g_slots[i].mode != 7) g_slots[i].mode = 8; return; }
-    Str msg; hookInstall(g_vein.im, off, 8, 0, 0, msg, 0);
 }
 // до слома: дерево ли это (0 = не трогать)
 static uintptr_t veinPre(uintptr_t gm, uintptr_t pp) {
     if (g_vein.mode == 0 || !g_vein.getRegion) return 0;
     { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.calls++; }
-    if (g_vein.mode == 2) veinEnsureTick(gm);
     int p[3]; if (!guarded(p, (const void *)pp, 12)) return 0;
     uintptr_t reg = veinRegion(gm); if (!reg) return 0;
     uintptr_t b = veinBlockAt(reg, p); if (!b) return 0;
@@ -1022,48 +1004,18 @@ static uintptr_t veinPre(uintptr_t gm, uintptr_t pp) {
     { std::lock_guard<std::mutex> lk(g_vein.m); auto it = g_vein.autoN.find(b); g_vein.lastName = it != g_vein.autoN.end() ? it->second : Str(); }
     return t ? b : 0;
 }
-// после успешного слома первого блока
+// после успешного слома первого блока: ломаем остальное дерево тем же оригинальным destroyBlock
 static void veinPost(void *orig, uintptr_t *a, uintptr_t blk) {
+    (void)blk;
     int p[3]; if (!guarded(p, (const void *)a[1], 12)) return;
     uintptr_t reg = veinRegion(a[0]); if (!reg) return;
     int mode, R; { std::lock_guard<std::mutex> lk(g_vein.m); mode = g_vein.mode; R = g_vein.R; }
     std::vector<P3> v;
-    veinFlood(reg, p, mode == 1 ? R : 64, mode == 1 ? 256 : 1500, v);
-    if (mode == 1) {
-        g_inArea = true;
-        for (P3 &c : v) ((Fn8)orig)(a[0], (uintptr_t)c.data(), a[2], a[3], a[4], a[5], a[6], a[7]);
-        g_inArea = false;
-    } else if (mode == 2) {
-        std::lock_guard<std::mutex> lk(g_vein.m);
-        if (g_vein.lastGm != a[0]) g_vein.q.clear();
-        g_vein.lastGm = a[0]; g_vein.face = a[2];
-        for (P3 &c : v) g_vein.q.push_back(c);
-    }
-}
-// раз в тик игры: один блок из очереди
-static void veinTick(uintptr_t gm) {
-    { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.tickCalls++; }
-    if (g_vein.mode != 2 || g_vein.dslot < 0 || !g_slots[g_vein.dslot].orig) return;
-    long long now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    { std::lock_guard<std::mutex> lk(g_vein.m);
-      if (g_vein.q.empty()) return;
-      if (g_vein.lastGm != gm) { g_vein.q.clear(); g_vein.lastGm = gm; return; }    // другой мир/сервер: очередь устарела
-      if (now - g_vein.lastDrain < 45) return;
-      g_vein.lastDrain = now; }            // хук мог встать и на базовый tick, и на tick подкласса: не чаще раза за тик
-    uintptr_t reg = veinRegion(gm); if (!reg) return;
-    for (int tries = 0; tries < 64; tries++) {
-        P3 c; uintptr_t face;
-        { std::lock_guard<std::mutex> lk(g_vein.m);
-          if (g_vein.q.empty()) return;
-          c = g_vein.q.front(); g_vein.q.pop_front(); face = g_vein.face; }
-        uintptr_t b = veinBlockAt(reg, c.data());
-        if (!b || !veinTarget(b)) continue;                              // блока уже нет или это не дерево (в т.ч. другое измерение): следующий
-        g_inArea = true;
-        ((Fn8)g_slots[g_vein.dslot].orig)(gm, (uintptr_t)c.data(), face, 0, 0, 0, 0, 0);
-        g_inArea = false;
-        { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.drained++; }
-        return;
-    }
+    veinFlood(reg, p, mode == 1 ? R : 40, mode == 1 ? 256 : 1500, v);
+    g_inArea = true;
+    for (P3 &c : v) ((Fn8)orig)(a[0], (uintptr_t)c.data(), a[2], a[3], a[4], a[5], a[6], a[7]);
+    g_inArea = false;
+    { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.broken += (uint32_t)v.size(); }
 }
 
 template <int N>
@@ -1082,7 +1034,6 @@ static uintptr_t hk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uint
     if (s.mode == 7 && !g_inArea && a[1] > 0x10000) vblk = veinPre(a[0], a[1]);   // тип блока читаем до слома
     uintptr_t r = ((uintptr_t(*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t))s.orig)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
     if (s.mode == 7 && vblk && (r & 0xFF)) veinPost(s.orig, a, vblk);
-    if (s.mode == 8 && !g_inArea) veinTick(a[0]);
     if (s.mode == 4 && !g_inArea && (r & 0xFF) && a[1] > 0x10000) {   // слом вокруг: оригинал уже сломал блок, ломаем соседей
         int p[3];
         if (guarded(p, (const void *)a[1], 12) && p[0] > -30000000 && p[0] < 30000000 && p[2] > -30000000 && p[2] < 30000000) {
@@ -3443,9 +3394,9 @@ aside .lg{color:#fff}
 <small>Только локальный мир. Ставит пластину Ш × В вокруг блока, на который поставил, в плоскости грани. Блоки нужны в запасе (в выживании тратятся). Глубины нет: слой ставится не раньше, чем появится опора.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Vein miner (дерево)</h3>
 <div class="fn c" onclick="vmGo()"><div class=nm>Vein miner<div class=sub id=vms style="white-space:pre-wrap">выключено</div></div><div class=sw id=vmsw></div></div>
-<div class=zr><b>Режим</b><select id=vmm onchange="if(VM)vmSend(1)"><option value=l>Local world</option><option value=g>Global</option></select><b>R</b><select id=vmr onchange="if(VM)vmSend(1)"><option>2</option><option>4</option><option selected>6</option><option>8</option><option>12</option><option>16</option></select></div>
+<div class=zr><b>Режим</b><select id=vmm onchange="if(VM)vmSend(1)"><option value=l>Local world</option><option value=g>Global (всё дерево)</option></select><b>R</b><select id=vmr onchange="if(VM)vmSend(1)"><option>2</option><option>4</option><option selected>6</option><option>8</option><option>12</option><option>16</option></select></div>
 <div class=row><button class=s id=vml onclick="vmLearn()">Запомнить дерево: выкл</button><button class=s onclick="vmClear()">Сбросить</button></div>
-<small>Local: за одну вскопку ломает связанные брёвна в радиусе R. Global: после первого бревна остальное дерево ломается само, по блоку за тик, в любом мире. Деревья определяются сами по имени блока. Если после слома бревна в строке статуса имя «-» или дерево не берётся: включи «Запомнить дерево», сломай по бревну каждой породы, выключи. Multiple destroy при включении отключается. В мультиплеере (свой или друга мир) работает, если сервер принимает слом с клиента; если блоки возвращаются обратно, сервер их не принял, и с клиента это не обойти. Global ломает по блоку за тик, так мягче для сервера.</small></div>
+<small>Local: сломал бревно — ломаются связанные брёвна в радиусе R. Global: сломал бревно — ломается всё дерево целиком (до 1500 блоков), радиус не нужен. Деревья определяются сами по имени блока. Если в строке «последний блок» стоит «-» или дерево не берётся: включи «Запомнить дерево», сломай по бревну каждой породы, выключи. Multiple destroy при включении отключается. В мультиплеере и на реалме работает ровно так, как работает Multiple destroy: если сервер не принимает слом лишних блоков, они вернутся.</small></div>
 <div class=card><h3><svg class=ic><use href="#i-bolt"/></svg>Заготовки (хуки)</h3>
 <div id=prl><small>…</small></div>
 <div class=grid3 style="margin-top:6px"><button class=s onclick="call('gmslots',{n:40})">Слоты GameMode</button><button class=s onclick="call('hooks',{})">Список хуков</button><button class=s onclick="call('hooksave',{})">Запомнить хуки</button></div>
@@ -3871,7 +3822,7 @@ async function plInit(){plUi(await api('place',{on:2}))}
 async function plSend(on){await call('place',{on:on,w:v('plw'),h:v('plh'),s:v('plsl')});plUi(await api('place',{on:2}))}
 function plGo(){plSend(PL?0:1)}
 let VM=0;
-function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(a[5]!='0'?' · очередь '+a[5]:'')+(VM||a[3]=='1'?'\nслом: '+a[6]+' · блок: '+a[7]+' · тик/кадр: '+a[9]+' · снято: '+a[10]+'\nпоследний блок: '+a.slice(11).join(' '):'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
+function vmUi(t){const a=t.trim().split(' ');VM=a[0]=='1'?1:0;if(VM){document.getElementById('vmm').value=a[1];document.getElementById('vmr').value=a[2]}document.getElementById('vms').textContent=(VM?'включено: '+(a[1]=='g'?'Global':'Local R'+a[2]):'выключено')+' · типов: '+a[4]+(a[3]=='1'?' · запоминаю':'')+(VM||a[3]=='1'?'\nслом: '+a[5]+' · блок: '+a[6]+' · доп. снято: '+a[8]+'\nпоследний блок: '+a.slice(9).join(' '):'');document.getElementById('vmsw').className='sw '+(VM?'on':'');document.getElementById('vml').textContent='Запомнить дерево: '+(a[3]=='1'?'вкл':'выкл')}
 async function vmInit(){vmUi(await api('vein',{on:2}))}
 async function vmSend(on){await call('vein',{on:on,m:v('vmm'),r:v('vmr')});vmUi(await api('vein',{on:2}))}
 function vmGo(){vmSend(VM?0:1)}
@@ -4292,36 +4243,32 @@ static Str route(const Str &path, const Params &q) {
         auto status = [&]() -> Str {
             std::lock_guard<std::mutex> lk(g_vein.m);
             bool live = g_vein.mode && g_vein.dslot >= 0 && g_slots[g_vein.dslot].used && g_slots[g_vein.dslot].mode == 7;
-            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size() + std::count_if(g_vein.autoT.begin(), g_vein.autoT.end(), [](const std::pair<const uintptr_t, bool> &e) { return e.second; })) + " " + std::to_string(g_vein.q.size()) + " " + std::to_string(g_vein.calls) + " " + std::to_string(g_vein.blkOk) + " " + (g_vein.lastBlk ? hx(g_vein.lastBlk) : Str("-")) + " " + std::to_string(g_vein.tickCalls) + "/" + std::to_string(g_pick.calls) + " " + std::to_string(g_vein.drained) + " " + (g_vein.lastName.empty() ? Str("-") : g_vein.lastName) + "\n";
+            return Str(live ? "1" : "0") + " " + (g_vein.mode == 2 ? "g" : "l") + " " + std::to_string(g_vein.R) + " " + (g_vein.learn ? "1" : "0") + " " + std::to_string(g_vein.trees.size() + std::count_if(g_vein.autoT.begin(), g_vein.autoT.end(), [](const std::pair<const uintptr_t, bool> &e) { return e.second; })) + " " + std::to_string(g_vein.calls) + " " + std::to_string(g_vein.blkOk) + " " + (g_vein.lastBlk ? hx(g_vein.lastBlk) : Str("-")) + " " + std::to_string(g_vein.broken) + " " + (g_vein.lastName.empty() ? Str("-") : g_vein.lastName) + "\n";
         };
-        if (P(q, "clear") == "1") { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.trees.clear(); g_vein.q.clear(); return "типы деревьев забыты, очередь пуста\n"; }
+        if (P(q, "clear") == "1") { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.trees.clear(); return "типы деревьев забыты, очередь пуста\n"; }
         if (!P(q, "learn").empty()) { g_vein.learn = P(q, "learn") == "1"; return g_vein.learn ? "запоминаю: сломай по одному бревну каждой породы, затем выключи\n" : "запоминание выключено, типов: " + std::to_string(g_vein.trees.size()) + "\n"; }
         if (!P(q, "any").empty()) { g_vein.any = P(q, "any") == "1"; return g_vein.any ? "режим «любой блок» (проверка!)\n" : "режим «любой блок» выключен\n"; }
         Str on = P(q, "on", "2");
         if (on == "2") return status();
         if (on == "0") {
-            g_vein.mode = 0; { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.q.clear(); }
+            g_vein.mode = 0;
             for (int i = 0; i < 16; i++) if (g_slots[i].used && (g_slots[i].mode == 7 || g_slots[i].mode == 8)) g_slots[i].mode = 0;
             return "выключено: Vein miner\n";
         }
-        uintptr_t gr = 0xA65CD54, off = 0, toff = 0;
+        uintptr_t gr = 0xA65CD54, off = 0;
         hexNum(q, "gr", gr);
         if (!segAt(im, im.base + (gr & ~(uintptr_t)1), 8)) return "адрес getRegion вне библиотеки\n";
         if (!hexNum(q, "a", off)) { Str why; off = findDestroyBlock(im, why); if (!off) return why; }
-        if (!hexNum(q, "ts", toff)) { Str why; toff = findGameModeSlot(im, 10, why); if (!toff) return why; }   // слот 10 = GameMode::tick
         auto place = [&](uintptr_t o, int mode, Str &msg) -> int {
             for (int i = 0; i < 16; i++) if (g_slots[i].used && g_slots[i].off == (o & ~(uintptr_t)1)) { g_slots[i].mode = mode; g_slots[i].val = 0; return i; }
             return hookInstall(im, o, mode, 0, 0, msg, 0);
         };
         Str msg; int ds = place(off, 7, msg); if (ds < 0) return msg + "\n";
-        int ts = place(toff, 8, msg); Str tmsg = ts < 0 ? "tick-хук не встал (" + msg + "), Global пойдёт от getPickRange. " : Str();
-        g_vein.im = im; g_vein.base = im.base; g_vein.lastVt = 0; g_vein.lastGm = 0;
         g_vein.getRegion = (im.base + (gr & ~(uintptr_t)1)) | 1;
         g_vein.dslot = ds;
-        { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.R = (int)std::min<size_t>(16, std::max<size_t>(1, decNum(q, "r", 6))); g_vein.q.clear(); }
+        { std::lock_guard<std::mutex> lk(g_vein.m); g_vein.R = (int)std::min<size_t>(16, std::max<size_t>(1, decNum(q, "r", 6))); }
         g_vein.mode = P(q, "m", "l") == "g" ? 2 : 1;
-        Str pmsg; if (g_vein.mode == 2) { pmsg = pickInstall(im); if (!g_pick.done) tmsg += pmsg; }
-        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global" : "Local R" + std::to_string(g_vein.R)) + " (destroyBlock #" + std::to_string(ds) + ", tick " + (ts >= 0 ? "#" + std::to_string(ts) : Str("нет")) + ")" + ". " + tmsg + "Деревья определяются по имени блока; «Запомнить дерево» нужно, только если имя не распозналось\n";
+        return Str("включено: Vein miner ") + (g_vein.mode == 2 ? "Global (всё дерево)" : "Local R" + std::to_string(g_vein.R)) + " (хук destroyBlock #" + std::to_string(ds) + ")" + ". Деревья определяются по имени блока; «Запомнить дерево» нужно, только если имя не распозналось\n";
     }
     if (path == "gmslots") return gmSlots(im, decNum(q, "n", 40));
     if (path == "prelist") return preList();
